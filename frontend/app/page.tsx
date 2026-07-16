@@ -896,7 +896,8 @@ export default function Home() {
         prompt: promptText,
         count: imageCount || 1,
         aspect_ratio: imageAspectRatio || "IMAGE_ASPECT_RATIO_LANDSCAPE",
-        model: imageModel || "GEM_PIX_2"
+        model: imageModel || "GEM_PIX_2",
+        for_video: true
       };
 
       if (mediaIds && mediaIds.length > 0) {
