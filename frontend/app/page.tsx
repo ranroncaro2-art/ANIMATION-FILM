@@ -1017,7 +1017,7 @@ export default function Home() {
         assetData = projectData.props.find(p => p.prop_name === ref.name);
       }
 
-      if (assetData && assetData.media_id) {
+      if (assetData && assetData.media_id && !assetData.media_id.startsWith("mock_")) {
         mediaIds.push(assetData.media_id);
         if (!accountId && assetData.account_id) {
           accountId = assetData.account_id;
@@ -1109,7 +1109,7 @@ export default function Home() {
         aspect_ratio: videoAspectRatio || "VIDEO_ASPECT_RATIO_LANDSCAPE"
       };
 
-      if (mediaId) {
+      if (mediaId && !mediaId.startsWith("mock_")) {
         payload.media_ids = [mediaId];
         payload.account_id = accountId || "default_account";
       }
