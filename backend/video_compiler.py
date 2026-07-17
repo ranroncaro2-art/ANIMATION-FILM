@@ -25,16 +25,26 @@ try:
 except ImportError:
     pass
 
-def get_system_font(size):
+def get_system_font(size, bold=False):
     """Find a standard TrueType font that supports CJK and Vietnamese characters."""
-    font_paths = [
-        "C:\\Windows\\Fonts\\segoeui.ttf",     # Windows Segoe UI (highly unicode compatible)
-        "C:\\Windows\\Fonts\\arial.ttf",       # Windows Arial
-        "C:\\Windows\\Fonts\\calibri.ttf",     # Windows Calibri
-        "C:\\Windows\\Fonts\\tahoma.ttf",      # Windows Tahoma
-        "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",  # Linux DejaVu
-        "/usr/share/fonts/truetype/liberation/LiberationSans-Bold.ttf"  # Linux Liberation
-    ]
+    if bold:
+        font_paths = [
+            "C:\\Windows\\Fonts\\segoeuib.ttf",    # Windows Segoe UI Bold
+            "C:\\Windows\\Fonts\\arialbd.ttf",      # Windows Arial Bold
+            "C:\\Windows\\Fonts\\tahomabd.ttf",     # Windows Tahoma Bold
+            "C:\\Windows\\Fonts\\calibrib.ttf",     # Windows Calibri Bold
+            "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",  # Linux DejaVu Bold
+            "/usr/share/fonts/truetype/liberation/LiberationSans-Bold.ttf"  # Linux Liberation Bold
+        ]
+    else:
+        font_paths = [
+            "C:\\Windows\\Fonts\\segoeui.ttf",     # Windows Segoe UI
+            "C:\\Windows\\Fonts\\arial.ttf",       # Windows Arial
+            "C:\\Windows\\Fonts\\calibri.ttf",     # Windows Calibri
+            "C:\\Windows\\Fonts\\tahoma.ttf",      # Windows Tahoma
+            "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",  # Linux DejaVu Regular
+            "/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf"  # Linux Liberation Regular
+        ]
     for path in font_paths:
         if os.path.exists(path):
             try:
@@ -227,47 +237,35 @@ def download_resource(url, temp_dir):
 
 def prepare_shot_audio(video_path, duration, out_wav_path):
     """Extract audio from video segment and trim/pad to duration, or generate silence if video has no audio."""
-    has_audio = False
+    success = False
     if video_path and os.path.exists(video_path):
         try:
+            # Try to extract and resample/trim the audio directly using ffmpeg
             cmd = [
-                'ffprobe', '-v', 'error', '-select_streams', 'a',
-                '-show_entries', 'stream=codec_name',
-                '-of', 'default=noprint_wrappers=1:nokey=1',
-                video_path
+                FFMPEG_PATH, '-y', '-i', video_path, '-vn',
+                '-filter_complex', f'aresample=async=1,atrim=0:{duration},apad=whole_dur={duration}',
+                '-c:a', 'pcm_s16le', '-ar', '44100', '-ac', '2', out_wav_path
             ]
-            res = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-            if res.returncode == 0 and res.stdout.strip():
-                has_audio = True
+            res = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            if res.returncode == 0:
+                success = True
         except Exception:
             pass
 
-    if has_audio:
-        cmd = [
-            FFMPEG_PATH, '-y', '-i', video_path, '-vn',
-            '-filter_complex', f'aresample=async=1,atrim=0:{duration},apad=whole_dur={duration}',
-            '-c:a', 'pcm_s16le', '-ar', '44100', '-ac', '2', out_wav_path
-        ]
-    else:
-        cmd = [
-            FFMPEG_PATH, '-y', '-f', 'lavfi', '-i', 'anullsrc=r=44100:cl=stereo',
-            '-t', str(duration), '-c:a', 'pcm_s16le', out_wav_path
-        ]
-        
-    try:
-        subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=True)
-        return True
-    except Exception as e:
-        print(f"Error preparing audio for {video_path}: {e}", file=sys.stderr)
+    if not success:
+        # Fallback to silence generator
         try:
-            cmd_fallback = [
+            cmd_silence = [
                 FFMPEG_PATH, '-y', '-f', 'lavfi', '-i', 'anullsrc=r=44100:cl=stereo',
                 '-t', str(duration), '-c:a', 'pcm_s16le', out_wav_path
             ]
-            subprocess.run(cmd_fallback, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=True)
+            subprocess.run(cmd_silence, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=True)
             return True
-        except:
+        except Exception as e:
+            print(f"Error generating fallback silence for {video_path}: {e}", file=sys.stderr)
             return False
+            
+    return True
 
 def check_nvenc_support():
     """Verify if NVIDIA NVENC is supported by running a fast encoding dry-run."""
@@ -431,7 +429,8 @@ def main():
 
     # Compile frames
     current_global_frame = 0
-    font_subtitle = get_system_font(28)
+    font_subtitle = get_system_font(26, bold=False)
+    font_subtitle_bold = get_system_font(26, bold=True)
 
     for idx, shot in enumerate(shots):
         shot_id = shot.get("shot_id")
@@ -506,40 +505,55 @@ def main():
                 pil_img = Image.fromarray(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
                 draw = ImageDraw.Draw(pil_img, "RGBA")
                 
-                # Wrap text to 85% of screen width
-                wrapped_lines = wrap_text(f"{speaker}: \"{speech}\"", font_subtitle, int(args.width * 0.85), draw)
+                # Wrap text to 85% of screen width (no outer quotes)
+                wrapped_lines = wrap_text(f"{speaker}: {speech}", font_subtitle, int(args.width * 0.85), draw)
                 
                 if wrapped_lines:
                     line_height = 36
                     box_height = len(wrapped_lines) * line_height + 24
                     
-                    # Draw semi-transparent rectangle box
+                    # Calculate max line width for form-fitting container box
+                    max_line_w = 0
+                    for line in wrapped_lines:
+                        line_w = draw.textbbox((0, 0), line, font=font_subtitle_bold)[2]
+                        if line_w > max_line_w:
+                            max_line_w = line_w
+                    
+                    box_width = min(int(args.width * 0.86), max_line_w + 48)
+                    box_x1 = (args.width - box_width) // 2
+                    box_x2 = (args.width + box_width) // 2
+                    
                     box_y1 = args.height - box_height - 35
                     box_y2 = args.height - 35
-                    draw.rectangle(
-                        [int(args.width * 0.07), box_y1, int(args.width * 0.93), box_y2],
-                        fill=(0, 0, 0, 185), outline=(255, 255, 255, 15), width=1
+                    
+                    # Draw form-fitting rounded rectangle box
+                    draw.rounded_rectangle(
+                        [box_x1, box_y1, box_x2, box_y2], radius=6,
+                        fill=(0, 0, 0, 153), outline=(255, 255, 255, 15), width=1
                     )
                     
                     # Draw each line centered
                     for l_idx, line in enumerate(wrapped_lines):
-                        line_w = draw.textbbox((0, 0), line, font=font_subtitle)[2]
-                        tx = (args.width - line_w) // 2
-                        ty = box_y1 + 12 + l_idx * line_height
-                        
-                        # Draw speaker name in accent yellow and dialog text in white
+                        # Determine actual line width to center correctly
                         if line.startswith(f"{speaker}:"):
-                            # Draw speaker prefix
                             prefix = f"{speaker}: "
-                            prefix_w = draw.textbbox((0, 0), prefix, font=font_subtitle)[2]
-                            
-                            # Draw name
-                            draw.text((tx, ty), prefix, font=font_subtitle, fill=(253, 224, 71, 255)) # Yellow
-                            # Draw text
                             dialog_text = line[len(prefix):]
-                            draw.text((tx + prefix_w, ty), dialog_text, font=font_subtitle, fill=(255, 255, 255, 255))
+                            prefix_w = draw.textbbox((0, 0), prefix, font=font_subtitle_bold)[2]
+                            text_w = draw.textbbox((0, 0), dialog_text, font=font_subtitle)[2]
+                            line_w = prefix_w + text_w
+                            tx = (args.width - line_w) // 2
+                            ty = box_y1 + 12 + l_idx * line_height
+                            
+                            # Draw speaker name in purple with black border stroke
+                            draw.text((tx, ty), prefix, font=font_subtitle_bold, fill=(167, 139, 250, 255), stroke_width=2, stroke_fill=(0, 0, 0, 255))
+                            # Draw dialogue text in white with black border stroke
+                            draw.text((tx + prefix_w, ty), dialog_text, font=font_subtitle, fill=(255, 255, 255, 255), stroke_width=2, stroke_fill=(0, 0, 0, 255))
                         else:
-                            draw.text((tx, ty), line, font=font_subtitle, fill=(255, 255, 255, 255))
+                            line_w = draw.textbbox((0, 0), line, font=font_subtitle)[2]
+                            tx = (args.width - line_w) // 2
+                            ty = box_y1 + 12 + l_idx * line_height
+                            
+                            draw.text((tx, ty), line, font=font_subtitle, fill=(255, 255, 255, 255), stroke_width=2, stroke_fill=(0, 0, 0, 255))
                 
                 frame = cv2.cvtColor(np.array(pil_img), cv2.COLOR_RGB2BGR)
 
