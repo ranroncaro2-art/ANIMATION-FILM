@@ -80,6 +80,15 @@ def clean_text_for_safety(text: str) -> str:
     text = re.sub(r'\bchild\b', 'character', text, flags=re.IGNORECASE)
     text = re.sub(r'\bkids\b', 'characters', text, flags=re.IGNORECASE)
     text = re.sub(r'\bkid\b', 'character', text, flags=re.IGNORECASE)
+    
+    # Vietnamese safety translations
+    text = re.sub(r'\bbé\s+trai\b', 'cậu bé', text, flags=re.IGNORECASE)
+    text = re.sub(r'\bbé\s+gái\b', 'cô bé', text, flags=re.IGNORECASE)
+    text = re.sub(r'\btrẻ\s+em\b', 'nhân vật', text, flags=re.IGNORECASE)
+    text = re.sub(r'\btrẻ\s+con\b', 'nhân vật', text, flags=re.IGNORECASE)
+    text = re.sub(r'\bcon\s+nít\b', 'nhân vật', text, flags=re.IGNORECASE)
+    text = re.sub(r'\bhọc\s+sinh\s+tiểu\s+học\b', 'học sinh', text, flags=re.IGNORECASE)
+    text = re.sub(r'\bhọc\s+sinh\s+mẫu\s+giáo\b', 'học sinh', text, flags=re.IGNORECASE)
     return text
 
 def compile_motion_prompt(shot: Shot) -> str:
@@ -326,7 +335,7 @@ async def run_shot_planner(
         "   - Only describe the visual appearance: integrate details about character clothing/look (from character reference), environment (from environment reference), active props (from prop reference), camera framing (e.g. Close Up), and mood/lighting.\n"
         "   - Ensure the prompt is formatted in a Pixar-quality stylized 3D, cinematic composition, reference keyframe, no motion blur, no text, no captions.\n"
         "   - Do NOT describe motion, timeline, movement, or speech in the keyframe prompt.\n"
-        "   - Clean the text for safety: do not include age descriptors or words like 'child', 'kids', 'young boy', 'little girl' (replace with 'boy', 'girl', or generic character terms to prevent Gemini API safety blocks).\n\n"
+        "   - Clean the text for safety: do not include age descriptors or sensitive child-related terms (use generic terms like 'boy', 'girl', or 'character' to prevent Gemini API safety blocks).\n\n"
         "3. Timeline:\n"
         "   - Generate a chronological breakdown of actions in seconds, matching the shot duration. Example:\n"
         "     [{\"time\": \"0-2\", \"action\": \"Lisa walks toward camera\"}, {\"time\": \"2-6\", \"action\": \"Lisa speaks\"}, {\"time\": \"6-8\", \"action\": \"Lisa smiles\"}]\n\n"
@@ -355,32 +364,40 @@ async def run_shot_planner(
             for p in scene.get("props", []):
                 referenced_props.add(p.strip().lower())
         
-        # Filter assets to only include referenced ones
+        # Filter assets to only include referenced ones, with fallback to all if none match
         chunk_characters = [
             c for c in all_characters 
             if c.get("name", "").strip().lower() in referenced_chars or 
                c.get("canonical_name", "").strip().lower() in referenced_chars or
                c.get("id", "").strip().lower() in referenced_chars
         ]
+        if not chunk_characters and all_characters:
+            chunk_characters = all_characters
+
         chunk_environments = [
             e for e in all_environments 
             if e.get("name", "").strip().lower() in referenced_envs or 
                e.get("setting_name", "").strip().lower() in referenced_envs or
                e.get("id", "").strip().lower() in referenced_envs
         ]
+        if not chunk_environments and all_environments:
+            chunk_environments = all_environments
+
         chunk_props = [
             p for p in all_props 
             if p.get("name", "").strip().lower() in referenced_props or 
                p.get("prop_name", "").strip().lower() in referenced_props or
                p.get("id", "").strip().lower() in referenced_props
         ]
+        if not chunk_props and all_props:
+            chunk_props = all_props
         
         # Clean character fields for safety (removing age / child keywords)
         cleaned_characters = []
         for c in chunk_characters:
             cc = c.copy()
             cc["age"] = ""
-            for field in ["appearance", "outfit", "hairstyle", "accessories", "turnaround_prompt", "prompt", "personality", "voice_style"]:
+            for field in ["appearance", "outfit", "hairstyle", "accessories", "turnaround_prompt", "prompt", "personality", "voice_style", "description", "gender"]:
                 if field in cc and cc[field]:
                     cc[field] = clean_text_for_safety(cc[field])
             cleaned_characters.append(cc)
@@ -402,7 +419,7 @@ async def run_shot_planner(
                 if field in pp and pp[field]:
                     pp[field] = clean_text_for_safety(pp[field])
             cleaned_props.append(pp)
-
+ 
         # Ensure we clean storyboard if provided, otherwise clean scene actions
         cleaned_chunk = []
         for scene in chunk:
@@ -411,6 +428,16 @@ async def run_shot_planner(
                 sc["action"] = clean_text_for_safety(sc["action"])
             if "description" in sc and sc["description"]:
                 sc["description"] = clean_text_for_safety(sc["description"])
+            if "dialogue" in sc and sc["dialogue"]:
+                cleaned_dialogue = []
+                for d in sc["dialogue"]:
+                    dc = d.copy()
+                    if "speech" in dc and dc["speech"]:
+                        dc["speech"] = clean_text_for_safety(dc["speech"])
+                    if "text" in dc and dc["text"]:
+                        dc["text"] = clean_text_for_safety(dc["text"])
+                    cleaned_dialogue.append(dc)
+                sc["dialogue"] = cleaned_dialogue
             cleaned_chunk.append(sc)
 
         chunk_scenes_json = json.dumps(cleaned_chunk, ensure_ascii=False)
@@ -515,29 +542,37 @@ async def run_keyframe_prompt_generator(
             for p in shot.get("props", []):
                 referenced_props.add(p.strip().lower())
         
-        # Filter assets to only include referenced ones
+        # Filter assets to only include referenced ones, with fallback to all if none match
         chunk_characters = [
             c for c in all_characters 
             if c.get("name", "").strip().lower() in referenced_chars or 
                c.get("canonical_name", "").strip().lower() in referenced_chars
         ]
+        if not chunk_characters and all_characters:
+            chunk_characters = all_characters
+
         chunk_environments = [
             e for e in all_environments 
             if e.get("name", "").strip().lower() in referenced_envs or 
                e.get("setting_name", "").strip().lower() in referenced_envs
         ]
+        if not chunk_environments and all_environments:
+            chunk_environments = all_environments
+
         chunk_props = [
             p for p in all_props 
             if p.get("name", "").strip().lower() in referenced_props or 
                p.get("prop_name", "").strip().lower() in referenced_props
         ]
+        if not chunk_props and all_props:
+            chunk_props = all_props
         
         # Clean character fields for safety (removing age / child keywords)
         cleaned_characters = []
         for c in chunk_characters:
             cc = c.copy()
             cc["age"] = ""
-            for field in ["appearance", "outfit", "hairstyle", "accessories", "turnaround_prompt", "prompt", "personality", "voice_style"]:
+            for field in ["appearance", "outfit", "hairstyle", "accessories", "turnaround_prompt", "prompt", "personality", "voice_style", "description", "gender"]:
                 if field in cc and cc[field]:
                     cc[field] = clean_text_for_safety(cc[field])
             cleaned_characters.append(cc)
@@ -567,6 +602,16 @@ async def run_keyframe_prompt_generator(
             for field in ["actions", "action", "description"]:
                 if field in s_copy and s_copy[field]:
                     s_copy[field] = clean_text_for_safety(s_copy[field])
+            if "dialogue" in s_copy and s_copy["dialogue"]:
+                cleaned_dialogue = []
+                for d in s_copy["dialogue"]:
+                    dc = d.copy()
+                    if "speech" in dc and dc["speech"]:
+                        dc["speech"] = clean_text_for_safety(dc["speech"])
+                    if "text" in dc and dc["text"]:
+                        dc["text"] = clean_text_for_safety(dc["text"])
+                    cleaned_dialogue.append(dc)
+                s_copy["dialogue"] = cleaned_dialogue
             cleaned_chunk.append(s_copy)
 
         chunk_shots_json = json.dumps(cleaned_chunk, ensure_ascii=False)
@@ -735,22 +780,30 @@ async def run_motion_prompt_generator(
                 except ValueError:
                     pass
         
-        # Filter assets
+        # Filter assets, with fallback to all if none match
         chunk_characters = [
             c for c in all_characters 
             if c.get("name", "").strip().lower() in referenced_chars or 
                c.get("canonical_name", "").strip().lower() in referenced_chars
         ]
+        if not chunk_characters and all_characters:
+            chunk_characters = all_characters
+
         chunk_environments = [
             e for e in all_environments 
             if e.get("name", "").strip().lower() in referenced_envs or 
                e.get("setting_name", "").strip().lower() in referenced_envs
         ]
+        if not chunk_environments and all_environments:
+            chunk_environments = all_environments
+
         chunk_props = [
             p for p in all_props 
             if p.get("name", "").strip().lower() in referenced_props or 
                p.get("prop_name", "").strip().lower() in referenced_props
         ]
+        if not chunk_props and all_props:
+            chunk_props = all_props
         
         # Extract only relevant storyboard text
         chunk_storyboard = extract_relevant_storyboard_scenes(storyboard, scene_numbers)
@@ -762,7 +815,7 @@ async def run_motion_prompt_generator(
         for c in chunk_characters:
             cc = c.copy()
             cc["age"] = ""
-            for field in ["appearance", "outfit", "hairstyle", "accessories", "turnaround_prompt", "prompt", "personality", "voice_style"]:
+            for field in ["appearance", "outfit", "hairstyle", "accessories", "turnaround_prompt", "prompt", "personality", "voice_style", "description", "gender"]:
                 if field in cc and cc[field]:
                     cc[field] = clean_text_for_safety(cc[field])
             cleaned_characters.append(cc)
@@ -792,6 +845,16 @@ async def run_motion_prompt_generator(
             for field in ["actions", "action", "description"]:
                 if field in s_copy and s_copy[field]:
                     s_copy[field] = clean_text_for_safety(s_copy[field])
+            if "dialogue" in s_copy and s_copy["dialogue"]:
+                cleaned_dialogue = []
+                for d in s_copy["dialogue"]:
+                    dc = d.copy()
+                    if "speech" in dc and dc["speech"]:
+                        dc["speech"] = clean_text_for_safety(dc["speech"])
+                    if "text" in dc and dc["text"]:
+                        dc["text"] = clean_text_for_safety(dc["text"])
+                    cleaned_dialogue.append(dc)
+                s_copy["dialogue"] = cleaned_dialogue
             cleaned_chunk.append(s_copy)
             
         chunk_shots_json = json.dumps(cleaned_chunk, ensure_ascii=False)

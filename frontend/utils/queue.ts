@@ -842,6 +842,52 @@ class BackgroundQueueManager {
             text: d.speech
           })) : []
         }));
+
+        // Automatically initialize shots from scenes if shots is currently empty
+        if (!projectData.shots || projectData.shots.length === 0) {
+          updatedData.shots = updatedData.scenes.map((scene: any, idx: number) => {
+            const shotId = `Shot${String(idx + 1).padStart(3, '0')}`;
+            return {
+              shot_id: shotId,
+              scene_id: scene.scene_id,
+              scene_number: scene.scene_id,
+              duration_seconds: scene.duration_seconds || 5,
+              actions: scene.description || "",
+              characters: scene.characters || [],
+              environment: scene.setting || "",
+              props: scene.props || [],
+              dialogue: scene.dialogues || [],
+              camera_movement: "Static",
+              framing: "Medium Shot",
+              transition: "Cut",
+              composition: "Rule of Thirds",
+              lighting: "Warm lighting",
+              camera: "Medium Shot, Static",
+              timeline: [{ time: `0-${scene.duration_seconds || 5}`, action: scene.description || "Idle" }],
+              motion: {
+                primary_motion: "Idle",
+                secondary_motion: ["Blink", "Breathing"],
+                motion_level: "Low"
+              },
+              keyframe_prompt: "",
+              motion_prompt: ""
+            };
+          });
+
+          updatedData.keyframes = updatedData.shots.map((shot: any) => ({
+            shot_id: shot.shot_id,
+            keyframe_image_prompt: "",
+            url: "",
+            media_id: "",
+            account_id: ""
+          }));
+
+          updatedData.motion_prompts = updatedData.shots.map((shot: any) => ({
+            shot_id: shot.shot_id,
+            motion_description: "",
+            video_url: ""
+          }));
+        }
         break;
 
       case "character_extractor":

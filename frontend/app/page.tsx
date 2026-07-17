@@ -38,6 +38,72 @@ function mergeProjectData(uiData: any, dbData: any) {
 
   const merged = { ...uiData };
 
+  // 0.1. Merge scenes
+  if (merged.scenes && dbData.scenes) {
+    merged.scenes = merged.scenes.map((uiScene: any) => {
+      const dbScene = dbData.scenes.find((s: any) => s.scene_id === uiScene.scene_id);
+      if (dbScene) {
+        return {
+          ...uiScene,
+          duration_seconds: dbScene.duration_seconds || uiScene.duration_seconds || 5,
+          characters: dbScene.characters || uiScene.characters || [],
+          setting: dbScene.setting || uiScene.setting || "",
+          props: dbScene.props || uiScene.props || [],
+          description: dbScene.description || uiScene.description || "",
+          dialogues: dbScene.dialogues || uiScene.dialogues || [],
+        };
+      }
+      return uiScene;
+    });
+    dbData.scenes.forEach((dbScene: any) => {
+      const exists = merged.scenes.some((s: any) => s.scene_id === dbScene.scene_id);
+      if (!exists) {
+        merged.scenes.push(dbScene);
+      }
+    });
+  } else if (dbData.scenes) {
+    merged.scenes = dbData.scenes;
+  }
+
+  // 0.2. Merge shots
+  if (merged.shots && dbData.shots) {
+    merged.shots = merged.shots.map((uiShot: any) => {
+      const dbShot = dbData.shots.find((s: any) => s.shot_id === uiShot.shot_id);
+      if (dbShot) {
+        return {
+          ...uiShot,
+          scene_id: dbShot.scene_id || uiShot.scene_id,
+          scene_number: dbShot.scene_number || uiShot.scene_number,
+          duration_seconds: dbShot.duration_seconds || uiShot.duration_seconds || 5,
+          actions: dbShot.actions || uiShot.actions || "",
+          characters: dbShot.characters || uiShot.characters || [],
+          environment: dbShot.environment || uiShot.environment || "",
+          props: dbShot.props || uiShot.props || [],
+          dialogue: dbShot.dialogue || uiShot.dialogue || [],
+          camera_movement: dbShot.camera_movement || uiShot.camera_movement || "",
+          framing: dbShot.framing || uiShot.framing || "",
+          transition: dbShot.transition || uiShot.transition || "Cut",
+          composition: dbShot.composition || dbShot.composition || "Rule of Thirds",
+          lighting: dbShot.lighting || uiShot.lighting || "Warm lighting",
+          camera: dbShot.camera || uiShot.camera || "",
+          timeline: dbShot.timeline || uiShot.timeline || [],
+          motion: dbShot.motion || uiShot.motion || {},
+          keyframe_prompt: dbShot.keyframe_prompt || uiShot.keyframe_prompt || "",
+          motion_prompt: dbShot.motion_prompt || uiShot.motion_prompt || "",
+        };
+      }
+      return uiShot;
+    });
+    dbData.shots.forEach((dbShot: any) => {
+      const exists = merged.shots.some((s: any) => s.shot_id === dbShot.shot_id);
+      if (!exists) {
+        merged.shots.push(dbShot);
+      }
+    });
+  } else if (dbData.shots) {
+    merged.shots = dbData.shots;
+  }
+
   // 1. Merge characters
   if (merged.characters && dbData.characters) {
     merged.characters = merged.characters.map((uiChar: any) => {
@@ -1451,6 +1517,272 @@ export default function Home() {
     });
   };
 
+  // Helper to normalize reference asset filenames
+  const normalizeFileName = (name: string) => {
+    if (!name) return "";
+    return name.toLowerCase()
+      .trim()
+      .replace(/[^a-z0-9]+/g, "_")
+      .replace(/^_+|_+$/g, "") + ".png";
+  };
+
+  // Helper to trigger a single JSON file download
+  const triggerJsonDownload = (data: any, defaultFilename: string) => {
+    const blob = new Blob([JSON.stringify(data, null, 2)], { type: "application/json" });
+    const url = window.URL.createObjectURL(blob);
+    const link = document.createElement("a");
+    link.href = url;
+    link.setAttribute("download", defaultFilename);
+    document.body.appendChild(link);
+    link.click();
+    link.parentNode?.removeChild(link);
+    window.URL.revokeObjectURL(url);
+  };
+
+  // Export 3 prompt JSON files based on the specification
+  const handleExportJsonPrompts = () => {
+    if (projectData.shots.length === 0) {
+      alert("Chưa có camera shots. Vui lòng chạy các bước tạo prompt trước.");
+      return;
+    }
+
+    const safeProjName = activeProjectName.replace(/\s+/g, "_");
+
+    // 1. References JSON
+    const referencesData: any[] = [];
+    
+    // Add characters
+    (projectData.characters || []).forEach((c: any, index: number) => {
+      const origId = c.canonical_name || c.name || `char_${index + 1}`;
+      const normId = normalizeFileName(origId).replace(".png", "");
+      referencesData.push({
+        id: normId,
+        fileName: `${normId}.png`,
+        prompt: c.turnaround_prompt || c.prompt || ""
+      });
+    });
+
+    // Add environments
+    (projectData.environments || []).forEach((e: any, index: number) => {
+      const origId = e.setting_name || e.name || `env_${index + 1}`;
+      const normId = normalizeFileName(origId).replace(".png", "");
+      referencesData.push({
+        id: normId,
+        fileName: `${normId}.png`,
+        prompt: e.reference_prompt || e.prompt || ""
+      });
+    });
+
+    // Add props
+    (projectData.props || []).forEach((p: any, index: number) => {
+      const origId = p.prop_name || p.name || `prop_${index + 1}`;
+      const normId = normalizeFileName(origId).replace(".png", "");
+      referencesData.push({
+        id: normId,
+        fileName: `${normId}.png`,
+        prompt: p.reference_prompt || p.prompt || ""
+      });
+    });
+
+    // 2. Shots JSON
+    const shotsData = (projectData.shots || []).map((shot: any, index: number) => {
+      const matchedAssets = getReferencedAssetsForShot(shot) || [];
+      const refFileNames = Array.from(
+        new Set(matchedAssets.map((asset: any) => normalizeFileName(asset.name)).filter(Boolean))
+      );
+
+      const keyframeObj = projectData.keyframes
+        ? projectData.keyframes.find((k: any) => k.shot_id === shot.shot_id)
+        : null;
+      const keyframePrompt = keyframeObj?.keyframe_image_prompt || keyframeObj?.prompt || shot.actions || "";
+
+      return {
+        id: `shot_${index + 1}.png`,
+        references: refFileNames,
+        prompt: keyframePrompt
+      };
+    });
+
+    // 3. Video Prompts JSON
+    const videoPromptsData = (projectData.shots || []).map((shot: any, index: number) => {
+      const motionObj = projectData.motion_prompts
+        ? projectData.motion_prompts.find((m: any) => m.shot_id === shot.shot_id)
+        : null;
+      
+      const motionPrompt = motionObj?.motion_description || motionObj?.prompt || shot.camera_movement || "cinematic motion, slow pan";
+
+      const shotFileName = `shot_${index + 1}.png`;
+      return {
+        id: index + 1,
+        imageName: shotFileName,
+        "tên ảnh shots": shotFileName,
+        prompt: motionPrompt
+      };
+    });
+
+    // Trigger downloads with a slight delay to prevent browser blocking
+    triggerJsonDownload(referencesData, `${safeProjName}_references.json`);
+    
+    setTimeout(() => {
+      triggerJsonDownload(shotsData, `${safeProjName}_shots.json`);
+    }, 250);
+
+    setTimeout(() => {
+      triggerJsonDownload(videoPromptsData, `${safeProjName}_video_prompts.json`);
+    }, 500);
+  };
+
+  // Scan assets from configured PC directory
+  const handleScanPcAssets = async () => {
+    if (!projectData.pcDirectory) {
+      alert("Vui lòng cấu hình thư mục lưu trữ dự án trên máy tính trước.");
+      return;
+    }
+
+    try {
+      const response = await fetch("/api/scan-assets", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ pcDirectory: projectData.pcDirectory })
+      });
+
+      if (!response.ok) {
+        throw new Error(`Quét Assets thất bại với trạng thái ${response.status}`);
+      }
+
+      const data = await response.json();
+      if (!data.success) {
+        throw new Error(data.error || "Lỗi quét thư mục Assets.");
+      }
+
+      const { references = [], images_shots = [], videos = [] } = data;
+
+      const getBaseName = (filename: string) => {
+        const parts = filename.split(".");
+        if (parts.length > 1) parts.pop();
+        return parts.join(".").toLowerCase().trim();
+      };
+
+      const isAssetMatch = (filename: string, assetName: string) => {
+        const base = getBaseName(filename);
+        const name = assetName.toLowerCase().trim();
+        if (base === name) return true;
+        if (base === name.replace(/[^a-z0-9]+/g, "_")) return true;
+        return false;
+      };
+
+      const isShotMatch = (filename: string, shotId: string) => {
+        const base = getBaseName(filename);
+        const sId = shotId.toLowerCase().trim();
+        if (base === sId) return true;
+        if (base === `shot_${sId}`) return true;
+        if (base === `shot_${sId.padStart(3, '0')}`) return true;
+        
+        const numOnlyBase = base.replace(/[^0-9]/g, "");
+        const numOnlyId = sId.replace(/[^0-9]/g, "");
+        if (numOnlyBase && numOnlyId && parseInt(numOnlyBase, 10) === parseInt(numOnlyId, 10)) {
+          return true;
+        }
+        return false;
+      };
+
+      setProjectData((prev) => {
+        const copy = { ...prev };
+
+        // 1. Scan & Map characters
+        copy.characters = (copy.characters || []).map((char: any) => {
+          const match = references.find((f: any) => isAssetMatch(f.name, char.name));
+          if (match) {
+            return {
+              ...char,
+              url: `/api/media?path=${encodeURIComponent(match.path)}`
+            };
+          }
+          return char;
+        });
+
+        // 2. Scan & Map environments
+        copy.environments = (copy.environments || []).map((env: any) => {
+          const name = env.setting_name || env.name || "";
+          const match = references.find((f: any) => isAssetMatch(f.name, name));
+          if (match) {
+            return {
+              ...env,
+              url: `/api/media?path=${encodeURIComponent(match.path)}`
+            };
+          }
+          return env;
+        });
+
+        // 3. Scan & Map props
+        copy.props = (copy.props || []).map((prop: any) => {
+          const name = prop.prop_name || prop.name || "";
+          const match = references.find((f: any) => isAssetMatch(f.name, name));
+          if (match) {
+            return {
+              ...prop,
+              url: `/api/media?path=${encodeURIComponent(match.path)}`
+            };
+          }
+          return prop;
+        });
+
+        // 4. Scan & Map shot keyframes
+        const updatedKeyframes = [...(copy.keyframes || [])];
+        (copy.shots || []).forEach((shot: any) => {
+          const match = images_shots.find((f: any) => isShotMatch(f.name, shot.shot_id));
+          if (match) {
+            const mediaUrl = `/api/media?path=${encodeURIComponent(match.path)}`;
+            const kIdx = updatedKeyframes.findIndex((k: any) => k.shot_id === shot.shot_id);
+            if (kIdx !== -1) {
+              updatedKeyframes[kIdx] = {
+                ...updatedKeyframes[kIdx],
+                url: mediaUrl
+              };
+            } else {
+              updatedKeyframes.push({
+                shot_id: shot.shot_id,
+                url: mediaUrl,
+                keyframe_image_prompt: ""
+              });
+            }
+          }
+        });
+        copy.keyframes = updatedKeyframes;
+
+        // 5. Scan & Map videos
+        const updatedMotionPrompts = [...(copy.motion_prompts || [])];
+        (copy.shots || []).forEach((shot: any) => {
+          const match = videos.find((f: any) => isShotMatch(f.name, shot.shot_id));
+          if (match) {
+            const mediaUrl = `/api/media?path=${encodeURIComponent(match.path)}`;
+            const mIdx = updatedMotionPrompts.findIndex((m: any) => m.shot_id === shot.shot_id);
+            if (mIdx !== -1) {
+              updatedMotionPrompts[mIdx] = {
+                ...updatedMotionPrompts[mIdx],
+                video_url: mediaUrl
+              };
+            } else {
+              updatedMotionPrompts.push({
+                shot_id: shot.shot_id,
+                video_url: mediaUrl,
+                motion_description: ""
+              });
+            }
+          }
+        });
+        copy.motion_prompts = updatedMotionPrompts;
+
+        return copy;
+      });
+
+      alert("Quét Assets hoàn tất! Các ảnh tham chiếu, ảnh shots và video được cập nhật.");
+    } catch (err: any) {
+      console.error(err);
+      alert(`Quét Assets thất bại: ${err.message}`);
+    }
+  };
+
   // Send everything to ZIP exporter
   const handleExportZip = async () => {
     if (projectData.scenes.length === 0) {
@@ -2648,6 +2980,54 @@ export default function Home() {
                 <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4M7 10l5 5 5-5M12 15V3"/>
               </svg>
             </button>
+            <button
+              onClick={handleExportJsonPrompts}
+              title="Xuất JSON Prompts"
+              disabled={projectData.shots.length === 0}
+              style={{
+                background: "transparent",
+                border: "none",
+                cursor: projectData.shots.length === 0 ? "not-allowed" : "pointer",
+                color: "var(--text-muted)",
+                display: "flex",
+                alignItems: "center",
+                padding: "4px",
+                opacity: projectData.shots.length === 0 ? 0.3 : 1
+              }}
+              onMouseEnter={(e) => { if (projectData.shots.length > 0) e.currentTarget.style.color = "#ffffff"; }}
+              onMouseLeave={(e) => { e.currentTarget.style.color = "var(--text-muted)"; }}
+            >
+              <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" style={{ marginRight: "2px" }}>
+                <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/>
+                <polyline points="14 2 14 8 20 8"/>
+                <line x1="16" y1="13" x2="8" y2="13"/>
+                <line x1="16" y1="17" x2="8" y2="17"/>
+                <polyline points="10 9 9 9 8 9"/>
+              </svg>
+            </button>
+            <button
+              onClick={handleScanPcAssets}
+              title="Quét Assets từ thư mục PC"
+              disabled={!projectData.pcDirectory}
+              style={{
+                background: "transparent",
+                border: "none",
+                cursor: !projectData.pcDirectory ? "not-allowed" : "pointer",
+                color: "var(--text-muted)",
+                display: "flex",
+                alignItems: "center",
+                padding: "4px",
+                opacity: !projectData.pcDirectory ? 0.3 : 1
+              }}
+              onMouseEnter={(e) => { if (projectData.pcDirectory) e.currentTarget.style.color = "#ffffff"; }}
+              onMouseLeave={(e) => { e.currentTarget.style.color = "var(--text-muted)"; }}
+            >
+              <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+                <path d="M23 4v6h-6"/>
+                <path d="M1 20v-6h6"/>
+                <path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15"/>
+              </svg>
+            </button>
           </div>
         </div>
 
@@ -2908,6 +3288,25 @@ export default function Home() {
                         >
                           📂 Chọn thư mục
                         </button>
+                        {projectData.pcDirectory && (
+                          <button
+                            onClick={handleScanPcAssets}
+                            className="btn-primary"
+                            style={{
+                              padding: "8px 16px",
+                              fontSize: "0.8rem",
+                              borderRadius: "6px",
+                              background: "linear-gradient(135deg, #10b981, #059669)",
+                              border: "none",
+                              cursor: "pointer",
+                              whiteSpace: "nowrap",
+                              fontWeight: 600,
+                              boxShadow: "0 0 10px rgba(16, 185, 129, 0.2)"
+                            }}
+                          >
+                            🔍 Quét Assets
+                          </button>
+                        )}
                       </div>
                       
                       {projectData.pcDirectory ? (
@@ -3643,6 +4042,22 @@ export default function Home() {
                       <div style={{ display: "flex", gap: "10px", alignItems: "center", marginBottom: "16px", padding: "12px", background: "rgba(255,255,255,0.02)", borderRadius: "8px", border: "1px solid rgba(255,255,255,0.05)" }}>
                         <span style={{ fontSize: "0.8rem", color: "var(--text-secondary)", fontWeight: 600 }}>Hành động hàng loạt:</span>
                         <button
+                          onClick={() => handleRunStep("shot_planner")}
+                          disabled={activeStep !== null || isRunningAll}
+                          className="btn-primary"
+                          style={{
+                            padding: "6px 12px",
+                            fontSize: "0.75rem",
+                            borderRadius: "4px",
+                            background: "rgba(168,85,247,0.2)",
+                            border: "1px solid rgba(168,85,247,0.4)",
+                            color: "#c084fc",
+                            fontWeight: 600
+                          }}
+                        >
+                          🔮 Sinh Prompts (Shot Planner)
+                        </button>
+                        <button
                           onClick={() => handleGenerateAllShotImages(false)}
                           disabled={isGeneratingBatch || activeStep !== null || isRunningAll}
                           className="btn-primary"
@@ -3657,6 +4072,23 @@ export default function Home() {
                           style={{ padding: "6px 12px", fontSize: "0.75rem", borderRadius: "4px" }}
                         >
                           🎨 Tạo tất cả shots chưa tạo
+                        </button>
+                        <button
+                          onClick={handleExportJsonPrompts}
+                          disabled={activeStep !== null || isRunningAll}
+                          className="btn-primary"
+                          style={{
+                            padding: "6px 12px",
+                            fontSize: "0.75rem",
+                            borderRadius: "4px",
+                            background: "linear-gradient(135deg, #8b5cf6, #ec4899)",
+                            border: "none",
+                            cursor: "pointer",
+                            fontWeight: 600,
+                            boxShadow: "0 0 10px rgba(139, 92, 246, 0.2)"
+                          }}
+                        >
+                          📥 Xuất JSON Prompts
                         </button>
                         {isGeneratingBatch && (
                           <button
@@ -3727,13 +4159,10 @@ export default function Home() {
                                   <p style={{ fontSize: "0.75rem", fontStyle: "italic", margin: 0 }}>{keyframePrompt}</p>
                                 </div>
                               ) : (
-                                <button
-                                  onClick={() => handleRunStep("shot_planner")}
-                                  className="btn-secondary"
-                                  style={{ padding: "4px 8px", fontSize: "0.7rem", borderRadius: "4px", width: "fit-content", marginTop: "4px" }}
-                                >
-                                  Chạy Shot Prompt Generator
-                                </button>
+                                <div style={{ marginTop: "6px", background: "rgba(255,255,255,0.01)", padding: "8px", borderRadius: "4px", border: "1px dashed rgba(255,255,255,0.04)" }}>
+                                  <strong style={{ fontSize: "0.7rem", color: "var(--text-muted)", display: "block", marginBottom: "2px" }}>KEYFRAME IMAGE PROMPT:</strong>
+                                  <p style={{ fontSize: "0.75rem", fontStyle: "italic", margin: 0, color: "var(--text-muted)" }}>Chưa sinh prompt</p>
+                                </div>
                               )}
 
                               {/* Referenced Assets previews on segment */}
@@ -4062,27 +4491,7 @@ export default function Home() {
 
                   {/* Action panel: Generate Motion Prompts / Render Selected Videos */}
                   {projectData.shots.length > 0 && (
-                    <div className="glass-panel" style={{ display: "flex", justifyContent: "space-between", alignItems: "center", padding: "12px 20px" }}>
-                      <div style={{ display: "flex", gap: "10px", alignItems: "center" }}>
-                        <span style={{ fontSize: "0.8rem", color: "var(--text-secondary)" }}>
-                          Công cụ AI:
-                        </span>
-                        <button
-                          onClick={() => handleRunStep("motion_generator")}
-                          className="btn-primary"
-                          style={{
-                            padding: "6px 12px",
-                            fontSize: "0.75rem",
-                            borderRadius: "4px",
-                            background: "rgba(139,92,246,0.2)",
-                            border: "1px solid rgba(139,92,246,0.4)",
-                            color: "#a78bfa"
-                          }}
-                        >
-                          🔮 Cập nhật mô tả chuyển động (Compile Motion)
-                        </button>
-                      </div>
-
+                    <div className="glass-panel" style={{ display: "flex", justifyContent: "flex-end", alignItems: "center", padding: "12px 20px" }}>
                       <div style={{ display: "flex", gap: "8px" }}>
                         <button
                           onClick={() => {
@@ -4112,6 +4521,22 @@ export default function Home() {
                     <div style={{ display: "flex", gap: "10px", alignItems: "center", marginBottom: "16px", padding: "12px", background: "rgba(255,255,255,0.02)", borderRadius: "8px", border: "1px solid rgba(255,255,255,0.05)" }}>
                       <span style={{ fontSize: "0.8rem", color: "var(--text-secondary)", fontWeight: 600 }}>Hành động hàng loạt:</span>
                       <button
+                        onClick={() => handleRunStep("motion_generator")}
+                        disabled={activeStep !== null || isRunningAll}
+                        className="btn-primary"
+                        style={{
+                          padding: "6px 12px",
+                          fontSize: "0.75rem",
+                          borderRadius: "4px",
+                          background: "rgba(168,85,247,0.2)",
+                          border: "1px solid rgba(168,85,247,0.4)",
+                          color: "#c084fc",
+                          fontWeight: 600
+                        }}
+                      >
+                        🔮 Sinh chuyển động (Motion Generator)
+                      </button>
+                      <button
                         onClick={() => handleGenerateAllSegmentVideos(false)}
                         disabled={isGeneratingBatch || activeStep !== null || isRunningAll}
                         className="btn-primary"
@@ -4126,6 +4551,23 @@ export default function Home() {
                         style={{ padding: "6px 12px", fontSize: "0.75rem", borderRadius: "4px" }}
                       >
                         🎬 Tạo video chưa tạo
+                      </button>
+                      <button
+                        onClick={handleExportJsonPrompts}
+                        disabled={activeStep !== null || isRunningAll}
+                        className="btn-primary"
+                        style={{
+                          padding: "6px 12px",
+                          fontSize: "0.75rem",
+                          borderRadius: "4px",
+                          background: "linear-gradient(135deg, #8b5cf6, #ec4899)",
+                          border: "none",
+                          cursor: "pointer",
+                          fontWeight: 600,
+                          boxShadow: "0 0 10px rgba(139, 92, 246, 0.2)"
+                        }}
+                      >
+                        📥 Xuất JSON Prompts
                       </button>
                       {isGeneratingBatch && (
                         <button
