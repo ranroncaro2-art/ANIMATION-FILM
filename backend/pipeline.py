@@ -318,9 +318,10 @@ async def run_shot_planner(
     system_instruction = (
         "You are an expert animation Shot Prompt Generator.\n"
         "Your task is to translate a sequence of analyzed scenes into individual camera shots, generating both a detailed Keyframe reference image prompt and structured shot parameters (timeline, camera, lighting, motion details, transition, dialogue).\n\n"
-        "The analyzed scenes are the single source of truth. You must NOT alter any core content: "
-        "do NOT split dialogues, modify dialogues, change durations, add/remove actions, or add/remove characters/props. "
-        "The dialogue, duration, actions, characters, environment, and props for each shot MUST be copied exactly from the corresponding scene.\n\n"
+        "CRITICAL SHOT DURATION & SPLITTING RULE:\n"
+        "- If a scene has a duration <= 8 seconds, it can be mapped to a single shot of the same duration.\n"
+        "- If any scene has a duration > 8 seconds, you MUST split it into multiple sequential shots so that each shot's duration is in the range of 4 to 8 seconds (inclusive). For example, a 12-second scene should be split into two 6-second shots; a 10-second scene should be split into two 5-second shots. The sum of the durations of the split shots must exactly equal the total duration of the original scene.\n"
+        "- When splitting a scene into multiple shots, you must also distribute the scene's dialogue, actions, and timeline sequentially and logically across the split shots. Ensure that no dialogue or action overlaps or is repeated. If a shot contains a character's dialogue, only include that specific character's speech in that shot's dialogue list.\n\n"
         "Your additions for each shot:\n"
         "1. Camera and framing parameters. You must apply these strict Camera Rule mappings to determine camera_movement and shot_type:\n"
         "   - Focus on Dialogue -> shot_type must be 'Medium Shot'\n"
