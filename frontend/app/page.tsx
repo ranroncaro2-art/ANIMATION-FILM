@@ -2259,7 +2259,69 @@ export default function Home() {
   };
 
   // Sync simulated subtitles playing on Tab 7 (Cinema)
+  interface ParsedSubtitle {
+    startTime: number;
+    endTime: number;
+    character: string;
+    text: string;
+  }
+
+  const parseSubtitlesFromMotionPrompt = (promptText: string): ParsedSubtitle[] => {
+    if (!promptText) return [];
+    const lines = promptText.split("\n");
+    const subs: ParsedSubtitle[] = [];
+    
+    for (const line of lines) {
+      const trimmed = line.trim();
+      const timeMatch = trimmed.match(/^(\d+(?:\.\d+)?)-(\d+(?:\.\d+)?)s\b/);
+      if (timeMatch) {
+        const startTime = parseFloat(timeMatch[1]);
+        const endTime = parseFloat(timeMatch[2]);
+        const quoteMatch = trimmed.match(/['"“'’‘]([^'"”'’]+)['"”'’]/);
+        if (quoteMatch) {
+          const text = quoteMatch[1].trim();
+          const afterTime = trimmed.substring(timeMatch[0].length).trim();
+          const charMatch = afterTime.match(/^([A-Z][a-zA-Z0-9]*)/);
+          const character = charMatch ? charMatch[1] : "";
+          subs.push({ startTime, endTime, character, text });
+        }
+      }
+    }
+    return subs;
+  };
+
+  // Sync simulated subtitles playing on Tab 7 (Cinema)
   const getSubtitlesAtTime = (time: number) => {
+    if (projectData.shots && projectData.shots.length > 0) {
+      let accumulatedTime = 0;
+      for (let i = 0; i < projectData.shots.length; i++) {
+        const shot = projectData.shots[i];
+        const duration = shot.duration_seconds || 5;
+        if (time >= accumulatedTime && time < accumulatedTime + duration) {
+          const motionObj = projectData.motion_prompts?.find((m: any) => m.shot_id === shot.shot_id);
+          const motionPromptText = motionObj?.motion_description || motionObj?.prompt || "";
+          const parsedSubs = parseSubtitlesFromMotionPrompt(motionPromptText);
+          const shotOffset = time - accumulatedTime;
+          const activeSub = parsedSubs.find(s => shotOffset >= s.startTime && shotOffset <= s.endTime);
+          
+          if (activeSub) {
+            return `${activeSub.character}: "${activeSub.text}"`;
+          } else {
+            const scene = projectData.scenes?.find((s: any) => s.scene_id === shot.scene_id);
+            if (scene && scene.dialogues && scene.dialogues.length > 0) {
+              const count = scene.dialogues.length;
+              const segmentDuration = duration / count;
+              const dialogIndex = Math.floor(shotOffset / segmentDuration);
+              const currentDialog = scene.dialogues[Math.min(dialogIndex, count - 1)];
+              return `${currentDialog.character}: "${currentDialog.text}"`;
+            }
+          }
+          return "";
+        }
+        accumulatedTime += duration;
+      }
+    }
+
     if (!projectData.scenes || projectData.scenes.length === 0) return "";
     
     let accumulatedTime = 0;
@@ -2267,9 +2329,7 @@ export default function Home() {
       const scene = projectData.scenes[i];
       const duration = scene.duration_seconds || 5;
       if (time >= accumulatedTime && time < accumulatedTime + duration) {
-        // Look up dialogues in this scene
         if (scene.dialogues && scene.dialogues.length > 0) {
-          // If multiple dialogues, divide duration evenly
           const count = scene.dialogues.length;
           const segmentDuration = duration / count;
           const offset = time - accumulatedTime;
@@ -2371,7 +2431,17 @@ export default function Home() {
             tempAcc += dur;
           });
           
-          const subtitle = getSubtitlesForCinema(clampedTime, sceneStartTime, sceneDuration, scene?.dialogues, scene?.description || "");
+          let subtitle = { character: "", text: "" };
+          const motionPromptText = motionObj?.motion_description || motionObj?.prompt || "";
+          const parsedSubs = parseSubtitlesFromMotionPrompt(motionPromptText);
+          const shotOffset = clampedTime - accumulatedTime;
+          const activeSub = parsedSubs.find(s => shotOffset >= s.startTime && shotOffset <= s.endTime);
+          
+          if (activeSub) {
+            subtitle = { character: activeSub.character, text: activeSub.text };
+          } else {
+            subtitle = getSubtitlesForCinema(clampedTime, sceneStartTime, sceneDuration, scene?.dialogues, scene?.description || "");
+          }
           
           return {
             mode: "shot" as const,
