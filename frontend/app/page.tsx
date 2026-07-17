@@ -2170,7 +2170,8 @@ export default function Home() {
           resolution: videoResolution,
           shots: payloadShots,
           keyframes: payloadKeyframes,
-          motion_prompts: payloadMotion
+          motion_prompts: payloadMotion,
+          pcDirectory: projectData.pcDirectory
         })
       });
 

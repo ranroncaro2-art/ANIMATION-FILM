@@ -6,7 +6,7 @@ import path from "path";
 export async function POST(req: NextRequest) {
   try {
     const body = await req.json();
-    const { projectId, resolution, shots, keyframes, motion_prompts } = body;
+    const { projectId, resolution, shots, keyframes, motion_prompts, pcDirectory } = body;
 
     // Validate
     if (!projectId || !shots) {
@@ -132,6 +132,17 @@ export async function POST(req: NextRequest) {
           }
 
           if (code === 0) {
+            // Copy to pcDirectory if provided
+            if (pcDirectory && fs.existsSync(pcDirectory)) {
+              try {
+                const destinationPath = path.join(pcDirectory, outputFilename);
+                fs.copyFileSync(outputPath, destinationPath);
+                console.log(`Successfully copied compiled video to pcDirectory: ${destinationPath}`);
+              } catch (copyErr) {
+                console.error("Failed to copy compiled video to pcDirectory:", copyErr);
+              }
+            }
+
             const chunk = JSON.stringify({
               percent: 100,
               stage: "Export complete!",
