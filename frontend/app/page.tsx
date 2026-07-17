@@ -4,6 +4,7 @@ import React, { useState, useEffect, useRef } from "react";
 import ApiKeyInput from "../components/ApiKeyInput";
 import JsonEditor from "../components/JsonEditor";
 import { StepKey, PipelineStep } from "../components/PipelineProgress";
+import { FloatingSystemLogs } from "../components/FloatingSystemLogs";
 import {
   saveProject,
   getProject,
@@ -14,7 +15,12 @@ import {
 } from "../utils/db";
 import { queueManager } from "../utils/queue";
 
-const BACKEND_URL = "http://127.0.0.1:8000";
+const getBackendUrl = () => {
+  if (typeof window !== "undefined") {
+    return `http://${window.location.hostname}:8000`;
+  }
+  return "http://127.0.0.1:8000";
+};
 
 interface ProjectData {
   scenes: any[];
@@ -24,6 +30,117 @@ interface ProjectData {
   shots: any[];
   keyframes: any[];
   motion_prompts: any[];
+  pcDirectory?: string;
+}
+
+function mergeProjectData(uiData: any, dbData: any) {
+  if (!dbData) return uiData;
+
+  const merged = { ...uiData };
+
+  // 1. Merge characters
+  if (merged.characters && dbData.characters) {
+    merged.characters = merged.characters.map((uiChar: any) => {
+      const dbChar = dbData.characters.find(
+        (c: any) => c.name === uiChar.name || c.id === uiChar.id
+      );
+      if (dbChar) {
+        return {
+          ...uiChar,
+          url: dbChar.url || uiChar.url || "",
+          media_id: dbChar.media_id || uiChar.media_id || "",
+          account_id: dbChar.account_id || uiChar.account_id || "",
+        };
+      }
+      return uiChar;
+    });
+  }
+
+  // 2. Merge environments
+  if (merged.environments && dbData.environments) {
+    merged.environments = merged.environments.map((uiEnv: any) => {
+      const dbEnv = dbData.environments.find(
+        (e: any) => e.setting_name === uiEnv.setting_name || e.id === uiEnv.id
+      );
+      if (dbEnv) {
+        return {
+          ...uiEnv,
+          url: dbEnv.url || uiEnv.url || "",
+          media_id: dbEnv.media_id || uiEnv.media_id || "",
+          account_id: dbEnv.account_id || uiEnv.account_id || "",
+        };
+      }
+      return uiEnv;
+    });
+  }
+
+  // 3. Merge props
+  if (merged.props && dbData.props) {
+    merged.props = merged.props.map((uiProp: any) => {
+      const dbProp = dbData.props.find(
+        (p: any) => p.prop_name === uiProp.prop_name || p.id === uiProp.id
+      );
+      if (dbProp) {
+        return {
+          ...uiProp,
+          url: dbProp.url || uiProp.url || "",
+          media_id: dbProp.media_id || uiProp.media_id || "",
+          account_id: dbProp.account_id || uiProp.account_id || "",
+        };
+      }
+      return uiProp;
+    });
+  }
+
+  // 4. Merge keyframes
+  if (merged.keyframes && dbData.keyframes) {
+    merged.keyframes = merged.keyframes.map((uiKf: any) => {
+      const dbKf = dbData.keyframes.find((k: any) => k.shot_id === uiKf.shot_id);
+      if (dbKf) {
+        return {
+          ...uiKf,
+          url: dbKf.url || uiKf.url || "",
+          media_id: dbKf.media_id || uiKf.media_id || "",
+          account_id: dbKf.account_id || uiKf.account_id || "",
+        };
+      }
+      return uiKf;
+    });
+    // Add any keyframes that exist in DB but not in UI
+    dbData.keyframes.forEach((dbKf: any) => {
+      const exists = merged.keyframes.some((k: any) => k.shot_id === dbKf.shot_id);
+      if (!exists) {
+        merged.keyframes.push(dbKf);
+      }
+    });
+  } else if (dbData.keyframes) {
+    merged.keyframes = dbData.keyframes;
+  }
+
+  // 5. Merge motion prompts
+  if (merged.motion_prompts && dbData.motion_prompts) {
+    merged.motion_prompts = merged.motion_prompts.map((uiMp: any) => {
+      const dbMp = dbData.motion_prompts.find((m: any) => m.shot_id === uiMp.shot_id);
+      if (dbMp) {
+        return {
+          ...uiMp,
+          video_url: dbMp.video_url || uiMp.video_url || "",
+        };
+      }
+      return uiMp;
+    });
+    // Add any motion prompts that exist in DB but not in UI
+    dbData.motion_prompts.forEach((dbMp: any) => {
+      const exists = merged.motion_prompts.some((m: any) => m.shot_id === dbMp.shot_id);
+      if (!exists) {
+        merged.motion_prompts.push(dbMp);
+      }
+    });
+  } else if (dbData.motion_prompts) {
+    merged.motion_prompts = dbData.motion_prompts;
+  }
+
+  return merged;
 }
 
 const INITIAL_PROJECT_DATA: ProjectData = {
@@ -34,6 +151,7 @@ const INITIAL_PROJECT_DATA: ProjectData = {
   shots: [],
   keyframes: [],
   motion_prompts: [],
+  pcDirectory: "",
 };
 
 const INITIAL_STEPS: PipelineStep[] = [
@@ -63,20 +181,14 @@ const INITIAL_STEPS: PipelineStep[] = [
   },
   {
     key: "shot_planner",
-    label: "5. Shot Planner",
-    description: "Plan individual camera shots, movements, and framings",
-    status: "idle",
-  },
-  {
-    key: "keyframe_generator",
-    label: "6. Keyframe Prompt AI",
-    description: "Generate static reference image prompts for each shot",
+    label: "5. Shot Prompt Generator",
+    description: "Plan camera shots and generate Keyframe & Motion prompts simultaneously",
     status: "idle",
   },
   {
     key: "motion_generator",
-    label: "7. Motion Prompt AI",
-    description: "Generate Veo 3 motion and video generation prompts",
+    label: "6. Motion Generator",
+    description: "Compile and update video motion prompts from shot details",
     status: "idle",
   },
 ];
@@ -156,7 +268,54 @@ Lisa: "You dropped your lunch box."
 Boy: "Thank you!"`;
 
 export default function Home() {
+  // Subscribe to Media Queue from Background Queue Manager
+  const [mediaQueue, setMediaQueue] = useState<any[]>([]);
+  useEffect(() => {
+    return queueManager.subscribeMediaQueue((q) => {
+      setMediaQueue(q);
+    });
+  }, []);
+
+  // Derived generating states from mediaQueue
+  const generatingAssetIds = React.useMemo(() => {
+    const map: Record<string, "pending" | "running" | boolean> = {};
+    mediaQueue.forEach(task => {
+      if (task.status === "pending" || task.status === "running") {
+        if (task.type === "character" || task.type === "environment" || task.type === "prop") {
+          const prefix = task.type === "character" ? "char_" : task.type === "environment" ? "env_" : "prop_";
+          map[`${prefix}${task.targetId}`] = task.status;
+        }
+      }
+    });
+    return map;
+  }, [mediaQueue]);
+
+  const generatingShotKeys = React.useMemo(() => {
+    const map: Record<string, "pending" | "running" | boolean> = {};
+    mediaQueue.forEach(task => {
+      if (task.status === "pending" || task.status === "running") {
+        if (task.type === "shot_image") {
+          map[task.targetId] = task.status;
+        }
+      }
+    });
+    return map;
+  }, [mediaQueue]);
+
+  const generatingSegmentVideoKeys = React.useMemo(() => {
+    const map: Record<string, "pending" | "running" | boolean> = {};
+    mediaQueue.forEach(task => {
+      if (task.status === "pending" || task.status === "running") {
+        if (task.type === "shot_video") {
+          map[task.targetId] = task.status;
+        }
+      }
+    });
+    return map;
+  }, [mediaQueue]);
+
   const [storyboard, setStoryboard] = useState("");
+  const [customMotionInstructions, setCustomMotionInstructions] = useState("");
   const [apiKeys, setApiKeys] = useState<string[]>([]);
   const [selectedModel, setSelectedModel] = useState("gemini-2.5-flash");
   const [rpmLimit, setRpmLimit] = useState(5);
@@ -184,6 +343,224 @@ export default function Home() {
   const [showJsonEditor, setShowJsonEditor] = useState<boolean>(false);
   const [assetSubTab, setAssetSubTab] = useState<string>("scenes");
 
+  // Web Directory Explorer States
+  const [isExplorerOpen, setIsExplorerOpen] = useState(false);
+  const [explorerCurrentPath, setExplorerCurrentPath] = useState("");
+  const [explorerFolders, setExplorerFolders] = useState<{ name: string; path: string }[]>([]);
+  const [explorerParentPath, setExplorerParentPath] = useState<string | null>(null);
+  const [explorerError, setExplorerError] = useState<string | null>(null);
+  const [explorerNewFolderName, setExplorerNewFolderName] = useState("");
+  const [showNewFolderInput, setShowNewFolderInput] = useState(false);
+
+  // Cinema Preview & Subtitle Config States
+  const [cinemaPlayhead, setCinemaPlayhead] = useState<number>(0);
+  const [cinemaPlaying, setCinemaPlaying] = useState<boolean>(false);
+  const [cinemaLoop, setCinemaLoop] = useState<boolean>(true);
+  const [isFullscreen, setIsFullscreen] = useState<boolean>(false);
+  const [subConfig, setSubConfig] = useState({
+    fontFamily: "sans-serif",
+    fontSize: 35,
+    color: "#ffffff",
+    outlineColor: "#000000",
+    strokeWidth: 3,
+    bgOpacity: 63,
+    bgColor: "#000000",
+    bgPadding: 10,
+    maxLineLength: 30,
+    maxWordsPerSub: 6,
+    alignment: "BOTTOM",
+  });
+
+
+  // Project Name Custom Modal States
+  const [isProjectNameModalOpen, setIsProjectNameModalOpen] = useState(false);
+  const [projectNameInput, setProjectNameInput] = useState("");
+  const [projectNameModalTitle, setProjectNameModalTitle] = useState("");
+  const [projectNameModalCallback, setProjectNameModalCallback] = useState<((name: string) => void) | null>(null);
+
+  const showProjectNameModal = (title: string, defaultName: string, callback: (name: string) => void) => {
+    setProjectNameInput(defaultName);
+    setProjectNameModalTitle(title);
+    setProjectNameModalCallback(() => callback);
+    setIsProjectNameModalOpen(true);
+  };
+
+  // Fullscreen image zoom state
+  const [fullscreenImageUrl, setFullscreenImageUrl] = useState<string | null>(null);
+
+  // Batch Image Generation derived state
+  const isGeneratingBatch = React.useMemo(() => {
+    return mediaQueue.some(task => task.status === "pending" || task.status === "running");
+  }, [mediaQueue]);
+
+  const downloadImageUrl = async (url: string, filename: string) => {
+    if (!url) return;
+    try {
+      // If url is already a blob URL or base64 data, download directly
+      if (url.startsWith("blob:") || url.startsWith("data:")) {
+        const link = document.createElement("a");
+        link.href = url;
+        link.download = filename;
+        document.body.appendChild(link);
+        link.click();
+        document.body.removeChild(link);
+        return;
+      }
+      
+      const response = await fetch(url);
+      const blob = await response.blob();
+      const objectUrl = URL.createObjectURL(blob);
+      
+      const link = document.createElement("a");
+      link.href = objectUrl;
+      link.download = filename;
+      document.body.appendChild(link);
+      link.click();
+      document.body.removeChild(link);
+      
+      URL.revokeObjectURL(objectUrl);
+    } catch (e) {
+      console.error("Failed to download image via blob fallback, attempting direct link download:", e);
+      const link = document.createElement("a");
+      link.href = url;
+      link.download = filename;
+      link.target = "_blank";
+      document.body.appendChild(link);
+      link.click();
+      document.body.removeChild(link);
+    }
+  };
+
+  const handleStopDrawing = () => {
+    queueManager.stopMediaQueue();
+  };
+
+  const handleBatchGenerateAssetImage = async (subTab: string) => {
+    queueManager.addLog(`Đã xếp hàng chờ vẽ tất cả ảnh tham chiếu cho ${subTab === "environments" ? "Bối cảnh" : "Đạo cụ"}...`, "info", activeProjectId);
+
+    const assetsToGen: { id: string; type: string; name: string }[] = [];
+
+    if (subTab === "environments") {
+      projectData.environments.forEach(e => {
+        assetsToGen.push({ id: `env_${e.setting_name}`, type: "environment", name: e.setting_name });
+      });
+    } else if (subTab === "props") {
+      projectData.props.forEach(p => {
+        assetsToGen.push({ id: `prop_${p.prop_name}`, type: "prop", name: p.prop_name });
+      });
+    }
+
+    if (assetsToGen.length === 0) {
+      queueManager.addLog("Không tìm thấy ảnh tham chiếu nào cần vẽ.", "info", activeProjectId);
+      return;
+    }
+
+    assetsToGen.forEach(asset => {
+      triggerGenerateAssetImage(asset.id);
+    });
+  };
+
+  const handleGenerateAllAssetImages = async (onlyUncreated: boolean = false) => {
+    if (!checkPcDirectory()) return;
+    queueManager.addLog(onlyUncreated ? "Đã xếp hàng chờ vẽ các ảnh tham chiếu chưa tạo..." : "Đã xếp hàng chờ vẽ tất cả ảnh tham chiếu...", "info", activeProjectId);
+
+    const assetsToGen: { id: string; type: string; name: string }[] = [];
+
+    // Characters
+    projectData.characters.forEach(c => {
+      const id = `char_${c.name}`;
+      const exists = !!(c.url && !c.url.startsWith("mock_"));
+      if (!onlyUncreated || !exists) {
+        assetsToGen.push({ id, type: "character", name: c.name });
+      }
+    });
+
+    // Environments
+    projectData.environments.forEach(e => {
+      const id = `env_${e.setting_name}`;
+      const exists = !!(e.url && !e.url.startsWith("mock_"));
+      if (!onlyUncreated || !exists) {
+        assetsToGen.push({ id, type: "environment", name: e.setting_name });
+      }
+    });
+
+    // Props
+    projectData.props.forEach(p => {
+      const id = `prop_${p.prop_name}`;
+      const exists = !!(p.url && !p.url.startsWith("mock_"));
+      if (!onlyUncreated || !exists) {
+        assetsToGen.push({ id, type: "prop", name: p.prop_name });
+      }
+    });
+
+    if (assetsToGen.length === 0) {
+      queueManager.addLog("Không tìm thấy ảnh tham chiếu nào cần vẽ.", "info", activeProjectId);
+      return;
+    }
+
+    assetsToGen.forEach(asset => {
+      triggerGenerateAssetImage(asset.id);
+    });
+  };
+
+  const handleGenerateAllShotImages = async (onlyUncreated: boolean = false) => {
+    if (!checkPcDirectory()) return;
+    queueManager.addLog(onlyUncreated ? "Đã xếp hàng chờ vẽ các ảnh Shots chưa tạo..." : "Đã xếp hàng chờ vẽ tất cả ảnh Shots...", "info", activeProjectId);
+
+    const shotsToGen: string[] = [];
+
+    projectData.shots.forEach(s => {
+      const shotKey = `shot_${s.scene_number || s.scene_id || ''}_${s.shot_id}`;
+      const keyframeObj = projectData.keyframes
+        ? projectData.keyframes.find((k: any) => k.shot_id === s.shot_id)
+        : null;
+      const exists = !!(keyframeObj?.url && !keyframeObj.url.startsWith("mock_"));
+      if (!onlyUncreated || !exists) {
+        shotsToGen.push(shotKey);
+      }
+    });
+
+    if (shotsToGen.length === 0) {
+      queueManager.addLog("Không tìm thấy ảnh Shots nào cần vẽ.", "info", activeProjectId);
+      return;
+    }
+
+    shotsToGen.forEach(shotKey => {
+      triggerGenerateShotImage(shotKey);
+    });
+  };
+
+  const handleGenerateAllSegmentVideos = async (onlyUncreated: boolean = false) => {
+    if (!checkPcDirectory()) return;
+    queueManager.addLog(onlyUncreated ? "Đã xếp hàng chờ render các video segment chưa tạo..." : "Đã xếp hàng chờ render tất cả video segment...", "info", activeProjectId);
+
+    const videosToGen: string[] = [];
+
+    projectData.shots.forEach(s => {
+      const shotKey = `shot_${s.scene_number || s.scene_id || ''}_${s.shot_id}`;
+      const motionIndex = projectData.motion_prompts 
+        ? projectData.motion_prompts.findIndex((m: any) => m.shot_id === s.shot_id)
+        : -1;
+      const videoUrl = motionIndex !== -1 && projectData.motion_prompts
+        ? projectData.motion_prompts[motionIndex].video_url || ""
+        : "";
+      
+      const exists = !!videoUrl || mockGeneratedSegmentVideos[shotKey] || isVideoGenerated;
+      if (!onlyUncreated || !exists) {
+        videosToGen.push(shotKey);
+      }
+    });
+
+    if (videosToGen.length === 0) {
+      queueManager.addLog("Không tìm thấy video segment nào cần render.", "info", activeProjectId);
+      return;
+    }
+
+    videosToGen.forEach(shotKey => {
+      triggerGenerateSegmentVideo(shotKey);
+    });
+  };
+
   // Local API Draw & Video configurations
   const [imageCount, setImageCount] = useState<number>(1);
   const [imageAspectRatio, setImageAspectRatio] = useState<string>("IMAGE_ASPECT_RATIO_LANDSCAPE");
@@ -195,18 +572,20 @@ export default function Home() {
 
   const [imageConcurrency, setImageConcurrency] = useState<number>(2);
   const [videoConcurrency, setVideoConcurrency] = useState<number>(1);
+  const [isLoaded, setIsLoaded] = useState<boolean>(false);
+
 
   // Mock Generation previews for Asset References & Shots
   const [mockGeneratedReferenceImages, setMockGeneratedReferenceImages] = useState<Record<string, boolean>>({});
   const [mockGeneratedShotImages, setMockGeneratedShotImages] = useState<Record<string, boolean>>({});
-  const [generatingAssetIds, setGeneratingAssetIds] = useState<Record<string, boolean>>({});
-  const [generatingShotKeys, setGeneratingShotKeys] = useState<Record<string, boolean>>({});
 
   // Video Rendering preview state
   const [isRenderingVideo, setIsRenderingVideo] = useState<boolean>(false);
   const [videoRenderPercent, setVideoRenderPercent] = useState<number>(0);
   const [videoRenderStage, setVideoRenderStage] = useState<string>("");
   const [isVideoGenerated, setIsVideoGenerated] = useState<boolean>(false);
+  const [videoResolution, setVideoResolution] = useState<string>("720");
+  const [renderTimestamp, setRenderTimestamp] = useState<number>(Date.now());
 
   // Video Player state
   const videoRef = useRef<HTMLVideoElement>(null);
@@ -217,7 +596,6 @@ export default function Home() {
   // Video Segment rendering states
   const [selectedShots, setSelectedShots] = useState<Record<string, boolean>>({});
   const [mockGeneratedSegmentVideos, setMockGeneratedSegmentVideos] = useState<Record<string, boolean>>({});
-  const [generatingSegmentVideoKeys, setGeneratingSegmentVideoKeys] = useState<Record<string, boolean>>({});
 
   // Helper to update projectData directly in IndexedDB for isolation
   const updateProjectDataInDb = async (projectId: string, updateFn: (data: ProjectData) => ProjectData) => {
@@ -237,26 +615,142 @@ export default function Home() {
     }
   };
 
-  // System logs states
-  const [systemLogs, setSystemLogs] = useState<any[]>([]);
-  const [showLogsPanel, setShowLogsPanel] = useState<boolean>(true);
-  const [filterLogsCurrentProj, setFilterLogsCurrentProj] = useState<boolean>(false);
-  const logsEndRef = useRef<HTMLDivElement>(null);
-
-  // Subscribe to system logs from the singleton queueManager
-  useEffect(() => {
-    const unsubscribe = queueManager.subscribeLogs((logs) => {
-      setSystemLogs(logs);
-    });
-    return () => unsubscribe();
-  }, []);
-
-  // Scroll to bottom when new logs are appended
-  useEffect(() => {
-    if (logsEndRef.current) {
-      logsEndRef.current.scrollIntoView({ behavior: "smooth" });
+  // Helper to render media generation states (pending spinner or running loader)
+  const renderMediaLoader = (status: any, activeText: string) => {
+    if (!status) return null;
+    if (status === "running") {
+      return (
+        <div style={{ display: "flex", flexDirection: "column", alignItems: "center", gap: "8px" }}>
+          <style>{`
+            @keyframes spin {
+              0% { transform: rotate(0deg); }
+              100% { transform: rotate(360deg); }
+            }
+            @keyframes pulse {
+              0%, 100% { opacity: 0.6; }
+              50% { opacity: 1; }
+            }
+          `}</style>
+          <div style={{
+            width: "24px",
+            height: "24px",
+            border: "3px solid rgba(255,255,255,0.1)",
+            borderTop: "3px solid var(--accent-cyan)",
+            borderRadius: "50%",
+            animation: "spin 1s linear infinite"
+          }} />
+          <span style={{ fontSize: "0.75rem", color: "var(--accent-cyan)", fontWeight: 600 }}>{activeText}</span>
+        </div>
+      );
     }
-  }, [systemLogs, showLogsPanel]);
+    return (
+      <div style={{ display: "flex", flexDirection: "column", alignItems: "center", gap: "8px" }}>
+        <style>{`
+          @keyframes pulse {
+            0%, 100% { opacity: 0.6; }
+            50% { opacity: 1; }
+          }
+        `}</style>
+        <span style={{ fontSize: "1.2rem", animation: "pulse 1.5s infinite", display: "inline-block" }}>⏳</span>
+        <span style={{ fontSize: "0.75rem", color: "var(--text-muted)", fontWeight: 500 }}>Đang chờ...</span>
+      </div>
+    );
+  };
+
+  // Helper to render uniform image action overlay toolbar (using simple, easy-to-understand icons)
+  const renderImageActionToolbar = (url: string, filename: string, onRecreate?: () => void) => {
+    return (
+      <div style={{
+        position: "absolute",
+        bottom: 0,
+        left: 0,
+        right: 0,
+        background: "rgba(6, 9, 16, 0.85)",
+        borderTop: "1px solid rgba(255,255,255,0.08)",
+        padding: "6px 12px",
+        display: "flex",
+        justifyContent: onRecreate ? "space-between" : "flex-end",
+        alignItems: "center",
+        zIndex: 10
+      }}>
+        {onRecreate && (
+          <button
+            onClick={onRecreate}
+            title="Tạo lại ảnh"
+            style={{
+              background: "transparent",
+              border: "none",
+              color: "#ffffff",
+              fontSize: "0.75rem",
+              cursor: "pointer",
+              display: "flex",
+              alignItems: "center",
+              justifyContent: "center",
+              padding: "4px",
+              borderRadius: "4px",
+              transition: "background 0.2s"
+            }}
+          >
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round">
+              <path d="M3 12a9 9 0 0 1 9-9 9.75 9.75 0 0 1 6.74 2.74L21 8" />
+              <path d="M16 3h5v5" />
+              <path d="M21 12a9 9 0 0 1-9 9 9.75 9.75 0 0 1-6.74-2.74L3 16" />
+              <path d="M8 21H3v-5" />
+            </svg>
+          </button>
+        )}
+        <div style={{ display: "flex", gap: "8px" }}>
+          <button
+            onClick={() => downloadImageUrl(url, filename)}
+            title="Tải ảnh về máy"
+            style={{
+              background: "transparent",
+              border: "none",
+              color: "var(--text-secondary)",
+              cursor: "pointer",
+              display: "flex",
+              alignItems: "center",
+              justifyContent: "center",
+              padding: "4px",
+              borderRadius: "4px",
+              transition: "background 0.2s"
+            }}
+          >
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round">
+              <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4" />
+              <polyline points="7 10 12 15 17 10" />
+              <line x1="12" y1="15" x2="12" y2="3" />
+            </svg>
+          </button>
+          <button
+            onClick={() => setFullscreenImageUrl(url)}
+            title="Xem ảnh phóng to"
+            style={{
+              background: "transparent",
+              border: "none",
+              color: "var(--text-secondary)",
+              cursor: "pointer",
+              display: "flex",
+              alignItems: "center",
+              justifyContent: "center",
+              padding: "4px",
+              borderRadius: "4px",
+              transition: "background 0.2s"
+            }}
+          >
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round">
+              <path d="M15 3h6v6" />
+              <path d="M9 21H3v-6" />
+              <path d="M21 3l-7 7" />
+              <path d="M3 21l7-7" />
+            </svg>
+          </button>
+        </div>
+      </div>
+    );
+  };
+
+  // System logs are handled by the FloatingSystemLogs component
 
   // Load configuration and active project from IndexedDB/LocalStorage on mount
   useEffect(() => {
@@ -335,37 +829,52 @@ export default function Home() {
           setStoryboard(SAMPLE_SCRIPT_AUTO);
         }
       })
-      .catch(console.error);
+      .catch(console.error)
+      .finally(() => {
+        setIsLoaded(true);
+      });
 
     // Refresh the list of saved projects
     refreshProjectsList();
   }, []);
 
+  // Synchronize image and video concurrency limits to queueManager
+  useEffect(() => {
+    queueManager.setConcurrencyLimits(imageConcurrency, videoConcurrency);
+  }, [imageConcurrency, videoConcurrency]);
+
   // Debounced auto-save to IndexedDB for the active workspace
   useEffect(() => {
-    const timer = setTimeout(() => {
+    if (!isLoaded) return;
+    const timer = setTimeout(async () => {
       // Only save if there's actually some content to store
       if (storyboard.trim() || projectData.scenes.length > 0) {
-        const activeProject: SavedProject = {
-          id: activeProjectId,
-          name: activeProjectName,
-          updatedAt: new Date().toISOString(),
-          storyboard,
-          projectData,
-          steps,
-          model: selectedModel,
-          selectedStyle,
-          styleDescription,
-          workflowMode,
-        };
-        saveProject(activeProject).catch((err) => {
+        try {
+          // Retrieve the existing project data from DB to merge background-generated assets
+          const existing = await getProject(activeProjectId);
+          const mergedData = existing ? mergeProjectData(projectData, existing.projectData) : projectData;
+
+          const activeProject: SavedProject = {
+            id: activeProjectId,
+            name: activeProjectName,
+            updatedAt: new Date().toISOString(),
+            storyboard,
+            projectData: mergedData,
+            steps,
+            model: selectedModel,
+            selectedStyle,
+            styleDescription,
+            workflowMode,
+          };
+          await saveProject(activeProject);
+        } catch (err) {
           console.error("IndexedDB Auto-save failed:", err);
-        });
+        }
       }
     }, 1000); // 1 second debounce
     
     return () => clearTimeout(timer);
-  }, [storyboard, projectData, steps, activeProjectName, selectedModel, selectedStyle, styleDescription, workflowMode, activeProjectId]);
+  }, [storyboard, projectData, steps, activeProjectName, selectedModel, selectedStyle, styleDescription, workflowMode, activeProjectId, isLoaded]);
 
   // Refresh saved projects list
   const refreshProjectsList = async () => {
@@ -410,38 +919,37 @@ export default function Home() {
   }, [activeProjectId]);
 
   const handleSaveNamedProject = async () => {
-    const name = prompt("Enter project name:", activeProjectName === "Untitled Project" ? "" : activeProjectName);
-    if (name === null) return;
-    if (!name.trim()) {
-      alert("Please enter a valid project name.");
-      return;
-    }
+    showProjectNameModal(
+      "Lưu Tên Dự Án",
+      activeProjectName === "Untitled Project" ? "" : activeProjectName,
+      async (name) => {
+        const projectId = activeProjectId === "active" ? `project_${Date.now()}` : activeProjectId;
+        const newProject: SavedProject = {
+          id: projectId,
+          name: name.trim(),
+          updatedAt: new Date().toISOString(),
+          storyboard,
+          projectData,
+          steps,
+          model: selectedModel,
+          selectedStyle,
+          styleDescription,
+          workflowMode,
+        };
 
-    const projectId = activeProjectId === "active" ? `project_${Date.now()}` : activeProjectId;
-    const newProject: SavedProject = {
-      id: projectId,
-      name: name.trim(),
-      updatedAt: new Date().toISOString(),
-      storyboard,
-      projectData,
-      steps,
-      model: selectedModel,
-      selectedStyle,
-      styleDescription,
-      workflowMode,
-    };
-
-    try {
-      await saveProject(newProject);
-      setActiveProjectId(projectId);
-      setActiveProjectName(name.trim());
-      localStorage.setItem("last_active_project_id", projectId);
-      await refreshProjectsList();
-      queueManager.addLog(`Đã lưu dự án "${newProject.name}" thành công!`, "success", projectId);
-      alert(`Project "${newProject.name}" saved successfully!`);
-    } catch (err: any) {
-      alert(`Save failed: ${err.message}`);
-    }
+        try {
+          await saveProject(newProject);
+          setActiveProjectId(projectId);
+          setActiveProjectName(name.trim());
+          localStorage.setItem("last_active_project_id", projectId);
+          await refreshProjectsList();
+          queueManager.addLog(`Đã lưu dự án "${newProject.name}" thành công!`, "success", projectId);
+          alert(`Project "${newProject.name}" saved successfully!`);
+        } catch (err: any) {
+          alert(`Save failed: ${err.message}`);
+        }
+      }
+    );
   };
 
   // Load project handler
@@ -491,43 +999,47 @@ export default function Home() {
       return;
     }
 
-    const name = prompt("Nhập tên dự án mới:", "Dự án mới");
-    if (name === null) return; // User cancelled
-    const finalName = name.trim() || "Dự án mới";
-    const newId = `project_${Date.now()}`;
+    showProjectNameModal(
+      "Tạo Dự Án Mới",
+      "Dự án mới",
+      (name) => {
+        const finalName = name.trim() || "Dự án mới";
+        const newId = `project_${Date.now()}`;
 
-    const newProject: SavedProject = {
-      id: newId,
-      name: finalName,
-      updatedAt: new Date().toISOString(),
-      storyboard: workflowMode === "script_auto" ? SAMPLE_SCRIPT_AUTO : SAMPLE_SRT,
-      projectData: INITIAL_PROJECT_DATA,
-      steps: INITIAL_STEPS,
-      model: selectedModel,
-      selectedStyle,
-      styleDescription,
-      workflowMode,
-    };
+        const newProject: SavedProject = {
+          id: newId,
+          name: finalName,
+          updatedAt: new Date().toISOString(),
+          storyboard: workflowMode === "script_auto" ? SAMPLE_SCRIPT_AUTO : SAMPLE_SRT,
+          projectData: INITIAL_PROJECT_DATA,
+          steps: INITIAL_STEPS,
+          model: selectedModel,
+          selectedStyle,
+          styleDescription,
+          workflowMode,
+        };
 
-    saveProject(newProject)
-      .then(() => {
-        setActiveProjectId(newId);
-        setActiveProjectName(finalName);
-        localStorage.setItem("last_active_project_id", newId);
-        setStoryboard(newProject.storyboard);
-        setProjectData(INITIAL_PROJECT_DATA);
-        setSteps(INITIAL_STEPS);
-        setSelectedStep(null);
-        setActiveTab("cauhinh");
-        setMockGeneratedReferenceImages({});
-        setMockGeneratedShotImages({});
-        setIsVideoGenerated(false);
-        refreshProjectsList();
-        queueManager.addLog(`Đã khởi tạo dự án mới "${finalName}" với ID: ${newId}`, "info", newId);
-      })
-      .catch((err) => {
-        alert("Không thể khởi tạo dự án mới: " + err.message);
-      });
+        saveProject(newProject)
+          .then(() => {
+            setActiveProjectId(newId);
+            setActiveProjectName(finalName);
+            localStorage.setItem("last_active_project_id", newId);
+            setStoryboard(newProject.storyboard);
+            setProjectData(INITIAL_PROJECT_DATA);
+            setSteps(INITIAL_STEPS);
+            setSelectedStep(null);
+            setActiveTab("cauhinh");
+            setMockGeneratedReferenceImages({});
+            setMockGeneratedShotImages({});
+            setIsVideoGenerated(false);
+            refreshProjectsList();
+            queueManager.addLog(`Đã khởi tạo dự án mới "${finalName}" với ID: ${newId}`, "info", newId);
+          })
+          .catch((err) => {
+            alert("Không thể khởi tạo dự án mới: " + err.message);
+          });
+      }
+    );
   };
 
   // Delete project handler
@@ -581,6 +1093,147 @@ export default function Home() {
 
   const handleClearStoryboard = () => {
     setStoryboard("");
+  };
+
+  const checkPcDirectory = (): boolean => {
+    if (!projectData.pcDirectory) {
+      alert("Bạn chưa chọn thư mục lưu dự án trên PC! Vui lòng cấu hình thư mục lưu ở tab 'Cấu hình dự án' trước.");
+      setActiveTab("cauhinh");
+      return false;
+    }
+    return true;
+  };
+
+  const handleSelectPcDirectory = () => {
+    handleOpenExplorer();
+  };
+
+  const explorePath = async (targetPath: string) => {
+    setExplorerError(null);
+    try {
+      const response = await fetch("/api/explore-directory", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ currentPath: targetPath })
+      });
+      if (response.ok) {
+        const data = await response.json();
+        setExplorerCurrentPath(data.currentPath);
+        setExplorerFolders(data.folders || []);
+        setExplorerParentPath(data.parent);
+        setShowNewFolderInput(false);
+        setExplorerNewFolderName("");
+      } else {
+        const data = await response.json();
+        setExplorerError(data.error || "Không thể truy cập thư mục");
+      }
+    } catch (err: any) {
+      setExplorerError(err.message);
+    }
+  };
+
+  const handleOpenExplorer = () => {
+    setIsExplorerOpen(true);
+    explorePath(projectData.pcDirectory || "");
+  };
+
+  const handleCreateNewFolder = async () => {
+    if (!explorerNewFolderName.trim() || !explorerCurrentPath) return;
+    try {
+      const response = await fetch("/api/create-directory", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ parentPath: explorerCurrentPath, folderName: explorerNewFolderName })
+      });
+      if (response.ok) {
+        explorePath(explorerCurrentPath);
+      } else {
+        const data = await response.json();
+        alert(data.error || "Không thể tạo thư mục mới");
+      }
+    } catch (err: any) {
+      alert(`Lỗi tạo thư mục: ${err.message}`);
+    }
+  };
+
+  const handleSelectExplorerFolder = async (selectedPath: string) => {
+    try {
+      const response = await fetch("/api/init-directory", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ path: selectedPath })
+      });
+      if (response.ok) {
+        const data = await response.json();
+        if (data.success && data.path) {
+          const updatedData = { ...projectData, pcDirectory: data.path };
+          setProjectData(updatedData);
+          
+          const project = await getProject(activeProjectId);
+          if (project) {
+            project.projectData = updatedData;
+            project.updatedAt = new Date().toISOString();
+            await saveProject(project);
+          }
+          
+          queueManager.addLog(`[Cấu hình] Đã chọn thư mục dự án trên PC: ${data.path}`, "success", activeProjectId);
+          setIsExplorerOpen(false);
+        }
+      } else {
+        const errData = await response.json();
+        alert(`Thư mục không hợp lệ: ${errData.error || "Lỗi không xác định"}`);
+      }
+    } catch (err: any) {
+      alert(`Lỗi thiết lập thư mục: ${err.message}`);
+    }
+  };
+
+  const handleManualPcDirectoryChange = (val: string) => {
+    setProjectData((prev) => ({ ...prev, pcDirectory: val }));
+  };
+
+  const handleManualPcDirectoryBlur = async (val: string) => {
+    const trimmed = val.trim();
+    if (!trimmed) {
+      const updatedData = { ...projectData, pcDirectory: "" };
+      setProjectData(updatedData);
+      const project = await getProject(activeProjectId);
+      if (project) {
+        project.projectData = updatedData;
+        project.updatedAt = new Date().toISOString();
+        await saveProject(project);
+      }
+      return;
+    }
+
+    try {
+      const response = await fetch("/api/init-directory", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ path: trimmed })
+      });
+      if (response.ok) {
+        const data = await response.json();
+        if (data.success && data.path) {
+          const updatedData = { ...projectData, pcDirectory: data.path };
+          setProjectData(updatedData);
+          
+          const project = await getProject(activeProjectId);
+          if (project) {
+            project.projectData = updatedData;
+            project.updatedAt = new Date().toISOString();
+            await saveProject(project);
+          }
+          
+          queueManager.addLog(`[Cấu hình] Đã thiết lập thư mục PC: ${data.path}`, "success", activeProjectId);
+        }
+      } else {
+        const errData = await response.json();
+        alert(`Thư mục không hợp lệ: ${errData.error || "Lỗi không xác định"}`);
+      }
+    } catch (err: any) {
+      console.error(err);
+    }
   };
 
   const updateStepStatus = (
@@ -665,6 +1318,7 @@ export default function Home() {
 
   // Delegate execution flow to queueManager
   const handleRunStep = (stepKey: StepKey) => {
+    if (!checkPcDirectory()) return;
     if (apiKeys.length === 0) {
       setIsSettingsOpen(true);
       alert("Please add at least one Gemini API key in the Settings panel.");
@@ -686,11 +1340,13 @@ export default function Home() {
       selectedModel,
       rpmLimit,
       chunkSize,
+      custom_instructions: stepKey === "motion_generator" ? customMotionInstructions : undefined,
     });
   };
 
   // Run groups of steps (Combo runs)
   const runCombo1 = () => {
+    if (!checkPcDirectory()) return;
     if (apiKeys.length === 0) {
       setIsSettingsOpen(true);
       alert("Please add at least one Gemini API key in the Settings panel.");
@@ -706,8 +1362,9 @@ export default function Home() {
     );
     if (!confirmClear) return;
 
-    // Reset local data
-    setProjectData(INITIAL_PROJECT_DATA);
+    // Reset local data but preserve PC directory
+    const preservedData = { ...INITIAL_PROJECT_DATA, pcDirectory: projectData.pcDirectory };
+    setProjectData(preservedData);
 
     queueManager.runCombo1({
       projectId: activeProjectId,
@@ -718,13 +1375,14 @@ export default function Home() {
       rpmLimit,
       chunkSize,
       initialSteps: INITIAL_STEPS,
-      projectData: INITIAL_PROJECT_DATA,
+      projectData: preservedData,
     });
     setActiveTab("assets");
     setAssetSubTab("scenes");
   };
 
   const runCombo2 = () => {
+    if (!checkPcDirectory()) return;
     if (apiKeys.length === 0) {
       setIsSettingsOpen(true);
       alert("Please add at least one Gemini API key in the Settings panel.");
@@ -740,8 +1398,9 @@ export default function Home() {
     );
     if (!confirmClear) return;
 
-    // Reset local data
-    setProjectData(INITIAL_PROJECT_DATA);
+    // Reset local data but preserve PC directory
+    const preservedData = { ...INITIAL_PROJECT_DATA, pcDirectory: projectData.pcDirectory };
+    setProjectData(preservedData);
 
     queueManager.runCombo2({
       projectId: activeProjectId,
@@ -752,7 +1411,7 @@ export default function Home() {
       rpmLimit,
       chunkSize,
       initialSteps: INITIAL_STEPS,
-      projectData: INITIAL_PROJECT_DATA,
+      projectData: preservedData,
     });
     setActiveTab("assets");
     setAssetSubTab("characters");
@@ -760,6 +1419,7 @@ export default function Home() {
 
   // Run the whole pipeline sequentially
   const handleRunAllPipeline = () => {
+    if (!checkPcDirectory()) return;
     if (apiKeys.length === 0) {
       setIsSettingsOpen(true);
       alert("Please add at least one Gemini API key in the Settings panel.");
@@ -775,8 +1435,8 @@ export default function Home() {
     );
     if (!confirmClear) return;
 
-    // Reset local data
-    setProjectData(INITIAL_PROJECT_DATA);
+    // Reset local data but preserve PC directory
+    setProjectData({ ...INITIAL_PROJECT_DATA, pcDirectory: projectData.pcDirectory });
 
     queueManager.runAllPipeline({
       projectId: activeProjectId,
@@ -787,6 +1447,7 @@ export default function Home() {
       rpmLimit,
       chunkSize,
       initialSteps: INITIAL_STEPS,
+      pcDirectory: projectData.pcDirectory,
     });
   };
 
@@ -811,50 +1472,79 @@ export default function Home() {
       })) : []
     }));
 
-    const payloadCharacters = (projectData.characters || []).map((char: any) => ({
-      name: char.name,
-      description: char.description,
-      prompt: char.turnaround_prompt
-    }));
+    const payloadCharacters = (projectData.characters || []).map((char: any, index: number) => {
+      const cname = char.canonical_name || char.name || "";
+      return {
+        id: char.id || `char_${Date.now()}_${index}`,
+        canonical_name: cname,
+        name: cname,
+        age: char.age || "",
+        gender: char.gender || "",
+        appearance: char.appearance || "",
+        outfit: char.outfit || "",
+        hairstyle: char.hairstyle || "",
+        accessories: char.accessories || "",
+        voice_style: char.voice_style || "",
+        personality: char.personality || "",
+        turnaround_prompt: char.turnaround_prompt || char.prompt || "",
+        prompt: char.turnaround_prompt || char.prompt || "",
+        description: char.description || ""
+      };
+    });
 
-    const payloadEnvironments = (projectData.environments || []).map((env: any) => ({
-      name: env.setting_name,
-      prompt: env.reference_prompt
-    }));
+    const payloadEnvironments = (projectData.environments || []).map((env: any, index: number) => {
+      const ename = env.setting_name || env.name || "";
+      const eprompt = env.reference_prompt || env.prompt || "";
+      return {
+        id: env.id || `env_${Date.now()}_${index}`,
+        name: ename,
+        reference_prompt: eprompt,
+        prompt: eprompt
+      };
+    });
 
-    const payloadProps = (projectData.props || []).map((prop: any) => ({
-      name: prop.prop_name,
-      prompt: prop.reference_prompt
-    }));
+    const payloadProps = (projectData.props || []).map((prop: any, index: number) => {
+      const pname = prop.prop_name || prop.name || "";
+      const pprompt = prop.reference_prompt || prop.prompt || "";
+      return {
+        id: prop.id || `prop_${Date.now()}_${index}`,
+        name: pname,
+        reference_prompt: pprompt,
+        prompt: pprompt
+      };
+    });
 
     const payloadShots = (projectData.shots || []).map((shot: any) => ({
       shot_id: shot.shot_id,
-      scene_number: shot.scene_number || shot.scene_id,
-      duration_seconds: shot.duration_seconds,
+      scene_number: Number(shot.scene_number || shot.scene_id || 0),
+      duration_seconds: Number(shot.duration_seconds || 5),
       actions: shot.actions || "",
-      characters: shot.characters,
-      environment: shot.environment,
-      props: shot.props,
+      characters: shot.characters || [],
+      environment: shot.setting || shot.environment || "",
+      props: shot.props || [],
       dialogue: shot.dialogue ? shot.dialogue.map((d: any) => ({
         character: d.character,
         speech: d.text
       })) : [],
-      camera_movement: shot.camera_movement,
-      shot_type: shot.framing
+      camera_movement: shot.camera_movement || "",
+      shot_type: shot.framing || "",
+      transition: shot.transition || "Cut",
+      composition: shot.composition || "Rule of Thirds",
+      lighting: shot.lighting || "Warm lighting"
     }));
 
     const payloadKeyframes = (projectData.keyframes || []).map((k: any) => ({
       shot_id: k.shot_id,
-      prompt: k.keyframe_image_prompt
+      prompt: k.keyframe_image_prompt || ""
     }));
 
     const payloadMotion = (projectData.motion_prompts || []).map((m: any) => ({
       shot_id: m.shot_id,
-      prompt: m.motion_description
+      prompt: m.motion_description || m.prompt || ""
     }));
 
     try {
-      const response = await fetch(`${BACKEND_URL}/api/export-zip`, {
+      const response = await fetch(`${getBackendUrl()}/api/export-zip`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
@@ -905,7 +1595,8 @@ export default function Home() {
         payload.account_id = accountId || "default_account";
       }
 
-      const response = await fetch("http://127.0.0.1:5000/api/generate", {
+      const localApiUrl = typeof window !== "undefined" ? `http://${window.location.hostname}:5000` : "http://127.0.0.1:5000";
+      const response = await fetch(`${localApiUrl}/api/generate`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify(payload)
@@ -926,21 +1617,15 @@ export default function Home() {
         throw new Error("No image was returned from local API.");
       }
     } catch (err: any) {
-      console.warn("Local Image API offline or failed, falling back to mock. Error:", err.message);
-      // Fallback: Use anime placeholder URL so persistence on reload is active even when offline
-      return {
-        url: "https://images.unsplash.com/photo-1607604276583-eef5d076aa5f?w=400&auto=format&fit=crop&q=80",
-        media_id: `mock_media_${Math.random().toString(36).substring(2, 11)}`,
-        account_id: "mock_account"
-      };
+      console.error("Local Image API failed: ", err.message);
+      throw err;
     }
   };
 
-  // Reference image generator trigger
+  // Reference image generator trigger (pushes task to sequential queue)
   const triggerGenerateAssetImage = async (id: string) => {
+    if (!checkPcDirectory()) return;
     const startedProjectId = activeProjectId;
-    setGeneratingAssetIds(prev => ({ ...prev, [id]: true }));
-    queueManager.addLog(`Bắt đầu vẽ ảnh tham chiếu cho Asset: ${id}...`, "running", startedProjectId);
     
     let promptText = "";
     let type: "character" | "environment" | "prop" = "character";
@@ -963,40 +1648,27 @@ export default function Home() {
       promptText = found ? found.reference_prompt : `prop Pixar style ${name}`;
     }
 
-    try {
-      const result = await generateImageViaLocalApi(promptText);
-
-      // Isolated database update
-      await updateProjectDataInDb(startedProjectId, (prevData) => {
-        const copy = { ...prevData };
-        if (type === "character") {
-          copy.characters = copy.characters.map(c => c.name === name ? { ...c, url: result.url, media_id: result.media_id, account_id: result.account_id } : c);
-        } else if (type === "environment") {
-          copy.environments = copy.environments.map(e => e.setting_name === name ? { ...e, url: result.url, media_id: result.media_id, account_id: result.account_id } : e);
-        } else if (type === "prop") {
-          copy.props = copy.props.map(p => p.prop_name === name ? { ...p, url: result.url, media_id: result.media_id, account_id: result.account_id } : p);
-        }
-        return copy;
-      });
-
-      setMockGeneratedReferenceImages(prev => ({ ...prev, [id]: true }));
-      queueManager.addLog(`Đã vẽ xong ảnh tham chiếu cho Asset: ${name}! Media ID: ${result.media_id}`, "success", startedProjectId);
-    } catch (err: any) {
-      queueManager.addLog(`Lỗi vẽ ảnh Asset: ${err.message}`, "error", startedProjectId);
-    } finally {
-      setGeneratingAssetIds(prev => {
-        const copy = { ...prev };
-        delete copy[id];
-        return copy;
-      });
-    }
+    const taskId = `media_task_${Date.now()}_${Math.random().toString(36).substring(2, 5)}`;
+    queueManager.addMediaTask({
+      id: taskId,
+      projectId: startedProjectId,
+      projectName: activeProjectName,
+      type,
+      targetId: name,
+      prompt: promptText,
+      params: {
+        imageCount,
+        imageAspectRatio,
+        imageModel,
+        pcDirectory: projectData.pcDirectory,
+      }
+    });
   };
 
+  // Shot image generator trigger (pushes task to sequential queue)
   const triggerGenerateShotImage = async (key: string) => {
+    if (!checkPcDirectory()) return;
     const startedProjectId = activeProjectId;
-    setGeneratingShotKeys(prev => ({ ...prev, [key]: true }));
-    queueManager.addLog(`Bắt đầu vẽ ảnh cho Shot: ${key}...`, "running", startedProjectId);
-
     const parts = key.split("_");
     const shotId = parts[parts.length - 1];
 
@@ -1026,47 +1698,34 @@ export default function Home() {
       }
     });
 
-    if (mediaIds.length > 0) {
-      queueManager.addLog(`Phát hiện ${mediaIds.length} ảnh tham chiếu cho Shot ${shotId}. Sử dụng chế độ Image-to-Image.`, "info", startedProjectId);
-    }
-
     const keyframeObj = projectData.keyframes
       ? projectData.keyframes.find((k: any) => k.shot_id === shotId)
       : null;
     const promptText = keyframeObj?.keyframe_image_prompt || `Pixar keyframe for shot ${shotId}`;
 
-    try {
-      const result = await generateImageViaLocalApi(promptText, mediaIds.length > 0 ? mediaIds : undefined, accountId || undefined);
-
-      // Isolated database update
-      await updateProjectDataInDb(startedProjectId, (prevData) => {
-        const copy = { ...prevData };
-        copy.keyframes = copy.keyframes.map(k =>
-          k.shot_id === shotId
-            ? { ...k, url: result.url, media_id: result.media_id, account_id: result.account_id }
-            : k
-        );
-        return copy;
-      });
-
-      setMockGeneratedShotImages(prev => ({ ...prev, [key]: true }));
-      queueManager.addLog(`Đã vẽ xong ảnh cho Shot: ${shotId}! Media ID: ${result.media_id}`, "success", startedProjectId);
-    } catch (err: any) {
-      queueManager.addLog(`Lỗi vẽ ảnh cho Shot ${shotId}: ${err.message}`, "error", startedProjectId);
-    } finally {
-      setGeneratingShotKeys(prev => {
-        const copy = { ...prev };
-        delete copy[key];
-        return copy;
-      });
-    }
+    const taskId = `media_task_${Date.now()}_${Math.random().toString(36).substring(2, 5)}`;
+    queueManager.addMediaTask({
+      id: taskId,
+      projectId: startedProjectId,
+      projectName: activeProjectName,
+      type: "shot_image",
+      targetId: key, // Keep full key
+      prompt: promptText,
+      params: {
+        imageCount,
+        imageAspectRatio,
+        imageModel,
+        mediaIds: mediaIds.length > 0 ? mediaIds : undefined,
+        accountId: accountId || undefined,
+        pcDirectory: projectData.pcDirectory,
+      }
+    });
   };
 
+  // Video segment generator trigger (pushes task to sequential queue)
   const triggerGenerateSegmentVideo = async (shotKey: string) => {
+    if (!checkPcDirectory()) return;
     const startedProjectId = activeProjectId;
-    setGeneratingSegmentVideoKeys(prev => ({ ...prev, [shotKey]: true }));
-    queueManager.addLog(`Bắt đầu gọi API local render video phân đoạn: ${shotKey}...`, "running", startedProjectId);
-
     const parts = shotKey.split("_");
     const shotId = parts[parts.length - 1];
 
@@ -1082,8 +1741,9 @@ export default function Home() {
     const keyframeObj = projectData.keyframes
       ? projectData.keyframes.find((k: any) => k.shot_id === shotId)
       : null;
-    const mediaId = keyframeObj?.media_id || "";
-    const accountId = keyframeObj?.account_id || "";
+    const hasImage = !!(keyframeObj && keyframeObj.url && !keyframeObj.url.startsWith("mock_") && keyframeObj.media_id);
+    const mediaIds = hasImage ? [keyframeObj.media_id] : undefined;
+    const accountId = hasImage ? (keyframeObj.account_id || "default_account") : undefined;
 
     // Resolve audioReferenceMediaIds from referenced characters in the shot
     const audioReferenceMediaIds: string[] = [];
@@ -1104,116 +1764,139 @@ export default function Home() {
       });
     }
 
+    const taskId = `media_task_${Date.now()}_${Math.random().toString(36).substring(2, 5)}`;
+    queueManager.addMediaTask({
+      id: taskId,
+      projectId: startedProjectId,
+      projectName: activeProjectName,
+      type: "shot_video",
+      targetId: shotKey, // Keep full shotKey
+      prompt: promptText,
+      params: {
+        videoCount,
+        videoAspectRatio,
+        videoModel,
+        mediaIds,
+        accountId,
+        audioReferenceMediaIds: audioReferenceMediaIds.length > 0 ? audioReferenceMediaIds : undefined,
+        duration_seconds: shotObj?.duration_seconds || 5,
+        pcDirectory: projectData.pcDirectory,
+      }
+    });
+  };
+
+  // Video renderer caller using Next.js streaming API
+  const startVideoRendering = async () => {
+    if (!checkPcDirectory()) return;
+    if (projectData.shots.length === 0) {
+      alert("Vui lòng tạo danh sách shot trước khi render.");
+      return;
+    }
+    
+    setIsRenderingVideo(true);
+    setVideoRenderPercent(0);
+    setVideoRenderStage("Khởi chạy engine render...");
+    queueManager.addLog("Bắt đầu tiến trình Render Video...", "running", activeProjectId);
+    
+    // Prepare the payload for the rendering API
+    const payloadShots = (projectData.shots || []).map((shot: any) => ({
+      shot_id: shot.shot_id,
+      scene_number: shot.scene_number || shot.scene_id,
+      duration_seconds: shot.duration_seconds || 5,
+      actions: shot.actions || "",
+      characters: shot.characters || [],
+      environment: shot.environment || "",
+      props: shot.props || [],
+      dialogue: shot.dialogue ? shot.dialogue.map((d: any) => ({
+        character: d.character,
+        speech: d.text || d.speech
+      })) : [],
+      camera_movement: shot.camera_movement || "Static",
+      shot_type: shot.framing || shot.shot_type || ""
+    }));
+
+    const payloadKeyframes = (projectData.keyframes || []).map((k: any) => ({
+      shot_id: k.shot_id,
+      url: k.url || "",
+      media_id: k.media_id || ""
+    }));
+
+    const payloadMotion = (projectData.motion_prompts || []).map((m: any) => ({
+      shot_id: m.shot_id,
+      motion_description: m.motion_description || m.prompt || "",
+      video_url: m.video_url || ""
+    }));
+
     try {
-      const payload: any = {
-        prompt: promptText,
-        aspect_ratio: videoAspectRatio || "VIDEO_ASPECT_RATIO_LANDSCAPE"
-      };
-
-      if (mediaId && !mediaId.startsWith("mock_")) {
-        payload.media_ids = [mediaId];
-        payload.account_id = accountId || "default_account";
-      }
-
-      if (audioReferenceMediaIds.length > 0) {
-        payload.audioReferenceMediaIds = audioReferenceMediaIds;
-      }
-
-      // Call port 5000 API, set timeout to 10 minutes (600000 ms)
-      const response = await fetch("http://127.0.0.1:5000/api/generate_video", {
+      const response = await fetch("/api/render", {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(payload)
+        headers: {
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({
+          projectId: activeProjectId,
+          resolution: videoResolution,
+          shots: payloadShots,
+          keyframes: payloadKeyframes,
+          motion_prompts: payloadMotion
+        })
       });
 
       if (!response.ok) {
-        throw new Error(`Video API responded with status ${response.status}`);
+        throw new Error(`Render request failed: ${response.statusText}`);
       }
 
-      const data = await response.json();
-      if (data.success && data.videos && data.videos.length > 0) {
-        const videoUrl = data.videos[0].url;
+      if (!response.body) {
+        throw new Error("No response body received from server");
+      }
 
-        // Isolated database update
-        await updateProjectDataInDb(startedProjectId, (prevData) => {
-          const copy = { ...prevData };
-          if (motionIndex !== -1) {
-            copy.motion_prompts = copy.motion_prompts.map((m, idx) =>
-              idx === motionIndex ? { ...m, video_url: videoUrl } : m
-            );
-          } else {
-            copy.motion_prompts = [
-              ...(copy.motion_prompts || []),
-              { shot_id: shotId, motion_description: promptText, video_url: videoUrl }
-            ];
+      const reader = response.body.getReader();
+      const decoder = new TextDecoder();
+      let done = false;
+      let buffer = "";
+
+      while (!done) {
+        const { value, done: doneReading } = await reader.read();
+        done = doneReading;
+        if (value) {
+          buffer += decoder.decode(value, { stream: !doneReading });
+          const lines = buffer.split("\n");
+          buffer = lines.pop() || ""; // keep tail
+
+          for (const line of lines) {
+            const trimmed = line.trim();
+            if (!trimmed) continue;
+            try {
+              const data = JSON.parse(trimmed);
+              if (data.percent !== undefined) {
+                setVideoRenderPercent(data.percent);
+              }
+              if (data.stage) {
+                setVideoRenderStage(data.stage);
+                queueManager.addLog(`[Render Engine] ${data.stage}`, "info", activeProjectId);
+              }
+              
+              if (data.status === "success") {
+                queueManager.addLog("Quá trình render video hoàn tất! File MP4 đã được tạo.", "success", activeProjectId);
+                setRenderTimestamp(Date.now());
+                setIsRenderingVideo(false);
+                setIsVideoGenerated(true);
+                setActiveTab("video");
+              } else if (data.status === "failed") {
+                throw new Error(data.error || "Unknown render error");
+              }
+            } catch (err) {
+              // Ignore JSON parse errors for incomplete chunks
+            }
           }
-          return copy;
-        });
-
-        setMockGeneratedSegmentVideos(prev => ({ ...prev, [shotKey]: true }));
-        queueManager.addLog(`Đã render xong video phân đoạn ${shotId}! URL: ${videoUrl}`, "success", startedProjectId);
-      } else {
-        throw new Error("No video was returned from local API.");
+        }
       }
     } catch (err: any) {
-      console.warn("Local Video API failed or offline. Error:", err.message);
-      // Fallback: simulate success using mixkit forest video if offline/fails
-      setMockGeneratedSegmentVideos(prev => ({ ...prev, [shotKey]: true }));
-      queueManager.addLog(`Render video Shot ${shotId} thất bại (offline/error), sử dụng video mẫu.`, "info", startedProjectId);
-    } finally {
-      setGeneratingSegmentVideoKeys(prev => {
-        const copy = { ...prev };
-        delete copy[shotKey];
-        return copy;
-      });
+      console.error(err);
+      alert(`Render failed: ${err.message}`);
+      queueManager.addLog(`[Render Engine] Lỗi render: ${err.message}`, "error", activeProjectId);
+      setIsRenderingVideo(false);
     }
-  };
-
-  // Video renderer simulator
-  const startVideoRendering = () => {
-    if (projectData.motion_prompts.length === 0) {
-      alert("Please run Motion Prompt AI (Step 7) first to plan the videos.");
-      return;
-    }
-    setIsRenderingVideo(true);
-    setVideoRenderPercent(0);
-    setVideoRenderStage("Initialising Video Engine...");
-    queueManager.addLog("Bắt đầu tiến trình Render Video...", "running", activeProjectId);
-
-    const stages = [
-      { p: 15, msg: "Compiling background environment references..." },
-      { p: 30, msg: "Generating synthetic voice dialog tracks..." },
-      { p: 55, msg: "Applying image style weights & rendering shots..." },
-      { p: 75, msg: "Interpolating Veo 3 camera motion vectors (24fps)..." },
-      { p: 90, msg: "Blending frames and rendering final audio mux..." },
-      { p: 100, msg: "Compiling MP4 container..." }
-    ];
-
-    let currentStageIndex = 0;
-    const interval = setInterval(() => {
-      setVideoRenderPercent(prev => {
-        const next = prev + Math.floor(Math.random() * 8) + 2;
-        if (next >= 100) {
-          clearInterval(interval);
-          setVideoRenderStage("Render complete!");
-          queueManager.addLog("Quá trình render video hoàn tất! File MP4 đã được tạo.", "success", activeProjectId);
-          setTimeout(() => {
-            setIsRenderingVideo(false);
-            setIsVideoGenerated(true);
-            setActiveTab("video"); // Redirect to the unified video tab!
-          }, 800);
-          return 100;
-        }
-
-        // Advance stage message
-        if (currentStageIndex < stages.length && next >= stages[currentStageIndex].p) {
-          setVideoRenderStage(stages[currentStageIndex].msg);
-          queueManager.addLog(`[Render Engine] ${stages[currentStageIndex].msg}`, "info", activeProjectId);
-          currentStageIndex++;
-        }
-        return next;
-      });
-    }, 250);
   };
 
   // Helper matching search Unsplash links for visual assets
@@ -1262,7 +1945,7 @@ export default function Home() {
           const currentDialog = scene.dialogues[Math.min(dialogIndex, count - 1)];
           return `${currentDialog.character}: "${currentDialog.text}"`;
         }
-        return scene.description || `Scene ${scene.scene_id}`;
+        return "";
       }
       accumulatedTime += duration;
     }
@@ -1273,6 +1956,147 @@ export default function Home() {
     if (!projectData.scenes) return 10;
     return projectData.scenes.reduce((acc, s) => acc + (s.duration_seconds || 5), 0);
   };
+
+  // Cinema tab duration & active state helper functions
+  const getCinemaTotalDuration = () => {
+    if (projectData.shots && projectData.shots.length > 0) {
+      return projectData.shots.reduce((acc, s) => acc + (s.duration_seconds || 5), 0);
+    }
+    if (projectData.scenes && projectData.scenes.length > 0) {
+      return projectData.scenes.reduce((acc, s) => acc + (s.duration_seconds || 5), 0);
+    }
+    return 10;
+  };
+
+  const getSubtitlesForCinema = (time: number, sceneStartTime: number, sceneDuration: number, dialogues: any[], description: string) => {
+    if (!dialogues || dialogues.length === 0) {
+      return { character: "", text: "" };
+    }
+    
+    const count = dialogues.length;
+    const segmentDuration = sceneDuration / count;
+    const offset = time - sceneStartTime;
+    const dialogIndex = Math.min(Math.floor(offset / segmentDuration), count - 1);
+    const currentDialog = dialogues[dialogIndex];
+    
+    if (!currentDialog) return { character: "", text: "" };
+    
+    const charName = currentDialog.character || "";
+    const fullText = currentDialog.text || "";
+    
+    // Apply word count limits
+    const words = fullText.split(/\s+/).filter((w: string) => w.length > 0);
+    const maxWords = subConfig.maxWordsPerSub || 6;
+    const totalWords = words.length;
+    
+    if (totalWords <= maxWords) {
+      return { character: charName, text: fullText };
+    }
+    
+    // Split into sub-segments based on words per sub
+    const numChunks = Math.ceil(totalWords / maxWords);
+    const dialogueOffset = offset - (dialogIndex * segmentDuration);
+    const subSegmentDuration = segmentDuration / numChunks;
+    const chunkIndex = Math.min(Math.floor(dialogueOffset / subSegmentDuration), numChunks - 1);
+    
+    const startWordIdx = chunkIndex * maxWords;
+    const endWordIdx = Math.min(startWordIdx + maxWords, totalWords);
+    const chunkWords = words.slice(startWordIdx, endWordIdx);
+    
+    return {
+      character: charName,
+      text: chunkWords.join(" ")
+    };
+  };
+
+  const getCinemaActiveStateAtTime = (time: number) => {
+    const totalDuration = getCinemaTotalDuration();
+    const clampedTime = Math.min(Math.max(0, time), totalDuration);
+    
+    // Play by shots
+    if (projectData.shots && projectData.shots.length > 0) {
+      let accumulatedTime = 0;
+      for (let i = 0; i < projectData.shots.length; i++) {
+        const shot = projectData.shots[i];
+        const duration = shot.duration_seconds || 5;
+        if (clampedTime >= accumulatedTime && clampedTime < accumulatedTime + duration) {
+          const scene = projectData.scenes?.find((s: any) => s.scene_id === shot.scene_id);
+          const keyframeObj = projectData.keyframes?.find((k: any) => k.shot_id === shot.shot_id);
+          const motionObj = projectData.motion_prompts?.find((m: any) => m.shot_id === shot.shot_id);
+          
+          // Calculate start and duration of parent scene in shots list
+          let sceneStartTime = 0;
+          let sceneDuration = 0;
+          let tempAcc = 0;
+          projectData.shots.forEach((s) => {
+            const dur = s.duration_seconds || 5;
+            if (s.scene_id === shot.scene_id) {
+              if (sceneDuration === 0) {
+                sceneStartTime = tempAcc;
+              }
+              sceneDuration += dur;
+            }
+            tempAcc += dur;
+          });
+          
+          const subtitle = getSubtitlesForCinema(clampedTime, sceneStartTime, sceneDuration, scene?.dialogues, scene?.description || "");
+          
+          return {
+            mode: "shot" as const,
+            index: i,
+            totalCount: projectData.shots.length,
+            activeShot: shot,
+            activeScene: scene,
+            imageUrl: keyframeObj?.url || "",
+            videoUrl: motionObj?.video_url || "",
+            subtitle,
+            shotStartTime: accumulatedTime,
+            shotDuration: duration
+          };
+        }
+        accumulatedTime += duration;
+      }
+    }
+    
+    // Fallback: play by scenes
+    if (projectData.scenes && projectData.scenes.length > 0) {
+      let accumulatedTime = 0;
+      for (let i = 0; i < projectData.scenes.length; i++) {
+        const scene = projectData.scenes[i];
+        const duration = scene.duration_seconds || 5;
+        if (clampedTime >= accumulatedTime && clampedTime < accumulatedTime + duration) {
+          const subtitle = getSubtitlesForCinema(clampedTime, accumulatedTime, duration, scene.dialogues, scene.description || "");
+          return {
+            mode: "scene" as const,
+            index: i,
+            totalCount: projectData.scenes.length,
+            activeShot: null,
+            activeScene: scene,
+            imageUrl: "",
+            videoUrl: "",
+            subtitle,
+            shotStartTime: accumulatedTime,
+            shotDuration: duration
+          };
+        }
+        accumulatedTime += duration;
+      }
+    }
+    
+    return {
+      mode: "none" as const,
+      index: 0,
+      totalCount: 0,
+      activeShot: null,
+      activeScene: null,
+      imageUrl: "",
+      videoUrl: "",
+      subtitle: { character: "", text: "" },
+      shotStartTime: 0,
+      shotDuration: 0
+    };
+  };
+
 
   // Inline SVGs for rendering without library dependencies
   const IconConfig = () => (
@@ -1350,11 +2174,168 @@ export default function Home() {
     setSelectedStep(step);
   }, [activeTab, assetSubTab]);
 
+  // Cinema Preview timer and playback synchronizer refs/effects
+  const cinemaTimerRef = useRef<any>(null);
+  const lastTimeRef = useRef<number>(0);
+  const cinemaVideoRef = useRef<HTMLVideoElement | null>(null);
+
+  useEffect(() => {
+    if (cinemaPlaying) {
+      lastTimeRef.current = performance.now();
+      const tick = () => {
+        const now = performance.now();
+        const delta = (now - lastTimeRef.current) / 1000;
+        lastTimeRef.current = now;
+        setCinemaPlayhead((prev) => {
+          const total = getCinemaTotalDuration();
+          let next = prev + delta;
+          if (next >= total) {
+            if (cinemaLoop) {
+              next = 0;
+            } else {
+              next = total;
+              setCinemaPlaying(false);
+              return next;
+            }
+          }
+          return next;
+        });
+        cinemaTimerRef.current = requestAnimationFrame(tick);
+      };
+      cinemaTimerRef.current = requestAnimationFrame(tick);
+    } else {
+      if (cinemaTimerRef.current) {
+        cancelAnimationFrame(cinemaTimerRef.current);
+      }
+    }
+    return () => {
+      if (cinemaTimerRef.current) {
+        cancelAnimationFrame(cinemaTimerRef.current);
+      }
+    };
+  }, [cinemaPlaying, cinemaLoop]);
+
+  useEffect(() => {
+    if (!cinemaVideoRef.current) return;
+    const activeState = getCinemaActiveStateAtTime(cinemaPlayhead);
+    if (activeState.videoUrl) {
+      const expectedTime = cinemaPlayhead - activeState.shotStartTime;
+      // Sync play/pause state
+      if (cinemaPlaying && cinemaVideoRef.current.paused) {
+        cinemaVideoRef.current.play().catch(() => {});
+      } else if (!cinemaPlaying && !cinemaVideoRef.current.paused) {
+        cinemaVideoRef.current.pause();
+      }
+      // Sync current time if drift is > 0.3s
+      const diff = Math.abs(cinemaVideoRef.current.currentTime - expectedTime);
+      if (diff > 0.3) {
+        cinemaVideoRef.current.currentTime = Math.max(0, Math.min(expectedTime, activeState.shotDuration));
+      }
+    }
+  }, [cinemaPlayhead, cinemaPlaying]);
+
+  const renderSubtitleLines = (subText: string) => {
+    if (!subText) return null;
+    const maxChars = subConfig.maxLineLength || 30;
+    const words = subText.split(/\s+/).filter((w: string) => w.length > 0);
+    const lines: string[] = [];
+    let currentLine = "";
+    
+    words.forEach(word => {
+      if ((currentLine + " " + word).trim().length > maxChars) {
+        if (currentLine) {
+          lines.push(currentLine);
+          currentLine = word;
+        } else {
+          lines.push(word);
+        }
+      } else {
+        currentLine = currentLine ? currentLine + " " + word : word;
+      }
+    });
+    if (currentLine) {
+      lines.push(currentLine);
+    }
+    
+    return lines.map((line, idx) => (
+      <div key={idx} style={{ margin: "2px 0" }}>
+        {line}
+      </div>
+    ));
+  };
+
+  const handleCinemaSkip = (direction: number) => {
+    const totalDuration = getCinemaTotalDuration();
+    if (totalDuration <= 0) return;
+    
+    if (projectData.shots && projectData.shots.length > 0) {
+      const activeState = getCinemaActiveStateAtTime(cinemaPlayhead);
+      const nextIdx = Math.max(0, Math.min(activeState.index + direction, projectData.shots.length - 1));
+      
+      let nextTime = 0;
+      for (let i = 0; i < nextIdx; i++) {
+        nextTime += projectData.shots[i].duration_seconds || 5;
+      }
+      setCinemaPlayhead(nextTime);
+      return;
+    }
+    
+    if (projectData.scenes && projectData.scenes.length > 0) {
+      const activeState = getCinemaActiveStateAtTime(cinemaPlayhead);
+      const nextIdx = Math.max(0, Math.min(activeState.index + direction, projectData.scenes.length - 1));
+      
+      let nextTime = 0;
+      for (let i = 0; i < nextIdx; i++) {
+        nextTime += projectData.scenes[i].duration_seconds || 5;
+      }
+      setCinemaPlayhead(nextTime);
+    }
+  };
+
+  const handleCinemaTimelineClick = (e: React.MouseEvent<HTMLDivElement>) => {
+    const totalDuration = getCinemaTotalDuration();
+    if (!totalDuration) return;
+    const rect = e.currentTarget.getBoundingClientRect();
+    const clickX = e.clientX - rect.left;
+    const percent = clickX / rect.width;
+    const seekTime = Math.max(0, Math.min(percent * totalDuration, totalDuration));
+    setCinemaPlayhead(seekTime);
+  };
+
+  const toggleFullscreen = () => {
+    const playerEl = document.getElementById("cinema-player-screen");
+    if (!playerEl) return;
+    
+    if (!document.fullscreenElement) {
+      playerEl.requestFullscreen().catch((err) => {
+        console.error("Error attempting to enable fullscreen:", err);
+      });
+    } else {
+      document.exitFullscreen();
+    }
+  };
+
+  useEffect(() => {
+    const handleFullscreenChange = () => {
+      setIsFullscreen(!!document.fullscreenElement);
+    };
+    document.addEventListener("fullscreenchange", handleFullscreenChange);
+    return () => {
+      document.removeEventListener("fullscreenchange", handleFullscreenChange);
+    };
+  }, []);
+
+
   // Scan shot to match referenced assets
   const getReferencedAssetsForShot = (shot: any) => {
     const refs: { name: string; type: 'character' | 'environment' | 'prop'; key: string; url?: string }[] = [];
     const actionsLower = (shot.actions || "").toLowerCase();
     
+    // Find the parent scene to matching setting/location and scene props
+    const parentScene = projectData.scenes.find((s: any) => Number(s.scene_id) === Number(shot.scene_number || shot.scene_id));
+    const sceneSettingLower = parentScene ? (parentScene.setting || "").toLowerCase() : "";
+    const sceneProps = parentScene ? parentScene.props || [] : [];
+
     // Check characters
     const shotChars = shot.characters || [];
     projectData.characters.forEach(char => {
@@ -1370,14 +2351,28 @@ export default function Home() {
     // Check setting matching environments
     const settingLower = (shot.setting || shot.environment || "").toLowerCase();
     projectData.environments.forEach(env => {
-      if (
-        env.setting_name && 
-        (settingLower.includes(env.setting_name.toLowerCase()) || 
-         env.setting_name.toLowerCase().includes(settingLower) || 
-         actionsLower.includes(env.setting_name.toLowerCase()))
-      ) {
-        if (!refs.some(r => r.name === env.setting_name)) {
-          refs.push({ name: env.setting_name, type: 'environment', key: `env_${env.setting_name}`, url: env.url });
+      const envName = env.setting_name || env.name || "";
+      if (envName) {
+        const envNameLower = envName.toLowerCase();
+        // Fuzzy checks: check containment, parent scene setting, actions text, or keyword overlaps
+        const isMatch = 
+          settingLower.includes(envNameLower) || 
+          envNameLower.includes(settingLower) || 
+          (sceneSettingLower && (sceneSettingLower.includes(envNameLower) || envNameLower.includes(sceneSettingLower))) ||
+          actionsLower.includes(envNameLower) ||
+          (settingLower.length > 2 && envNameLower.length > 2 && (
+            settingLower.split(/\s+/).some((word: string) => word.length > 2 && envNameLower.includes(word)) ||
+            envNameLower.split(/\s+/).some((word: string) => word.length > 2 && settingLower.includes(word))
+          )) ||
+          (sceneSettingLower.length > 2 && envNameLower.length > 2 && (
+            sceneSettingLower.split(/\s+/).some((word: string) => word.length > 2 && envNameLower.includes(word)) ||
+            envNameLower.split(/\s+/).some((word: string) => word.length > 2 && sceneSettingLower.includes(word))
+          ));
+          
+        if (isMatch) {
+          if (!refs.some(r => r.name.toLowerCase() === envName.toLowerCase())) {
+            refs.push({ name: envName, type: 'environment', key: `env_${envName}`, url: env.url });
+          }
         }
       }
     });
@@ -1385,18 +2380,184 @@ export default function Home() {
     // Check props
     const shotProps = shot.props || [];
     projectData.props.forEach(prop => {
-      if (
-        prop.prop_name && 
-        (actionsLower.includes(prop.prop_name.toLowerCase()) || 
-         shotProps.some((p: any) => String(p).toLowerCase().includes(prop.prop_name.toLowerCase()) || prop.prop_name.toLowerCase().includes(String(p).toLowerCase())))
-      ) {
-        if (!refs.some(r => r.name === prop.prop_name)) {
-          refs.push({ name: prop.prop_name, type: 'prop', key: `prop_${prop.prop_name}`, url: prop.url });
+      const propName = prop.prop_name || prop.name || "";
+      if (propName) {
+        const propNameLower = propName.toLowerCase();
+        // Fuzzy checks: check containment in actions, shotProps list, parent scene props, or keyword overlaps
+        const isMatch = 
+          actionsLower.includes(propNameLower) || 
+          shotProps.some((p: any) => {
+            const pLower = String(p).toLowerCase();
+            return pLower.includes(propNameLower) || propNameLower.includes(pLower);
+          }) ||
+          sceneProps.some((p: any) => {
+            const pLower = String(p).toLowerCase();
+            return pLower.includes(propNameLower) || propNameLower.includes(pLower);
+          }) ||
+          (propNameLower.length > 2 && (
+            propNameLower.split(/\s+/).some((word: string) => word.length > 2 && actionsLower.includes(word)) ||
+            shotProps.some((p: any) => {
+              const pLower = String(p).toLowerCase();
+              return pLower.split(/\s+/).some((word: string) => word.length > 2 && propNameLower.includes(word));
+            }) ||
+            sceneProps.some((p: any) => {
+              const pLower = String(p).toLowerCase();
+              return pLower.split(/\s+/).some((word: string) => word.length > 2 && propNameLower.includes(word));
+            })
+          ));
+          
+        if (isMatch) {
+          if (!refs.some(r => r.name.toLowerCase() === propName.toLowerCase())) {
+            refs.push({ name: propName, type: 'prop', key: `prop_${propName}`, url: prop.url });
+          }
         }
       }
     });
 
     return refs;
+  };
+
+  const getTabColor = (tabName: string) => {
+    const isActive = activeTab === tabName;
+    let hasData = false;
+    
+    if (tabName === "cauhinh") {
+      hasData = storyboard.trim().length > 0;
+    } else if (tabName === "assets") {
+      hasData = projectData.scenes.length > 0 || projectData.characters.length > 0;
+    } else if (tabName === "shots") {
+      hasData = projectData.shots.length > 0;
+    } else if (tabName === "video") {
+      hasData = projectData.motion_prompts.length > 0;
+    } else if (tabName === "rapphim") {
+      hasData = projectData.motion_prompts.length > 0;
+    }
+    
+    if (hasData) {
+      return "#10b981"; // Green color
+    }
+    return isActive ? "var(--accent-purple)" : "var(--text-secondary)";
+  };
+
+  const getStepUIStatus = (stepKey: StepKey): "running" | "pending" | "idle" | "success" | "failed" => {
+    if (activeStep === stepKey) {
+      return "running";
+    }
+    
+    const stepObj = steps.find(s => s.key === stepKey);
+    if (!stepObj) return "idle";
+    
+    if (stepObj.status === "success") return "success";
+    if (stepObj.status === "failed") return "failed";
+    
+    if (activeStep !== null) {
+      const combo3Order: StepKey[] = [
+        "story_analyzer",
+        "character_extractor",
+        "environment_extractor",
+        "prop_extractor",
+        "shot_planner"
+      ];
+      
+      const combo1Order: StepKey[] = [
+        "story_analyzer",
+        "character_extractor",
+        "shot_planner"
+      ];
+      
+      const combo2Order: StepKey[] = [
+        "character_extractor",
+        "environment_extractor",
+        "prop_extractor"
+      ];
+      
+      if (isRunningAll) {
+        const activeIdx = combo3Order.indexOf(activeStep);
+        const currentIdx = combo3Order.indexOf(stepKey);
+        if (activeIdx !== -1 && currentIdx > activeIdx) {
+          return "pending";
+        }
+      } else {
+        const isCombo1Active = combo1Order.includes(activeStep);
+        const isCombo2Active = combo2Order.includes(activeStep);
+        
+        if (isCombo1Active) {
+          const activeIdx = combo1Order.indexOf(activeStep);
+          const currentIdx = combo1Order.indexOf(stepKey);
+          if (activeIdx !== -1 && currentIdx > activeIdx) {
+            return "pending";
+          }
+        } else if (isCombo2Active) {
+          const activeIdx = combo2Order.indexOf(activeStep);
+          const currentIdx = combo2Order.indexOf(stepKey);
+          if (activeIdx !== -1 && currentIdx > activeIdx) {
+            return "pending";
+          }
+        }
+      }
+    }
+    
+    return "idle";
+  };
+
+  const renderTabStatusBanner = (stepKey: StepKey, customMessage?: string) => {
+    const status = getStepUIStatus(stepKey);
+    if (status === "idle" || status === "success" || status === "failed") return null;
+    
+    const isRunning = status === "running";
+    
+    const stepNames: Record<StepKey, string> = {
+      story_analyzer: "Phân tích câu chuyện (Story Analyzer)",
+      character_extractor: "Trích xuất Nhân vật (Character Extractor)",
+      environment_extractor: "Trích xuất Bối cảnh (Environment Extractor)",
+      prop_extractor: "Trích xuất Đạo cụ (Prop Extractor)",
+      shot_planner: "Shot Prompt Generator",
+      keyframe_generator: "Tạo Prompt Keyframe",
+      motion_generator: "Tạo mô tả chuyển động Video"
+    };
+    
+    const stepName = stepNames[stepKey] || stepKey;
+    const msg = customMessage || (isRunning 
+      ? `Đang chạy phân tích ${stepName}, vui lòng chờ...` 
+      : `Đang chờ đến lượt tạo ${stepName} trong Combo tự động...`);
+      
+    return (
+      <div
+        className="glass-panel"
+        style={{
+          padding: "12px 20px",
+          marginBottom: "16px",
+          background: isRunning 
+            ? "rgba(6, 182, 212, 0.06)" 
+            : "rgba(139, 92, 246, 0.04)",
+          border: isRunning
+            ? "1px solid rgba(6, 182, 212, 0.2)"
+            : "1px solid rgba(139, 92, 246, 0.15)",
+          borderLeft: isRunning
+            ? "4px solid var(--accent-cyan)"
+            : "4px solid var(--accent-purple)",
+          borderRadius: "6px",
+          display: "flex",
+          alignItems: "center",
+          gap: "12px",
+          animation: isRunning ? "pulse 2s infinite" : "none",
+        }}
+      >
+        <span
+          style={{
+            display: "inline-block",
+            width: "8px",
+            height: "8px",
+            borderRadius: "50%",
+            backgroundColor: isRunning ? "var(--accent-cyan)" : "var(--accent-purple)",
+            boxShadow: isRunning ? "0 0 8px var(--accent-cyan)" : "none",
+          }}
+        />
+        <span style={{ fontSize: "0.85rem", fontWeight: 600, color: isRunning ? "#06b6d4" : "#a78bfa" }}>
+          {msg}
+        </span>
+      </div>
+    );
   };
 
   return (
@@ -1656,6 +2817,7 @@ export default function Home() {
             <button
               onClick={() => { setActiveTab("cauhinh"); }}
               className={`tab-btn ${activeTab === "cauhinh" ? "active" : ""}`}
+              style={{ color: getTabColor("cauhinh") }}
             >
               <IconConfig />
               1. Cấu hình dự án
@@ -1663,6 +2825,7 @@ export default function Home() {
             <button
               onClick={() => { setActiveTab("assets"); }}
               className={`tab-btn ${activeTab === "assets" ? "active" : ""}`}
+              style={{ color: getTabColor("assets") }}
             >
               <IconFolder />
               2. Lọc Assets
@@ -1670,6 +2833,7 @@ export default function Home() {
             <button
               onClick={() => { setActiveTab("shots"); }}
               className={`tab-btn ${activeTab === "shots" ? "active" : ""}`}
+              style={{ color: getTabColor("shots") }}
             >
               <IconImage />
               3. Image Shots
@@ -1677,9 +2841,18 @@ export default function Home() {
             <button
               onClick={() => { setActiveTab("video"); }}
               className={`tab-btn ${activeTab === "video" ? "active" : ""}`}
+              style={{ color: getTabColor("video") }}
             >
               <IconFilm />
               4. Tạo video
+            </button>
+            <button
+              onClick={() => { setActiveTab("rapphim"); }}
+              className={`tab-btn ${activeTab === "rapphim" ? "active" : ""}`}
+              style={{ color: getTabColor("rapphim") }}
+            >
+              <IconCinema />
+              5. Rạp phim
             </button>
           </div>
 
@@ -1700,6 +2873,52 @@ export default function Home() {
                       <p style={{ fontSize: "0.85rem", color: "var(--text-secondary)" }}>
                         Thiết lập cấu hình dự án, tải phụ đề SRT và thực hiện các tác vụ tạo phân cảnh, vẽ ảnh.
                       </p>
+                    </div>
+                    {activeStep && renderTabStatusBanner(activeStep)}
+
+                    {/* PC Directory Settings Card */}
+                    <div className="glass-panel" style={{ padding: "16px 20px", marginBottom: "20px", background: "rgba(124, 58, 237, 0.04)", border: "1px solid rgba(124, 58, 237, 0.2)", borderRadius: "10px" }}>
+                      <span style={{ fontSize: "0.7rem", color: "#a78bfa", fontWeight: 700, letterSpacing: "0.05em", display: "block", marginBottom: "8px" }}>
+                        💾 THƯ MỤC LƯU TRỮ DỰ ÁN TRÊN MÁY TÍNH (PC)
+                      </span>
+                      
+                      <div style={{ display: "flex", gap: "10px", alignItems: "center" }}>
+                        <input
+                          type="text"
+                          value={projectData.pcDirectory || ""}
+                          onChange={(e) => handleManualPcDirectoryChange(e.target.value)}
+                          onBlur={(e) => handleManualPcDirectoryBlur(e.target.value)}
+                          placeholder="Nhập hoặc dán đường dẫn thư mục PC tại đây (ví dụ: D:\KidsProjects)..."
+                          className="custom-input"
+                          style={{ flexGrow: 1, padding: "8px 12px", fontSize: "0.85rem", background: "rgba(0,0,0,0.3)" }}
+                        />
+                        <button
+                          onClick={handleSelectPcDirectory}
+                          className="btn-primary"
+                          style={{
+                            padding: "8px 16px",
+                            fontSize: "0.8rem",
+                            borderRadius: "6px",
+                            background: "linear-gradient(135deg, #7c3aed, #db2777)",
+                            border: "none",
+                            cursor: "pointer",
+                            whiteSpace: "nowrap",
+                            fontWeight: 600
+                          }}
+                        >
+                          📂 Chọn thư mục
+                        </button>
+                      </div>
+                      
+                      {projectData.pcDirectory ? (
+                        <span style={{ fontSize: "0.72rem", color: "#34d399", display: "block", marginTop: "8px" }}>
+                          ✓ Thư mục hợp lệ. Đã tự động khởi tạo các thư mục: <code style={{ color: "#ffffff" }}>/images_shots</code>, <code style={{ color: "#ffffff" }}>/references</code>, <code style={{ color: "#ffffff" }}>/videos</code>.
+                        </span>
+                      ) : (
+                        <span style={{ fontSize: "0.72rem", color: "#f87171", display: "block", marginTop: "8px" }}>
+                          ⚠ Bạn phải cấu hình thư mục lưu trước khi khởi chạy các tính năng tạo ảnh hoặc render phim.
+                        </span>
+                      )}
                     </div>
 
                     {/* Combos Grid */}
@@ -1981,15 +3200,53 @@ export default function Home() {
                     </div>
                   </div>
 
+                  {/* Batch Action Buttons for Assets */}
+                  {assetSubTab !== "scenes" && (
+                    <div style={{ display: "flex", gap: "10px", alignItems: "center", marginBottom: "16px", padding: "12px", background: "rgba(255,255,255,0.02)", borderRadius: "8px", border: "1px solid rgba(255,255,255,0.05)" }}>
+                      <span style={{ fontSize: "0.8rem", color: "var(--text-secondary)", fontWeight: 600 }}>Hành động hàng loạt:</span>
+                      <button
+                        onClick={() => handleGenerateAllAssetImages(false)}
+                        disabled={isGeneratingBatch || activeStep !== null || isRunningAll}
+                        className="btn-primary"
+                        style={{ padding: "6px 12px", fontSize: "0.75rem", borderRadius: "4px" }}
+                      >
+                        🎨 Tạo tất cả ảnh tham chiếu
+                      </button>
+                      <button
+                        onClick={() => handleGenerateAllAssetImages(true)}
+                        disabled={isGeneratingBatch || activeStep !== null || isRunningAll}
+                        className="btn-secondary"
+                        style={{ padding: "6px 12px", fontSize: "0.75rem", borderRadius: "4px" }}
+                      >
+                        🎨 Tạo ảnh chưa được tạo
+                      </button>
+                      {isGeneratingBatch && (
+                        <button
+                          onClick={handleStopDrawing}
+                          className="btn-secondary"
+                          style={{ padding: "6px 12px", fontSize: "0.75rem", borderRadius: "4px", color: "var(--danger)", borderColor: "rgba(239,68,68,0.3)", background: "rgba(239,68,68,0.05)" }}
+                        >
+                          🛑 Dừng vẽ
+                        </button>
+                      )}
+                    </div>
+                  )}
+
                   {/* SUB TAB: Phân cảnh (Scenes) */}
                   {assetSubTab === "scenes" && (
                     <div>
+                      {renderTabStatusBanner("story_analyzer")}
                       {projectData.scenes.length === 0 ? (
                         <div style={{ padding: "40px", textAlign: "center", border: "1px dashed var(--border-color)", borderRadius: "var(--border-radius-lg)" }}>
                           <span style={{ display: "block", color: "var(--text-muted)", marginBottom: "16px" }}>
                             Chưa có dữ liệu phân cảnh. Vui lòng chạy Story Analyzer (Combo 1) trước.
                           </span>
-                          <button onClick={runCombo1} className="sidebar-btn-new" style={{ margin: "0 auto" }}>
+                          <button
+                            onClick={runCombo1}
+                            disabled={activeStep !== null || isRunningAll}
+                            className="sidebar-btn-new"
+                            style={{ margin: "0 auto", opacity: (activeStep !== null || isRunningAll) ? 0.5 : 1, cursor: (activeStep !== null || isRunningAll) ? "not-allowed" : "pointer" }}
+                          >
                             Phân tích kịch bản
                           </button>
                         </div>
@@ -2040,12 +3297,18 @@ export default function Home() {
                   {/* SUB TAB: Nhân vật */}
                   {assetSubTab === "characters" && (
                     <div>
+                      {renderTabStatusBanner("character_extractor")}
                       {projectData.characters.length === 0 ? (
                         <div style={{ padding: "40px", textAlign: "center", border: "1px dashed var(--border-color)", borderRadius: "var(--border-radius-lg)" }}>
                           <span style={{ display: "block", color: "var(--text-muted)", marginBottom: "16px" }}>
                             Chưa trích xuất nhân vật. Vui lòng chạy Combo 2 hoặc Character Extractor.
                           </span>
-                          <button onClick={() => handleRunStep("character_extractor")} className="sidebar-btn-new" style={{ margin: "0 auto" }}>
+                          <button
+                            onClick={() => handleRunStep("character_extractor")}
+                            disabled={activeStep !== null || isRunningAll}
+                            className="sidebar-btn-new"
+                            style={{ margin: "0 auto", opacity: (activeStep !== null || isRunningAll) ? 0.5 : 1, cursor: (activeStep !== null || isRunningAll) ? "not-allowed" : "pointer" }}
+                          >
                             Trích xuất nhân vật
                           </button>
                         </div>
@@ -2146,53 +3409,36 @@ export default function Home() {
 
                           <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fill, minmax(360px, 1fr))", gap: "20px" }}>
                             {projectData.characters.map((char: any, idx) => {
-                              const hasImg = !!(char.url || char.media_id) || mockGeneratedReferenceImages[`char_${char.name}`];
-                              const isGen = !!generatingAssetIds[`char_${char.name}`];
+                              const hasImg = !!(char.url && !char.url.startsWith("mock_"));
+                              const isGen = generatingAssetIds[`char_${char.name}`];
                               return (
                                 <div key={idx} className="glass-panel" style={{ padding: 0, overflow: "hidden", display: "flex", flexDirection: "column" }}>
                                   <div style={{ aspectRatio: "16/9", position: "relative", background: "#060910", display: "flex", alignItems: "center", justifyContent: "center" }}>
-                                    {hasImg ? (
-                                      <>
+                                    {isGen ? (
+                                      renderMediaLoader(isGen, "Vẽ nhân vật...")
+                                    ) : hasImg ? (
+                                      <div style={{ width: "100%", height: "100%", position: "relative" }}>
                                         <img
-                                          src={char.url || getAssetImage(char.name, 'character')}
+                                          src={char.url}
                                           alt={char.name}
                                           style={{ width: "100%", height: "100%", objectFit: "cover" }}
                                         />
-                                        {char.media_id && (
-                                          <span
-                                            style={{
-                                              position: "absolute",
-                                              top: "8px",
-                                              right: "8px",
-                                              fontSize: "0.65rem",
-                                              background: "#10b981",
-                                              color: "#ffffff",
-                                              padding: "2px 6px",
-                                              borderRadius: "4px",
-                                              fontWeight: 700
-                                            }}
-                                          >
-                                            ✓ Đã có ID
-                                          </span>
-                                        )}
-                                      </>
+                                        {renderImageActionToolbar(char.url, `character_${char.name}.png`, () => triggerGenerateAssetImage(`char_${char.name}`))}
+                                      </div>
                                     ) : (
                                       <div style={{ display: "flex", flexDirection: "column", alignItems: "center", gap: "10px" }}>
-                                      <span style={{ fontSize: "2rem" }}>👤</span>
-                                      {isGen ? (
-                                        <span style={{ fontSize: "0.75rem", color: "var(--accent-cyan)" }}>Vẽ ảnh...</span>
-                                      ) : (
+                                        <span style={{ fontSize: "2rem" }}>👤</span>
                                         <button
                                           onClick={() => triggerGenerateAssetImage(`char_${char.name}`)}
+                                          disabled={activeStep !== null || isRunningAll}
                                           className="btn-primary"
                                           style={{ padding: "6px 12px", fontSize: "0.75rem", borderRadius: "4px" }}
                                         >
-                                          Vẽ ảnh tham chiếu
+                                          Tạo
                                         </button>
-                                      )}
-                                    </div>
-                                  )}
-                                </div>
+                                      </div>
+                                    )}
+                                  </div>
                                 <div style={{ padding: "16px", display: "flex", flexDirection: "column", gap: "8px" }}>
                                   <h4 style={{ color: "#a78bfa", fontSize: "0.95rem", fontWeight: 700 }}>{char.name}</h4>
                                   <span style={{ fontSize: "0.7rem", color: "var(--text-muted)" }}>TURNAROUND PROMPT:</span>
@@ -2219,64 +3465,53 @@ export default function Home() {
                   {/* SUB TAB: Bối cảnh */}
                   {assetSubTab === "environments" && (
                     <div>
+                      {renderTabStatusBanner("environment_extractor")}
                       {projectData.environments.length === 0 ? (
                         <div style={{ padding: "40px", textAlign: "center", border: "1px dashed var(--border-color)", borderRadius: "var(--border-radius-lg)" }}>
                           <span style={{ display: "block", color: "var(--text-muted)", marginBottom: "16px" }}>
                             Chưa trích xuất bối cảnh. Vui lòng chạy Combo 2 hoặc Environment Extractor.
                           </span>
-                          <button onClick={() => handleRunStep("environment_extractor")} className="sidebar-btn-new" style={{ margin: "0 auto" }}>
+                          <button
+                            onClick={() => handleRunStep("environment_extractor")}
+                            disabled={activeStep !== null || isRunningAll}
+                            className="sidebar-btn-new"
+                            style={{ margin: "0 auto", opacity: (activeStep !== null || isRunningAll) ? 0.5 : 1, cursor: (activeStep !== null || isRunningAll) ? "not-allowed" : "pointer" }}
+                          >
                             Trích xuất bối cảnh
                           </button>
                         </div>
                       ) : (
                         <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fill, minmax(360px, 1fr))", gap: "20px" }}>
                           {projectData.environments.map((env: any, idx) => {
-                            const hasImg = !!(env.url || env.media_id) || mockGeneratedReferenceImages[`env_${env.setting_name}`];
-                            const isGen = !!generatingAssetIds[`env_${env.setting_name}`];
+                            const hasImg = !!(env.url && !env.url.startsWith("mock_"));
+                            const isGen = generatingAssetIds[`env_${env.setting_name}`];
                             return (
                               <div key={idx} className="glass-panel" style={{ padding: 0, overflow: "hidden", display: "flex", flexDirection: "column" }}>
                                 <div style={{ aspectRatio: "16/9", position: "relative", background: "#060910", display: "flex", alignItems: "center", justifyContent: "center" }}>
-                                  {hasImg ? (
-                                    <>
-                                      <img
-                                        src={env.url || getAssetImage(env.setting_name, 'environment')}
-                                        alt={env.setting_name}
-                                        style={{ width: "100%", height: "100%", objectFit: "cover" }}
-                                      />
-                                      {env.media_id && (
-                                        <span
-                                          style={{
-                                            position: "absolute",
-                                            top: "8px",
-                                            right: "8px",
-                                            fontSize: "0.65rem",
-                                            background: "#10b981",
-                                            color: "#ffffff",
-                                            padding: "2px 6px",
-                                            borderRadius: "4px",
-                                            fontWeight: 700
-                                          }}
-                                        >
-                                          ✓ Đã có ID
-                                        </span>
-                                      )}
-                                    </>
-                                  ) : (
-                                    <div style={{ display: "flex", flexDirection: "column", alignItems: "center", gap: "10px" }}>
-                                      <span style={{ fontSize: "2rem" }}>🏞️</span>
-                                      {isGen ? (
-                                        <span style={{ fontSize: "0.75rem", color: "var(--accent-cyan)" }}>Vẽ bối cảnh...</span>
-                                      ) : (
+                                    {isGen ? (
+                                      renderMediaLoader(isGen, "Vẽ bối cảnh...")
+                                    ) : hasImg ? (
+                                      <div style={{ width: "100%", height: "100%", position: "relative" }}>
+                                        <img
+                                          src={env.url}
+                                          alt={env.setting_name}
+                                          style={{ width: "100%", height: "100%", objectFit: "cover" }}
+                                        />
+                                        {renderImageActionToolbar(env.url, `env_${env.setting_name}.png`, () => triggerGenerateAssetImage(`env_${env.setting_name}`))}
+                                      </div>
+                                    ) : (
+                                      <div style={{ display: "flex", flexDirection: "column", alignItems: "center", gap: "10px" }}>
+                                        <span style={{ fontSize: "2rem" }}>🏞️</span>
                                         <button
                                           onClick={() => triggerGenerateAssetImage(`env_${env.setting_name}`)}
+                                          disabled={activeStep !== null || isRunningAll}
                                           className="btn-primary"
                                           style={{ padding: "6px 12px", fontSize: "0.75rem", borderRadius: "4px" }}
                                         >
-                                          Vẽ ảnh tham chiếu
+                                          Tạo
                                         </button>
-                                      )}
-                                    </div>
-                                  )}
+                                      </div>
+                                    )}
                                 </div>
                                 <div style={{ padding: "16px", display: "flex", flexDirection: "column", gap: "8px" }}>
                                   <h4 style={{ color: "#06b6d4", fontSize: "0.95rem", fontWeight: 700 }}>{env.setting_name}</h4>
@@ -2303,64 +3538,53 @@ export default function Home() {
                   {/* SUB TAB: Đạo cụ */}
                   {assetSubTab === "props" && (
                     <div>
+                      {renderTabStatusBanner("prop_extractor")}
                       {projectData.props.length === 0 ? (
                         <div style={{ padding: "40px", textAlign: "center", border: "1px dashed var(--border-color)", borderRadius: "var(--border-radius-lg)" }}>
                           <span style={{ display: "block", color: "var(--text-muted)", marginBottom: "16px" }}>
                             Chưa trích xuất đạo cụ. Vui lòng chạy Combo 2 hoặc Prop Extractor.
                           </span>
-                          <button onClick={() => handleRunStep("prop_extractor")} className="sidebar-btn-new" style={{ margin: "0 auto" }}>
+                          <button
+                            onClick={() => handleRunStep("prop_extractor")}
+                            disabled={activeStep !== null || isRunningAll}
+                            className="sidebar-btn-new"
+                            style={{ margin: "0 auto", opacity: (activeStep !== null || isRunningAll) ? 0.5 : 1, cursor: (activeStep !== null || isRunningAll) ? "not-allowed" : "pointer" }}
+                          >
                             Trích xuất đạo cụ
                           </button>
                         </div>
                       ) : (
                         <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fill, minmax(360px, 1fr))", gap: "20px" }}>
                           {projectData.props.map((prop: any, idx) => {
-                            const hasImg = !!(prop.url || prop.media_id) || mockGeneratedReferenceImages[`prop_${prop.prop_name}`];
-                            const isGen = !!generatingAssetIds[`prop_${prop.prop_name}`];
+                            const hasImg = !!(prop.url && !prop.url.startsWith("mock_"));
+                            const isGen = generatingAssetIds[`prop_${prop.prop_name}`];
                             return (
                               <div key={idx} className="glass-panel" style={{ padding: 0, overflow: "hidden", display: "flex", flexDirection: "column" }}>
                                 <div style={{ aspectRatio: "16/9", position: "relative", background: "#060910", display: "flex", alignItems: "center", justifyContent: "center" }}>
-                                  {hasImg ? (
-                                    <>
-                                      <img
-                                        src={prop.url || getAssetImage(prop.prop_name, 'prop')}
-                                        alt={prop.prop_name}
-                                        style={{ width: "100%", height: "100%", objectFit: "cover" }}
-                                      />
-                                      {prop.media_id && (
-                                        <span
-                                          style={{
-                                            position: "absolute",
-                                            top: "8px",
-                                            right: "8px",
-                                            fontSize: "0.65rem",
-                                            background: "#10b981",
-                                            color: "#ffffff",
-                                            padding: "2px 6px",
-                                            borderRadius: "4px",
-                                            fontWeight: 700
-                                          }}
-                                        >
-                                          ✓ Đã có ID
-                                        </span>
-                                      )}
-                                    </>
-                                  ) : (
-                                    <div style={{ display: "flex", flexDirection: "column", alignItems: "center", gap: "10px" }}>
-                                      <span style={{ fontSize: "2rem" }}>🎒</span>
-                                      {isGen ? (
-                                        <span style={{ fontSize: "0.75rem", color: "var(--accent-cyan)" }}>Vẽ đạo cụ...</span>
-                                      ) : (
+                                    {isGen ? (
+                                      renderMediaLoader(isGen, "Vẽ đạo cụ...")
+                                    ) : hasImg ? (
+                                      <div style={{ width: "100%", height: "100%", position: "relative" }}>
+                                        <img
+                                          src={prop.url}
+                                          alt={prop.prop_name}
+                                          style={{ width: "100%", height: "100%", objectFit: "cover" }}
+                                        />
+                                        {renderImageActionToolbar(prop.url, `prop_${prop.prop_name}.png`, () => triggerGenerateAssetImage(`prop_${prop.prop_name}`))}
+                                      </div>
+                                    ) : (
+                                      <div style={{ display: "flex", flexDirection: "column", alignItems: "center", gap: "10px" }}>
+                                        <span style={{ fontSize: "2rem" }}>🎒</span>
                                         <button
                                           onClick={() => triggerGenerateAssetImage(`prop_${prop.prop_name}`)}
+                                          disabled={activeStep !== null || isRunningAll}
                                           className="btn-primary"
                                           style={{ padding: "6px 12px", fontSize: "0.75rem", borderRadius: "4px" }}
                                         >
-                                          Vẽ ảnh tham chiếu
+                                          Tạo
                                         </button>
-                                      )}
-                                    </div>
-                                  )}
+                                      </div>
+                                    )}
                                 </div>
                                 <div style={{ padding: "16px", display: "flex", flexDirection: "column", gap: "8px" }}>
                                   <h4 style={{ color: "#f59e0b", fontSize: "0.95rem", fontWeight: 700 }}>{prop.prop_name}</h4>
@@ -2389,6 +3613,7 @@ export default function Home() {
               {/* TAB 3: IMAGE SHOTS */}
               {activeTab === "shots" && (
                 <div style={{ display: "flex", flexDirection: "column", gap: "16px" }}>
+                  {renderTabStatusBanner("shot_planner")}
                   <div>
                     <h2 style={{ fontSize: "1.4rem", fontWeight: 800, marginBottom: "4px" }}>
                       Tạo ảnh Shots
@@ -2403,12 +3628,47 @@ export default function Home() {
                       <span style={{ display: "block", color: "var(--text-muted)", marginBottom: "16px" }}>
                         Chưa lên kế hoạch camera shots. Vui lòng chạy Shot Planner (Step 5) trước.
                       </span>
-                      <button onClick={() => handleRunStep("shot_planner")} className="sidebar-btn-new" style={{ margin: "0 auto" }}>
+                      <button
+                        onClick={() => handleRunStep("shot_planner")}
+                        disabled={activeStep !== null || isRunningAll}
+                        className="sidebar-btn-new"
+                        style={{ margin: "0 auto", opacity: (activeStep !== null || isRunningAll) ? 0.5 : 1, cursor: (activeStep !== null || isRunningAll) ? "not-allowed" : "pointer" }}
+                      >
                         Lên kế hoạch camera
                       </button>
                     </div>
                   ) : (
                     <div style={{ display: "flex", flexDirection: "column", gap: "16px" }}>
+                      {/* Batch Action Buttons for Shots */}
+                      <div style={{ display: "flex", gap: "10px", alignItems: "center", marginBottom: "16px", padding: "12px", background: "rgba(255,255,255,0.02)", borderRadius: "8px", border: "1px solid rgba(255,255,255,0.05)" }}>
+                        <span style={{ fontSize: "0.8rem", color: "var(--text-secondary)", fontWeight: 600 }}>Hành động hàng loạt:</span>
+                        <button
+                          onClick={() => handleGenerateAllShotImages(false)}
+                          disabled={isGeneratingBatch || activeStep !== null || isRunningAll}
+                          className="btn-primary"
+                          style={{ padding: "6px 12px", fontSize: "0.75rem", borderRadius: "4px" }}
+                        >
+                          🎨 Tạo tất cả các shots
+                        </button>
+                        <button
+                          onClick={() => handleGenerateAllShotImages(true)}
+                          disabled={isGeneratingBatch || activeStep !== null || isRunningAll}
+                          className="btn-secondary"
+                          style={{ padding: "6px 12px", fontSize: "0.75rem", borderRadius: "4px" }}
+                        >
+                          🎨 Tạo tất cả shots chưa tạo
+                        </button>
+                        {isGeneratingBatch && (
+                          <button
+                            onClick={handleStopDrawing}
+                            className="btn-secondary"
+                            style={{ padding: "6px 12px", fontSize: "0.75rem", borderRadius: "4px", color: "var(--danger)", borderColor: "rgba(239,68,68,0.3)", background: "rgba(239,68,68,0.05)" }}
+                          >
+                            🛑 Dừng vẽ
+                          </button>
+                        )}
+                      </div>
+
                       {projectData.shots.map((shot: any, idx) => {
                         const shotKey = `shot_${shot.scene_number || shot.scene_id || ''}_${shot.shot_id}`;
                         const keyframeObj = projectData.keyframes 
@@ -2416,39 +3676,41 @@ export default function Home() {
                           : null;
                         const keyframePrompt = keyframeObj?.keyframe_image_prompt || "";
                         const keyframeUrl = keyframeObj?.url || "";
-                        const hasImg = !!keyframeUrl || mockGeneratedShotImages[shotKey];
-                        const isGen = !!generatingShotKeys[shotKey];
+                        const hasImg = !!(keyframeUrl && !keyframeUrl.startsWith("mock_"));
+                        const isGen = generatingShotKeys[shotKey];
 
                         return (
                           <div key={idx} className="glass-panel" style={{ padding: "16px", display: "grid", gridTemplateColumns: "180px 1fr", gap: "16px", alignItems: "start" }}>
-                            <div style={{ aspectRatio: "16/9", background: "#060910", borderRadius: "8px", overflow: "hidden", display: "flex", alignItems: "center", justifyContent: "center" }}>
-                              {hasImg ? (
-                                <img
-                                  src={keyframeUrl || getAssetImage(shot.actions || "", 'environment')}
-                                  alt={`Shot ${shot.scene_id}.${shot.shot_id}`}
-                                  style={{ width: "100%", height: "100%", objectFit: "cover" }}
-                                />
-                              ) : (
-                                <div style={{ display: "flex", flexDirection: "column", alignItems: "center", gap: "6px" }}>
-                                  {isGen ? (
-                                    <span style={{ fontSize: "0.7rem", color: "var(--accent-cyan)" }}>Sinh ảnh...</span>
-                                  ) : (
-                                    <button
-                                      onClick={() => triggerGenerateShotImage(shotKey)}
-                                      className="btn-primary"
-                                      style={{ padding: "4px 8px", fontSize: "0.7rem", borderRadius: "4px" }}
-                                    >
-                                      Sinh ảnh Shot
-                                    </button>
-                                  )}
-                                </div>
-                              )}
+                            <div style={{ aspectRatio: "16/9", background: "#060910", borderRadius: "8px", overflow: "hidden", display: "flex", alignItems: "center", justifyContent: "center", position: "relative" }}>
+                               {isGen ? (
+                                 renderMediaLoader(isGen, "Vẽ ảnh...")
+                               ) : hasImg ? (
+                                 <div style={{ width: "100%", height: "100%", position: "relative" }}>
+                                   <img
+                                     src={keyframeUrl}
+                                     alt={`Scene ${shot.scene_id} - Shot ${shot.shot_id}`}
+                                     style={{ width: "100%", height: "100%", objectFit: "cover" }}
+                                   />
+                                   {renderImageActionToolbar(keyframeUrl, `shot_${shot.shot_id}.png`, () => triggerGenerateShotImage(shotKey))}
+                                 </div>
+                               ) : (
+                                 <div style={{ display: "flex", flexDirection: "column", alignItems: "center", gap: "6px" }}>
+                                   <button
+                                     onClick={() => triggerGenerateShotImage(shotKey)}
+                                     disabled={activeStep !== null || isRunningAll}
+                                     className="btn-primary"
+                                     style={{ padding: "4px 8px", fontSize: "0.7rem", borderRadius: "4px" }}
+                                   >
+                                     Tạo
+                                   </button>
+                                 </div>
+                               )}
                             </div>
 
                             <div style={{ display: "flex", flexDirection: "column", gap: "4px" }}>
                               <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
                                 <h4 style={{ color: "#a78bfa", fontSize: "0.9rem" }}>
-                                  Shot {shot.scene_id}.{shot.shot_id} (Scene {shot.scene_id})
+                                  Scene {shot.scene_id} - Shot {String(shot.shot_id).replace('Shot', '')}
                                 </h4>
                                 <span style={{ fontSize: "0.75rem", color: "var(--text-muted)" }}>
                                   Camera: {shot.framing} | {shot.camera_movement}
@@ -2466,11 +3728,11 @@ export default function Home() {
                                 </div>
                               ) : (
                                 <button
-                                  onClick={() => handleRunStep("keyframe_generator")}
+                                  onClick={() => handleRunStep("shot_planner")}
                                   className="btn-secondary"
                                   style={{ padding: "4px 8px", fontSize: "0.7rem", borderRadius: "4px", width: "fit-content", marginTop: "4px" }}
                                 >
-                                  Generate Prompt ảnh vẽ
+                                  Chạy Shot Prompt Generator
                                 </button>
                               )}
 
@@ -2630,6 +3892,8 @@ export default function Home() {
               {/* TAB 4: TẠO VIDEO & RẠP PHIM */}
               {activeTab === "video" && (
                 <div style={{ display: "flex", flexDirection: "column", gap: "20px" }}>
+                  {renderTabStatusBanner("shot_planner", "Đang phân cảnh & tạo mô tả chuyển động AI, vui lòng chờ...")}
+                  {renderTabStatusBanner("motion_generator")}
                   {/* Tab Title */}
                   <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-end" }}>
                     <div>
@@ -2641,32 +3905,6 @@ export default function Home() {
                       </p>
                     </div>
 
-                    {/* Global Render options */}
-                    <div style={{ display: "flex", alignItems: "center", gap: "12px", background: "#0b0f19", padding: "8px 16px", borderRadius: "8px", border: "1px solid var(--border-color)" }}>
-                      <div style={{ display: "flex", flexDirection: "column", gap: "2px" }}>
-                        <span style={{ fontSize: "0.65rem", color: "var(--text-muted)", fontWeight: 700 }}>ĐỘ PHÂN GIẢI</span>
-                        <select className="custom-select" defaultValue="1080" style={{ padding: "4px 8px", fontSize: "0.75rem", background: "transparent", border: "none", color: "#ffffff" }}>
-                          <option value="1080">FHD (1920x1080)</option>
-                          <option value="720">HD (1280x720)</option>
-                        </select>
-                      </div>
-
-                      <div style={{ width: "1px", height: "24px", background: "rgba(255,255,255,0.08)" }} />
-
-                      <button
-                        onClick={startVideoRendering}
-                        disabled={isRenderingVideo || projectData.motion_prompts.length === 0}
-                        className="btn-primary"
-                        style={{
-                          padding: "6px 12px",
-                          fontSize: "0.75rem",
-                          borderRadius: "6px",
-                          background: "linear-gradient(135deg, #7c3aed, #db2777)"
-                        }}
-                      >
-                        {isRenderingVideo ? `Rendering (${videoRenderPercent}%)` : "🎬 Render phim hoàn chỉnh"}
-                      </button>
-                    </div>
                   </div>
 
                   {/* Unified Movie Player (If complete movie is rendered) */}
@@ -2680,15 +3918,15 @@ export default function Home() {
                       <div style={{ display: "grid", gridTemplateColumns: "1fr 280px", gap: "16px", alignItems: "start" }}>
                         <div className="cinema-screen" style={{ width: "100%", aspectRatio: "16/9" }}>
                           <video
+                            key={`movie-${activeProjectId}-${renderTimestamp}`}
                             ref={videoRef}
-                            src="https://assets.mixkit.co/videos/preview/mixkit-beautiful-aerial-view-of-forest-and-mountains-42646-large.mp4"
+                            src={`/exports/${activeProjectId}.mp4?t=${renderTimestamp}`}
                             style={{ width: "100%", height: "100%", objectFit: "cover" }}
                             onPlay={() => setIsPlaying(true)}
                             onPause={() => setIsPlaying(false)}
                             onDurationChange={(e) => setVideoDuration(e.currentTarget.duration)}
                             onTimeUpdate={(e) => setPlayheadTime(e.currentTarget.currentTime)}
                           />
-
                           {/* Subtitles Overlay */}
                           <div
                             style={{
@@ -2794,6 +4032,34 @@ export default function Home() {
                     </div>
                   )}
 
+                  {/* AI Custom Instructions Input for Motion Generator */}
+                  {projectData.shots.length > 0 && (
+                    <div className="glass-panel" style={{ padding: "16px", background: "rgba(255, 255, 255, 0.01)", border: "1px solid rgba(255, 255, 255, 0.03)" }}>
+                      <span style={{ fontSize: "0.75rem", color: "var(--text-secondary)", fontWeight: 700, display: "block", marginBottom: "8px" }}>
+                        💡 YÊU CẦU BỔ SUNG KHI TẠO CHUYỂN ĐỘNG BẰNG AI (TÙY CHỌN)
+                      </span>
+                      <textarea
+                        value={customMotionInstructions}
+                        onChange={(e) => setCustomMotionInstructions(e.target.value)}
+                        placeholder="Nhập hướng dẫn bổ sung cho Gemini khi tạo chuyển động (ví dụ: 'Hãy mô tả các nhân vật chuyển động cực kỳ chậm rãi', 'Thêm các hành động phụ như cười tươi', 'Máy quay luôn hướng theo nhân vật...')"
+                        className="custom-textarea"
+                        style={{
+                          width: "100%",
+                          minHeight: "60px",
+                          fontSize: "0.8rem",
+                          padding: "10px 12px",
+                          lineHeight: 1.4,
+                          background: "rgba(0, 0, 0, 0.2)",
+                          border: "1px solid rgba(255,255,255,0.05)",
+                          borderRadius: "4px"
+                        }}
+                      />
+                      <span style={{ fontSize: "0.68rem", color: "var(--text-muted)", marginTop: "4px", display: "block" }}>
+                        * Nếu nhập yêu cầu này, hệ thống sẽ sử dụng AI Gemini để viết lại chuyển động theo ý bạn thay vì tự động chuyển đổi từ bảng phân cảnh.
+                      </span>
+                    </div>
+                  )}
+
                   {/* Action panel: Generate Motion Prompts / Render Selected Videos */}
                   {projectData.shots.length > 0 && (
                     <div className="glass-panel" style={{ display: "flex", justifyContent: "space-between", alignItems: "center", padding: "12px 20px" }}>
@@ -2813,7 +4079,7 @@ export default function Home() {
                             color: "#a78bfa"
                           }}
                         >
-                          🔮 Tự động sinh mô tả chuyển động (Step 7)
+                          🔮 Cập nhật mô tả chuyển động (Compile Motion)
                         </button>
                       </div>
 
@@ -2841,6 +4107,38 @@ export default function Home() {
                     </div>
                   )}
 
+                  {/* Batch Action Buttons for Videos */}
+                  {projectData.shots.length > 0 && (
+                    <div style={{ display: "flex", gap: "10px", alignItems: "center", marginBottom: "16px", padding: "12px", background: "rgba(255,255,255,0.02)", borderRadius: "8px", border: "1px solid rgba(255,255,255,0.05)" }}>
+                      <span style={{ fontSize: "0.8rem", color: "var(--text-secondary)", fontWeight: 600 }}>Hành động hàng loạt:</span>
+                      <button
+                        onClick={() => handleGenerateAllSegmentVideos(false)}
+                        disabled={isGeneratingBatch || activeStep !== null || isRunningAll}
+                        className="btn-primary"
+                        style={{ padding: "6px 12px", fontSize: "0.75rem", borderRadius: "4px" }}
+                      >
+                        🎬 Tạo tất cả video segment
+                      </button>
+                      <button
+                        onClick={() => handleGenerateAllSegmentVideos(true)}
+                        disabled={isGeneratingBatch || activeStep !== null || isRunningAll}
+                        className="btn-secondary"
+                        style={{ padding: "6px 12px", fontSize: "0.75rem", borderRadius: "4px" }}
+                      >
+                        🎬 Tạo video chưa tạo
+                      </button>
+                      {isGeneratingBatch && (
+                        <button
+                          onClick={handleStopDrawing}
+                          className="btn-secondary"
+                          style={{ padding: "6px 12px", fontSize: "0.75rem", borderRadius: "4px", color: "var(--danger)", borderColor: "rgba(239,68,68,0.3)", background: "rgba(239,68,68,0.05)" }}
+                        >
+                          🛑 Dừng render video
+                        </button>
+                      )}
+                    </div>
+                  )}
+
                   {/* List of Shot Segment Cards */}
                   {projectData.shots.length === 0 ? (
                     <div style={{ padding: "40px", textAlign: "center", border: "1px dashed var(--border-color)", borderRadius: "var(--border-radius-lg)" }}>
@@ -2856,7 +4154,7 @@ export default function Home() {
                           ? projectData.keyframes.find((k: any) => k.shot_id === shot.shot_id)
                           : null;
                         const keyframeUrl = keyframeObj?.url || "";
-                        const hasShotImg = !!keyframeUrl || mockGeneratedShotImages[shotKey];
+                        const hasShotImg = !!(keyframeUrl && !keyframeUrl.startsWith("mock_"));
                         
                         // Find corresponding motion prompt by shot_id safely
                         const motionIndex = projectData.motion_prompts 
@@ -2870,7 +4168,8 @@ export default function Home() {
                           : "";
                         
                         const hasVideo = !!videoUrl || mockGeneratedSegmentVideos[shotKey] || isVideoGenerated;
-                        const isGenVideo = !!generatingSegmentVideoKeys[shotKey];
+                        const isGenVideo = generatingSegmentVideoKeys[shotKey];
+                        const isGenShot = generatingShotKeys[shotKey];
                         
                         return (
                           <div
@@ -2949,39 +4248,41 @@ export default function Home() {
                                   background: "#060910",
                                   borderRadius: "4px",
                                   overflow: "hidden",
-                                  border: "1px solid rgba(255,255,255,0.04)",
                                   display: "flex",
                                   alignItems: "center",
-                                  justifyContent: "center"
+                                  justifyContent: "center",
+                                  position: "relative"
                                 }}
                               >
                                 {hasShotImg ? (
-                                  <img
-                                    src={keyframeUrl || getAssetImage(shot.actions || "", 'environment')}
-                                    alt={`Shot ${shot.scene_id}.${shot.shot_id}`}
-                                    style={{ width: "100%", height: "100%", objectFit: "cover" }}
-                                  />
+                                  <div style={{ width: "100%", height: "100%", position: "relative" }}>
+                                    <img
+                                      src={keyframeUrl}
+                                      alt={`Scene ${shot.scene_id} - Shot ${shot.shot_id}`}
+                                      style={{ width: "100%", height: "100%", objectFit: "cover" }}
+                                    />
+                                    {renderImageActionToolbar(keyframeUrl, `shot_${shot.shot_id}.png`)}
+                                  </div>
                                 ) : (
                                   <div style={{ display: "flex", flexDirection: "column", alignItems: "center", gap: "4px" }}>
-                                    <span style={{ fontSize: "1.2rem" }}>🖼️</span>
-                                    <button
-                                      onClick={() => triggerGenerateShotImage(shotKey)}
-                                      className="btn-primary"
-                                      style={{ padding: "4px 8px", fontSize: "0.65rem", borderRadius: "3px" }}
-                                    >
-                                      Sinh ảnh shot
-                                    </button>
+                                    {isGenShot ? (
+                                      renderMediaLoader(isGenShot, "Vẽ ảnh...")
+                                    ) : (
+                                      <>
+                                        <span style={{ fontSize: "1.2rem" }}>🖼️</span>
+                                        <span style={{ fontSize: "0.65rem", color: "var(--text-muted)", fontWeight: 500 }}>Chưa tạo ảnh</span>
+                                      </>
+                                    )}
                                   </div>
                                 )}
                               </div>
                               <button
                                 onClick={() => {
                                   if (hasShotImg) {
-                                    alert(`[Shot ${shot.scene_id}.${shot.shot_id}]\nHành động: ${shot.actions}\nGóc quay: ${shot.framing} | Chuyển động: ${shot.camera_movement}`);
-                                  } else {
-                                    triggerGenerateShotImage(shotKey);
+                                    setFullscreenImageUrl(keyframeUrl);
                                   }
                                 }}
+                                disabled={!hasShotImg}
                                 className="btn-secondary"
                                 style={{
                                   width: "100%",
@@ -2990,7 +4291,9 @@ export default function Home() {
                                   display: "flex",
                                   alignItems: "center",
                                   justifyContent: "center",
-                                  gap: "4px"
+                                  gap: "4px",
+                                  opacity: hasShotImg ? 1 : 0.4,
+                                  cursor: hasShotImg ? "pointer" : "not-allowed"
                                 }}
                               >
                                 <svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5">
@@ -3019,7 +4322,9 @@ export default function Home() {
                                   justifyContent: "center"
                                 }}
                               >
-                                {hasVideo ? (
+                                {isGenVideo ? (
+                                  renderMediaLoader(isGenVideo, "Rendering...")
+                                ) : hasVideo ? (
                                   <video
                                     src={videoUrl || "https://assets.mixkit.co/videos/preview/mixkit-beautiful-aerial-view-of-forest-and-mountains-42646-large.mp4"}
                                     controls
@@ -3027,21 +4332,15 @@ export default function Home() {
                                   />
                                 ) : (
                                   <div style={{ display: "flex", flexDirection: "column", alignItems: "center", gap: "4px" }}>
-                                    {isGenVideo ? (
-                                      <span style={{ fontSize: "0.68rem", color: "var(--accent-cyan)", fontWeight: 600 }}>Rendering...</span>
-                                    ) : (
-                                      <>
-                                        <span style={{ fontSize: "1.2rem" }}>🎬</span>
-                                        <span style={{ fontSize: "0.65rem", color: "var(--text-muted)" }}>Chưa tạo video</span>
-                                      </>
-                                    )}
+                                    <span style={{ fontSize: "1.2rem" }}>🎬</span>
+                                    <span style={{ fontSize: "0.65rem", color: "var(--text-muted)" }}>Chưa tạo video</span>
                                   </div>
                                 )}
                               </div>
                               <div style={{ display: "flex", gap: "4px" }}>
                                 <button
                                   onClick={() => triggerGenerateSegmentVideo(shotKey)}
-                                  disabled={isGenVideo}
+                                  disabled={!!isGenVideo || activeStep !== null || isRunningAll}
                                   className="btn-secondary"
                                   style={{
                                     flexGrow: 1,
@@ -3089,6 +4388,739 @@ export default function Home() {
                 </div>
               )}
 
+              {activeTab === "rapphim" && (
+                <div style={{ display: "grid", gridTemplateColumns: "1fr 400px", gap: "24px", alignItems: "stretch", width: "100%" }}>
+                  {/* Left Column: Cinema Preview Screen & Timeline */}
+                  <div style={{ display: "flex", flexDirection: "column", gap: "16px" }}>
+                    
+                    {/* Cinema Screen Container */}
+                    <div className="glass-panel" style={{ padding: "20px", background: "#060913", border: "1px solid rgba(255,255,255,0.06)", display: "flex", flexDirection: "column", gap: "16px", borderRadius: "12px" }}>
+                      
+                      {/* Cinema Title bar */}
+                      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+                        <span style={{ fontSize: "0.85rem", fontWeight: 700, color: "#a78bfa", letterSpacing: "0.05em", display: "flex", alignItems: "center", gap: "8px" }}>
+                          🎬 TRÌNH CHIẾU RẠP PHIM (STORY PREVIEW PLAYER)
+                        </span>
+                        {/* active state info */}
+                        {(() => {
+                          const activeState = getCinemaActiveStateAtTime(cinemaPlayhead);
+                          if (activeState.mode === "shot" && activeState.activeShot) {
+                            return (
+                              <span style={{ fontSize: "0.75rem", color: "var(--text-muted)" }}>
+                                Phân cảnh: <strong style={{ color: "#ffffff" }}>Scene {activeState.activeShot.scene_id} - Shot {String(activeState.activeShot.shot_id).replace('Shot', '')}</strong> (Cảnh {activeState.index + 1}/{activeState.totalCount})
+                              </span>
+                            );
+                          } else if (activeState.mode === "scene" && activeState.activeScene) {
+                            return (
+                              <span style={{ fontSize: "0.75rem", color: "var(--text-muted)" }}>
+                                Phân cảnh: <strong style={{ color: "#ffffff" }}>Scene {activeState.activeScene.scene_id}</strong> (Cảnh {activeState.index + 1}/{activeState.totalCount})
+                              </span>
+                            );
+                          }
+                          return (
+                            <span style={{ fontSize: "0.75rem", color: "var(--text-muted)" }}>
+                              Chưa có phân cảnh nào
+                            </span>
+                          );
+                        })()}
+                      </div>
+
+                      {/* 16:9 Screen */}
+                      <div
+                        id="cinema-player-screen"
+                        className="cinema-screen"
+                        style={{
+                          width: "100%",
+                          aspectRatio: "16/9",
+                          background: "#000000",
+                          borderRadius: "8px",
+                          overflow: "hidden",
+                          position: "relative",
+                          border: "1px solid rgba(255,255,255,0.1)",
+                          boxShadow: "0 20px 40px -15px rgba(124, 58, 237, 0.25)"
+                        }}
+                      >
+                        {/* Display Media based on activeState */}
+                        {(() => {
+                          const activeState = getCinemaActiveStateAtTime(cinemaPlayhead);
+                          const hasVideo = !!(activeState.videoUrl && !activeState.videoUrl.startsWith("mock_"));
+                          const hasImage = !!(activeState.imageUrl && !activeState.imageUrl.startsWith("mock_"));
+
+                          if (hasVideo) {
+                            return (
+                              <video
+                                ref={cinemaVideoRef}
+                                src={activeState.videoUrl}
+                                style={{ width: "100%", height: "100%", objectFit: "cover" }}
+                                playsInline
+                                loop
+                              />
+                            );
+                          } else if (hasImage) {
+                            return (
+                              <img
+                                key={activeState.index}
+                                src={activeState.imageUrl}
+                                className="ken-burns"
+                                alt="Cinema shot preview"
+                                style={{ width: "100%", height: "100%", objectFit: "cover" }}
+                              />
+                            );
+                          } else {
+                            // Fallback if no media exists: Show stylized text overlay
+                            return (
+                              <div
+                                style={{
+                                  display: "flex",
+                                  flexDirection: "column",
+                                  alignItems: "center",
+                                  justifyContent: "center",
+                                  padding: "24px",
+                                  height: "100%",
+                                  width: "100%",
+                                  background: "radial-gradient(circle, #0e172a 0%, #030712 100%)",
+                                  color: "var(--text-secondary)",
+                                  textAlign: "center"
+                                }}
+                              >
+                                <svg width="48" height="48" viewBox="0 0 24 24" fill="none" stroke="rgba(255,255,255,0.15)" strokeWidth="1.5" style={{ marginBottom: "12px" }}>
+                                  <rect width="20" height="15" x="2" y="3" rx="2" />
+                                  <path d="M12 18v4M9 22h6" />
+                                </svg>
+                                <div style={{ fontSize: "0.85rem", color: "#a78bfa", fontWeight: 700, marginBottom: "4px" }}>
+                                  {activeState.mode === "shot" ? `SCENE ${activeState.activeShot?.scene_id} - SHOT ${String(activeState.activeShot?.shot_id).replace('Shot', '')}` : activeState.mode === "scene" ? `SCENE ${activeState.activeScene?.scene_id}` : "KHÔNG CÓ DỮ LIỆU"}
+                                </div>
+                                <div style={{ fontSize: "0.72rem", maxWidth: "400px", color: "var(--text-muted)", fontStyle: "italic" }}>
+                                  {activeState.mode === "shot" ? activeState.activeShot?.actions : activeState.mode === "scene" ? activeState.activeScene?.description : "Vui lòng tạo kịch bản/phân cảnh trước để bắt đầu xem phim."}
+                                </div>
+                              </div>
+                            );
+                          }
+                        })()}
+
+                        {/* Subtitles Overlay */}
+                        {(() => {
+                          const activeState = getCinemaActiveStateAtTime(cinemaPlayhead);
+                          const subtitle = activeState.subtitle;
+                          if (!subtitle.text) return null;
+
+                          // Align positions
+                          let positionStyle: React.CSSProperties = {};
+                          if (subConfig.alignment === "TOP") {
+                            positionStyle = { top: "24px", bottom: "auto" };
+                          } else if (subConfig.alignment === "CENTER") {
+                            positionStyle = { top: "50%", bottom: "auto", transform: "translateY(-50%)" };
+                          } else {
+                            // BOTTOM
+                            positionStyle = { bottom: "32px", top: "auto" };
+                          }
+
+                          // Font styling
+                          let fontStyle: React.CSSProperties = {
+                            fontFamily: subConfig.fontFamily === "sans-serif" ? "var(--font-sans)" : subConfig.fontFamily === "monospace" ? "var(--font-mono)" : subConfig.fontFamily,
+                            fontSize: `${subConfig.fontSize}px`,
+                            color: subConfig.color,
+                            textAlign: "center"
+                          };
+
+                          // Text outline using multi-shadow
+                          const w = subConfig.strokeWidth;
+                          const c = subConfig.outlineColor;
+                          if (w > 0) {
+                            fontStyle.textShadow = `
+                              -${w}px -${w}px 0 ${c},  
+                               ${w}px -${w}px 0 ${c},
+                              -${w}px  ${w}px 0 ${c},
+                               ${w}px  ${w}px 0 ${c},
+                              0 2px 4px rgba(0,0,0,0.8)
+                            `;
+                          } else {
+                            fontStyle.textShadow = "0 2px 4px rgba(0,0,0,0.8)";
+                          }
+
+                          // Background box style
+                          const hasBgBox = subConfig.bgOpacity > 0;
+                          const bgStyle: React.CSSProperties = hasBgBox ? {
+                            background: `${subConfig.bgColor || "#000000"}${Math.round(subConfig.bgOpacity * 2.55).toString(16).padStart(2, '0')}`,
+                            padding: `${subConfig.bgPadding || 10}px ${Number(subConfig.bgPadding || 10) * 1.8}px`,
+                            borderRadius: "6px",
+                            backdropFilter: "blur(2px)",
+                            border: "1px solid rgba(255,255,255,0.06)",
+                            display: "inline-block"
+                          } : {
+                            display: "inline-block"
+                          };
+
+                          return (
+                            <div
+                              style={{
+                                position: "absolute",
+                                left: "8%",
+                                right: "8%",
+                                zIndex: 10,
+                                display: "flex",
+                                justifyContent: "center",
+                                pointerEvents: "none",
+                                ...positionStyle
+                              }}
+                            >
+                              <div style={bgStyle}>
+                                <div style={fontStyle}>
+                                  {/* character name prefix */}
+                                  {subtitle.character && (
+                                    <span style={{ fontWeight: 800, color: "#a78bfa", marginRight: "6px" }}>
+                                      {subtitle.character}:
+                                    </span>
+                                  )}
+                                  {renderSubtitleLines(subtitle.text)}
+                                </div>
+                              </div>
+                            </div>
+                          );
+                        })()}
+
+                        {/* Projection screen top highlight shadow bar */}
+                        <div style={{ position: "absolute", top: 0, left: 0, right: 0, height: "30%", background: "linear-gradient(to bottom, rgba(167,139,250,0.08), transparent)", pointerEvents: "none" }} />
+
+                        {/* Fullscreen Button */}
+                        <button
+                          onClick={toggleFullscreen}
+                          style={{
+                            position: "absolute",
+                            top: "16px",
+                            right: "16px",
+                            zIndex: 20,
+                            background: "rgba(0, 0, 0, 0.5)",
+                            border: "1px solid rgba(255, 255, 255, 0.15)",
+                            borderRadius: "6px",
+                            width: "32px",
+                            height: "32px",
+                            display: "flex",
+                            alignItems: "center",
+                            justifyContent: "center",
+                            cursor: "pointer",
+                            color: "#ffffff",
+                            backdropFilter: "blur(4px)",
+                            transition: "all 0.2s"
+                          }}
+                          title={isFullscreen ? "Thu nhỏ" : "Phóng to toàn màn hình"}
+                        >
+                          {isFullscreen ? (
+                            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round">
+                              <path d="M4 14h6v6M20 10h-6V4M14 10l7-7M10 14l-7 7" />
+                            </svg>
+                          ) : (
+                            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round">
+                              <path d="M15 3h6v6M9 21H3v-6M21 3l-7 7M3 21l7-7" />
+                            </svg>
+                          )}
+                        </button>
+                      </div>
+
+                      {/* Video Player Controls (Playbar and buttons) */}
+                      <div style={{ display: "flex", flexDirection: "column", gap: "10px", background: "rgba(0,0,0,0.2)", padding: "12px", borderRadius: "8px" }}>
+                        <div style={{ display: "flex", alignItems: "center", gap: "16px" }}>
+                          
+                          {/* Play / Pause button */}
+                          <button
+                            onClick={() => setCinemaPlaying(!cinemaPlaying)}
+                            className="btn-primary"
+                            style={{
+                              width: "36px",
+                              height: "36px",
+                              borderRadius: "50%",
+                              display: "flex",
+                              alignItems: "center",
+                              justifyContent: "center",
+                              fontSize: "1rem",
+                              background: cinemaPlaying ? "linear-gradient(135deg, #7c3aed, #db2777)" : "rgba(255,255,255,0.08)",
+                              border: "none",
+                              cursor: "pointer",
+                              transition: "all 0.2s"
+                            }}
+                          >
+                            {cinemaPlaying ? "⏸" : "▶"}
+                          </button>
+
+                          {/* Navigation buttons */}
+                          <button
+                            onClick={() => handleCinemaSkip(-1)}
+                            className="btn-secondary"
+                            style={{ padding: "6px 10px", fontSize: "0.75rem", borderRadius: "6px", display: "flex", alignItems: "center", justifyContent: "center" }}
+                            title="Lùi 1 phân cảnh"
+                          >
+                            ⏮
+                          </button>
+                          
+                          <button
+                            onClick={() => handleCinemaSkip(1)}
+                            className="btn-secondary"
+                            style={{ padding: "6px 10px", fontSize: "0.75rem", borderRadius: "6px", display: "flex", alignItems: "center", justifyContent: "center" }}
+                            title="Tiến 1 phân cảnh"
+                          >
+                            ⏭
+                          </button>
+
+                          {/* Loop toggle button */}
+                          <button
+                            onClick={() => setCinemaLoop(!cinemaLoop)}
+                            className="btn-secondary"
+                            style={{
+                              padding: "6px 10px",
+                              fontSize: "0.72rem",
+                              borderRadius: "6px",
+                              color: cinemaLoop ? "#a78bfa" : "var(--text-muted)",
+                              border: `1px solid ${cinemaLoop ? "rgba(167,139,250,0.3)" : "rgba(255,255,255,0.05)"}`,
+                              background: cinemaLoop ? "rgba(167,139,250,0.06)" : "transparent"
+                            }}
+                          >
+                            🔁 Lặp lại
+                          </button>
+
+                          {/* Timeline slider */}
+                          <div
+                            onClick={handleCinemaTimelineClick}
+                            style={{
+                              flexGrow: 1,
+                              height: "6px",
+                              background: "rgba(255, 255, 255, 0.1)",
+                              borderRadius: "3px",
+                              position: "relative",
+                              cursor: "pointer",
+                              display: "flex",
+                              alignItems: "center"
+                            }}
+                          >
+                            <div
+                              style={{
+                                height: "100%",
+                                background: "linear-gradient(90deg, #7c3aed, #db2777)",
+                                borderRadius: "3px",
+                                width: `${getCinemaTotalDuration() ? (cinemaPlayhead / getCinemaTotalDuration()) * 100 : 0}%`
+                              }}
+                            />
+                            <div
+                              style={{
+                                position: "absolute",
+                                left: `calc(${getCinemaTotalDuration() ? (cinemaPlayhead / getCinemaTotalDuration()) * 100 : 0}% - 6px)`,
+                                width: "12px",
+                                height: "12px",
+                                borderRadius: "50%",
+                                background: "#ffffff",
+                                boxShadow: "0 0 6px rgba(167, 139, 250, 0.8)",
+                                border: "2px solid #7c3aed",
+                                pointerEvents: "none"
+                              }}
+                            />
+                          </div>
+
+                          {/* Playback time indicator */}
+                          <span style={{ fontSize: "0.75rem", fontFamily: "var(--font-mono)", color: "var(--text-muted)", minWidth: "90px", textAlign: "right" }}>
+                            {Math.floor(cinemaPlayhead / 60)}:{(Math.floor(cinemaPlayhead % 60)).toString().padStart(2, '0')} / {Math.floor(getCinemaTotalDuration() / 60)}:{(Math.floor(getCinemaTotalDuration() % 60)).toString().padStart(2, '0')}
+                          </span>
+                        </div>
+                      </div>
+
+                    </div>
+
+                    {/* Timeline Navigator Shot list */}
+                    <div className="glass-panel" style={{ padding: "16px", display: "flex", flexDirection: "column", gap: "10px", borderRadius: "12px" }}>
+                      <span style={{ fontSize: "0.72rem", color: "var(--text-muted)", fontWeight: 700, letterSpacing: "0.05em" }}>
+                        ĐIỀU HƯỚNG THEO VIDEO SHOT
+                      </span>
+                      
+                      {projectData.shots.length === 0 ? (
+                        <div style={{ textAlign: "center", padding: "20px 0", color: "var(--text-muted)", fontSize: "0.8rem" }}>
+                          Chưa có thông tin video shot. Bạn cần hoàn thành bước 5 (Shot Planner) trước.
+                        </div>
+                      ) : (
+                        <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fill, minmax(220px, 1fr))", gap: "10px", maxHeight: "250px", overflowY: "auto", paddingRight: "4px" }}>
+                          {projectData.shots.map((shot: any, idx) => {
+                            let start = 0;
+                            for (let i = 0; i < idx; i++) {
+                              start += projectData.shots[i].duration_seconds || 5;
+                            }
+                            const dur = shot.duration_seconds || 5;
+                            const isActive = cinemaPlayhead >= start && cinemaPlayhead < start + dur;
+
+                            // Lookup keyframe thumbnail
+                            const keyframeObj = projectData.keyframes?.find((k: any) => k.shot_id === shot.shot_id);
+                            const hasThumbnail = !!(keyframeObj?.url && !keyframeObj.url.startsWith("mock_"));
+
+                            return (
+                              <button
+                                key={idx}
+                                onClick={() => {
+                                  setCinemaPlayhead(start);
+                                  setCinemaPlaying(true);
+                                }}
+                                style={{
+                                  padding: "8px",
+                                  borderRadius: "8px",
+                                  background: isActive ? "rgba(124, 58, 237, 0.12)" : "rgba(255,255,255,0.02)",
+                                  border: `1px solid ${isActive ? "rgba(124, 58, 237, 0.35)" : "rgba(255,255,255,0.04)"}`,
+                                  color: isActive ? "#a78bfa" : "var(--text-secondary)",
+                                  fontSize: "0.75rem",
+                                  cursor: "pointer",
+                                  textAlign: "left",
+                                  display: "flex",
+                                  gap: "8px",
+                                  alignItems: "center",
+                                  transition: "all 0.2s"
+                                }}
+                              >
+                                {/* Mini thumbnail */}
+                                <div style={{ width: "48px", height: "27px", borderRadius: "4px", background: "#000", overflow: "hidden", display: "flex", alignItems: "center", justifyContent: "center", flexShrink: 0, border: "1px solid rgba(255,255,255,0.08)" }}>
+                                  {hasThumbnail ? (
+                                    <img src={keyframeObj.url} style={{ width: "100%", height: "100%", objectFit: "cover" }} />
+                                  ) : (
+                                    <span style={{ fontSize: "0.6rem" }}>🎬</span>
+                                  )}
+                                </div>
+                                <div style={{ overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", flexGrow: 1 }}>
+                                  <div style={{ fontWeight: 700, display: "flex", justifyContent: "space-between" }}>
+                                     <span>Scene {shot.scene_id} - Shot {String(shot.shot_id).replace('Shot', '')}</span>
+                                    <span style={{ color: "var(--text-muted)", fontSize: "0.65rem" }}>{dur}s</span>
+                                  </div>
+                                  <div style={{ fontSize: "0.65rem", color: "var(--text-muted)", overflow: "hidden", textOverflow: "ellipsis" }}>
+                                    {shot.actions || "Chưa có hành động"}
+                                  </div>
+                                </div>
+                              </button>
+                            );
+                          })}
+                        </div>
+                      )}
+                    </div>
+
+                  </div>
+
+                  {/* Right Column: Controls Sidebar */}
+                  <div style={{ display: "flex", flexDirection: "column", gap: "20px", width: "400px", flexShrink: 0 }}>
+                    
+                    {/* Render Movie Panel */}
+                    <div className="glass-panel" style={{ padding: "20px", background: "linear-gradient(135deg, #0d1222 0%, #060913 100%)", border: "1px solid rgba(139, 92, 246, 0.15)", borderRadius: "12px", display: "flex", flexDirection: "column", gap: "14px" }}>
+                      <div style={{ display: "flex", alignItems: "center", gap: "10px", borderBottom: "1px solid rgba(139, 92, 246, 0.2)", paddingBottom: "10px" }}>
+                        <span style={{ fontSize: "1.2rem" }}>🎬</span>
+                        <h3 style={{ fontSize: "1.05rem", fontWeight: 800, color: "#ffffff", letterSpacing: "0.03em", margin: 0 }}>
+                          XUẤT VIDEO MP4
+                        </h3>
+                      </div>
+
+                      <div style={{ display: "flex", flexDirection: "column", gap: "6px" }}>
+                        <label style={{ fontSize: "0.78rem", fontWeight: 700, color: "var(--text-secondary)" }}>
+                          Độ phân giải video
+                        </label>
+                        <select
+                          className="custom-select"
+                          value={videoResolution}
+                          onChange={(e) => setVideoResolution(e.target.value)}
+                          style={{ width: "100%", padding: "10px 14px", background: "rgba(0,0,0,0.25)", border: "1px solid rgba(255,255,255,0.08)", borderRadius: "8px" }}
+                        >
+                          <option value="1080">Full HD (1920x1080) - Chất lượng cao</option>
+                          <option value="720">HD (1280x720) - Khuyên dùng</option>
+                          <option value="360">SD (640x360) - Tốc độ nhanh</option>
+                        </select>
+                      </div>
+
+                      <button
+                        onClick={startVideoRendering}
+                        disabled={isRenderingVideo || projectData.shots.length === 0}
+                        className="btn-primary"
+                        style={{
+                          padding: "10px 16px",
+                          fontSize: "0.85rem",
+                          fontWeight: 700,
+                          borderRadius: "8px",
+                          background: isRenderingVideo ? "rgba(139, 92, 246, 0.3)" : "linear-gradient(135deg, #7c3aed, #db2777)",
+                          border: "none",
+                          cursor: "pointer",
+                          display: "flex",
+                          justifyContent: "center",
+                          alignItems: "center",
+                          gap: "8px",
+                          boxShadow: "0 4px 12px rgba(124, 58, 237, 0.35)",
+                          transition: "all 0.2s"
+                        }}
+                      >
+                        {isRenderingVideo ? (
+                          <>
+                            <span className="pulse-dot" style={{ background: "#ffffff" }} />
+                            Rendering ({videoRenderPercent}%)
+                          </>
+                        ) : (
+                          "🎬 Render phim hoàn chỉnh"
+                        )}
+                      </button>
+
+                      {isRenderingVideo && (
+                        <div style={{ display: "flex", flexDirection: "column", gap: "6px", marginTop: "4px" }}>
+                          <div style={{ display: "flex", justifyContent: "space-between", fontSize: "0.72rem", color: "var(--text-secondary)" }}>
+                            <span>Tiến độ: {videoRenderPercent}%</span>
+                            <span style={{ fontStyle: "italic", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", maxWidth: "200px" }}>{videoRenderStage}</span>
+                          </div>
+                          <div style={{ width: "100%", height: "6px", background: "rgba(255,255,255,0.08)", borderRadius: "3px", overflow: "hidden" }}>
+                            <div style={{ width: `${videoRenderPercent}%`, height: "100%", background: "linear-gradient(90deg, #7c3aed, #db2777)", transition: "width 0.2s ease" }} />
+                          </div>
+                        </div>
+                      )}
+
+                      {isVideoGenerated && !isRenderingVideo && (
+                        <div style={{ display: "flex", flexDirection: "column", gap: "8px", background: "rgba(16, 185, 129, 0.08)", border: "1px solid rgba(16, 185, 129, 0.25)", borderRadius: "8px", padding: "10px 14px", fontSize: "0.75rem", color: "#34d399" }}>
+                          <span style={{ fontWeight: 700 }}>✓ Đã biên dịch video thành công!</span>
+                          <span style={{ color: "var(--text-secondary)", fontSize: "0.7rem" }}>
+                            Bạn có thể xem trước phim ở trình phát bên trái hoặc tải file MP4 trực tiếp từ thư mục `public/exports`.
+                          </span>
+                        </div>
+                      )}
+                    </div>
+
+                    {/* Subtitle Settings Panel */}
+                    <div className="glass-panel" style={{ padding: "24px", background: "#0f121d", border: "1px solid rgba(255,255,255,0.05)", borderRadius: "12px", display: "flex", flexDirection: "column", gap: "20px" }}>
+                      
+                      {/* Header */}
+                      <div style={{ display: "flex", alignItems: "center", gap: "10px", borderBottom: "1px solid rgba(255,255,255,0.08)", paddingBottom: "12px" }}>
+                        <span style={{ fontSize: "1.2rem", color: "#a78bfa" }}>🎛️</span>
+                        <h3 style={{ fontSize: "1.05rem", fontWeight: 800, color: "#ffffff", letterSpacing: "0.03em", margin: 0 }}>
+                          CẤU HÌNH SUBTITLE
+                        </h3>
+                      </div>
+
+                      {/* Font Family selector */}
+                      <div style={{ display: "flex", flexDirection: "column", gap: "6px" }}>
+                        <label style={{ fontSize: "0.78rem", fontWeight: 700, color: "var(--text-secondary)" }}>
+                          T Kiểu chữ (Font Family)
+                        </label>
+                        <select
+                          value={subConfig.fontFamily}
+                          onChange={(e) => setSubConfig(prev => ({ ...prev, fontFamily: e.target.value }))}
+                          className="custom-select"
+                          style={{ width: "100%", padding: "10px 14px", background: "rgba(0,0,0,0.25)", border: "1px solid rgba(255,255,255,0.08)", borderRadius: "8px" }}
+                        >
+                          <option value="sans-serif">Sans-Serif (Mặc định)</option>
+                          <option value="serif">Serif (Thời cổ / Kịch)</option>
+                          <option value="monospace">Monospace (Lập trình)</option>
+                          <option value="cursive">Cursive (Bút viết tay)</option>
+                          <option value="Outfit">Outfit (Hiện đại thanh lịch)</option>
+                          <option value="Arial">Arial</option>
+                          <option value="Times New Roman">Times New Roman</option>
+                        </select>
+                      </div>
+
+                      {/* Font Size slider */}
+                      <div style={{ display: "flex", flexDirection: "column", gap: "6px" }}>
+                        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+                          <label style={{ fontSize: "0.78rem", fontWeight: 700, color: "var(--text-secondary)" }}>
+                            Kích thước (Font Size)
+                          </label>
+                          <span style={{ fontSize: "0.8rem", fontWeight: 700, color: "#a78bfa" }}>
+                            {subConfig.fontSize}px
+                          </span>
+                        </div>
+                        <input
+                          type="range"
+                          min="16"
+                          max="80"
+                          value={subConfig.fontSize}
+                          onChange={(e) => setSubConfig(prev => ({ ...prev, fontSize: parseInt(e.target.value) }))}
+                          className="cinema-range"
+                        />
+                      </div>
+
+                      {/* Colors grid (Text Color & Outline Color) */}
+                      <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: "16px" }}>
+                        
+                        {/* Text Color */}
+                        <div style={{ display: "flex", flexDirection: "column", gap: "6px" }}>
+                          <label style={{ fontSize: "0.75rem", fontWeight: 700, color: "var(--text-secondary)" }}>
+                            Màu chữ
+                          </label>
+                          <div style={{ display: "flex", alignItems: "center", gap: "8px", background: "rgba(0,0,0,0.25)", border: "1px solid rgba(255,255,255,0.08)", borderRadius: "8px", padding: "4px 8px" }}>
+                            <input
+                              type="color"
+                              value={subConfig.color}
+                              onChange={(e) => setSubConfig(prev => ({ ...prev, color: e.target.value }))}
+                              style={{ width: "24px", height: "24px", border: "none", borderRadius: "4px", cursor: "pointer", background: "transparent" }}
+                            />
+                            <span style={{ fontSize: "0.75rem", fontFamily: "var(--font-mono)", color: "#ffffff", textTransform: "uppercase" }}>
+                              {subConfig.color}
+                            </span>
+                          </div>
+                        </div>
+
+                        {/* Outline Color */}
+                        <div style={{ display: "flex", flexDirection: "column", gap: "6px" }}>
+                          <label style={{ fontSize: "0.75rem", fontWeight: 700, color: "var(--text-secondary)" }}>
+                            Màu viền (Outline)
+                          </label>
+                          <div style={{ display: "flex", alignItems: "center", gap: "8px", background: "rgba(0,0,0,0.25)", border: "1px solid rgba(255,255,255,0.08)", borderRadius: "8px", padding: "4px 8px" }}>
+                            <input
+                              type="color"
+                              value={subConfig.outlineColor}
+                              onChange={(e) => setSubConfig(prev => ({ ...prev, outlineColor: e.target.value }))}
+                              style={{ width: "24px", height: "24px", border: "none", borderRadius: "4px", cursor: "pointer", background: "transparent" }}
+                            />
+                            <span style={{ fontSize: "0.75rem", fontFamily: "var(--font-mono)", color: "#ffffff", textTransform: "uppercase" }}>
+                              {subConfig.outlineColor}
+                            </span>
+                          </div>
+                        </div>
+
+                      </div>
+
+                      {/* Stroke Width Slider */}
+                      <div style={{ display: "flex", flexDirection: "column", gap: "6px" }}>
+                        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+                          <label style={{ fontSize: "0.78rem", fontWeight: 700, color: "var(--text-secondary)" }}>
+                            Độ dày viền (Stroke)
+                          </label>
+                          <span style={{ fontSize: "0.8rem", fontWeight: 700, color: "#a78bfa" }}>
+                            {subConfig.strokeWidth}px
+                          </span>
+                        </div>
+                        <input
+                          type="range"
+                          min="0"
+                          max="10"
+                          value={subConfig.strokeWidth}
+                          onChange={(e) => setSubConfig(prev => ({ ...prev, strokeWidth: parseInt(e.target.value) }))}
+                          className="cinema-range"
+                        />
+                      </div>
+
+                      {/* Background Box Opacity Slider */}
+                      <div style={{ display: "flex", flexDirection: "column", gap: "6px" }}>
+                        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+                          <label style={{ fontSize: "0.78rem", fontWeight: 700, color: "var(--text-secondary)" }}>
+                            Độ mờ hộp nền
+                          </label>
+                          <span style={{ fontSize: "0.8rem", fontWeight: 700, color: "#a78bfa" }}>
+                            {subConfig.bgOpacity}%
+                          </span>
+                        </div>
+                        <input
+                          type="range"
+                          min="0"
+                          max="100"
+                          value={subConfig.bgOpacity}
+                          onChange={(e) => setSubConfig(prev => ({ ...prev, bgOpacity: parseInt(e.target.value) }))}
+                          className="cinema-range"
+                        />
+                      </div>
+
+                      {/* Background Box Color & Padding (User Custom Additions) */}
+                      <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: "16px" }}>
+                        {/* BG Color */}
+                        <div style={{ display: "flex", flexDirection: "column", gap: "6px" }}>
+                          <label style={{ fontSize: "0.75rem", fontWeight: 700, color: "var(--text-secondary)" }}>
+                            Màu hộp nền
+                          </label>
+                          <div style={{ display: "flex", alignItems: "center", gap: "8px", background: "rgba(0,0,0,0.25)", border: "1px solid rgba(255,255,255,0.08)", borderRadius: "8px", padding: "4px 8px" }}>
+                            <input
+                              type="color"
+                              value={subConfig.bgColor}
+                              onChange={(e) => setSubConfig(prev => ({ ...prev, bgColor: e.target.value }))}
+                              style={{ width: "24px", height: "24px", border: "none", borderRadius: "4px", cursor: "pointer", background: "transparent" }}
+                            />
+                            <span style={{ fontSize: "0.75rem", fontFamily: "var(--font-mono)", color: "#ffffff", textTransform: "uppercase" }}>
+                              {subConfig.bgColor}
+                            </span>
+                          </div>
+                        </div>
+
+                        {/* BG Padding */}
+                        <div style={{ display: "flex", flexDirection: "column", gap: "6px" }}>
+                          <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+                            <label style={{ fontSize: "0.75rem", fontWeight: 700, color: "var(--text-secondary)" }}>
+                              Size hộp (Padding)
+                            </label>
+                            <span style={{ fontSize: "0.7rem", fontWeight: 700, color: "#a78bfa" }}>
+                              {subConfig.bgPadding}px
+                            </span>
+                          </div>
+                          <input
+                            type="range"
+                            min="4"
+                            max="30"
+                            value={subConfig.bgPadding}
+                            onChange={(e) => setSubConfig(prev => ({ ...prev, bgPadding: parseInt(e.target.value) }))}
+                            className="cinema-range"
+                          />
+                        </div>
+                      </div>
+
+                      {/* Max Line Length slider */}
+                      <div style={{ display: "flex", flexDirection: "column", gap: "6px" }}>
+                        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+                          <label style={{ fontSize: "0.78rem", fontWeight: 700, color: "var(--text-secondary)" }}>
+                            Độ dài dòng tối đa
+                          </label>
+                          <span style={{ fontSize: "0.8rem", fontWeight: 700, color: "#a78bfa" }}>
+                            {subConfig.maxLineLength} ký tự
+                          </span>
+                        </div>
+                        <input
+                          type="range"
+                          min="10"
+                          max="80"
+                          value={subConfig.maxLineLength}
+                          onChange={(e) => setSubConfig(prev => ({ ...prev, maxLineLength: parseInt(e.target.value) }))}
+                          className="cinema-range"
+                        />
+                      </div>
+
+                      {/* Max Words per Sub slider */}
+                      <div style={{ display: "flex", flexDirection: "column", gap: "6px" }}>
+                        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+                          <label style={{ fontSize: "0.78rem", fontWeight: 700, color: "var(--text-secondary)" }}>
+                            Từ tối đa / Sub (Tách câu)
+                          </label>
+                          <span style={{ fontSize: "0.8rem", fontWeight: 700, color: "#a78bfa" }}>
+                            {subConfig.maxWordsPerSub} từ
+                          </span>
+                        </div>
+                        <input
+                          type="range"
+                          min="2"
+                          max="15"
+                          value={subConfig.maxWordsPerSub}
+                          onChange={(e) => setSubConfig(prev => ({ ...prev, maxWordsPerSub: parseInt(e.target.value) }))}
+                          className="cinema-range"
+                        />
+                      </div>
+
+                      {/* Alignment segmented controller */}
+                      <div style={{ display: "flex", flexDirection: "column", gap: "6px" }}>
+                        <label style={{ fontSize: "0.78rem", fontWeight: 700, color: "var(--text-secondary)" }}>
+                          Vị trí hiển thị (Alignment)
+                        </label>
+                        <div className="segmented-control">
+                          <button
+                            onClick={() => setSubConfig(prev => ({ ...prev, alignment: "TOP" }))}
+                            className={`segmented-control-btn ${subConfig.alignment === "TOP" ? "active" : ""}`}
+                          >
+                            TOP
+                          </button>
+                          <button
+                            onClick={() => setSubConfig(prev => ({ ...prev, alignment: "CENTER" }))}
+                            className={`segmented-control-btn ${subConfig.alignment === "CENTER" ? "active" : ""}`}
+                          >
+                            CENTER
+                          </button>
+                          <button
+                            onClick={() => setSubConfig(prev => ({ ...prev, alignment: "BOTTOM" }))}
+                            className={`segmented-control-btn ${subConfig.alignment === "BOTTOM" ? "active" : ""}`}
+                          >
+                            BOTTOM
+                          </button>
+                        </div>
+                      </div>
+
+                    </div>
+                  </div>
+
+                </div>
+              )}
             </div>
 
             {/* Collapsible right sidebar JSON editor */}
@@ -3102,170 +5134,7 @@ export default function Home() {
                 />
               </div>
             )}
-          {/* Collapsible System Logs Terminal Panel */}
-          <div
-            style={{
-              marginTop: "24px",
-              background: "#080c14",
-              border: "1px solid var(--border-color)",
-              borderRadius: "8px",
-              display: "flex",
-              flexDirection: "column",
-              overflow: "hidden",
-              transition: "all 0.3s cubic-bezier(0.4, 0, 0.2, 1)"
-            }}
-          >
-            {/* Terminal Header */}
-            <div
-              onClick={() => setShowLogsPanel(!showLogsPanel)}
-              style={{
-                background: "#0d1321",
-                padding: "10px 16px",
-                display: "flex",
-                alignItems: "center",
-                justifyContent: "space-between",
-                cursor: "pointer",
-                borderBottom: showLogsPanel ? "1px solid var(--border-color)" : "none",
-                userSelect: "none"
-              }}
-            >
-              <div style={{ display: "flex", alignItems: "center", gap: "10px" }}>
-                <span style={{ fontSize: "1rem" }}>💻</span>
-                <span style={{ fontSize: "0.85rem", fontWeight: 700, letterSpacing: "0.03em", color: "#a78bfa" }}>
-                  SYSTEM LOGS TERMINAL
-                </span>
-                
-                {/* Stats indicators */}
-                {systemLogs.length > 0 && (
-                  <div style={{ display: "flex", alignItems: "center", gap: "8px", marginLeft: "12px" }}>
-                    <span style={{ fontSize: "0.7rem", color: "var(--text-muted)" }}>
-                      ({systemLogs.length} logs)
-                    </span>
-                    {systemLogs.some(l => l.type === "running") && (
-                      <span className="pulse-dot" style={{ display: "inline-block", width: "8px", height: "8px", background: "#38bdf8", borderRadius: "50%" }} />
-                    )}
-                  </div>
-                )}
-              </div>
 
-              <div style={{ display: "flex", alignItems: "center", gap: "16px" }} onClick={(e) => e.stopPropagation()}>
-                {/* Filter toggle */}
-                <label style={{ display: "flex", alignItems: "center", gap: "6px", cursor: "pointer", fontSize: "0.72rem", color: "var(--text-secondary)" }}>
-                  <input
-                    type="checkbox"
-                    checked={filterLogsCurrentProj}
-                    onChange={(e) => setFilterLogsCurrentProj(e.target.checked)}
-                    style={{ cursor: "pointer" }}
-                  />
-                  Lọc theo dự án hiện tại
-                </label>
-
-                {/* Clear button */}
-                <button
-                  onClick={() => queueManager.clearLogs()}
-                  style={{
-                    background: "transparent",
-                    border: "none",
-                    color: "rgba(239, 68, 68, 0.7)",
-                    fontSize: "0.72rem",
-                    cursor: "pointer",
-                    padding: "2px 6px",
-                    borderRadius: "4px"
-                  }}
-                  onMouseEnter={(e) => e.currentTarget.style.color = "rgba(239, 68, 68, 1)"}
-                  onMouseLeave={(e) => e.currentTarget.style.color = "rgba(239, 68, 68, 0.7)"}
-                >
-                  Xóa Logs
-                </button>
-
-                {/* Collapse button */}
-                <button
-                  onClick={() => setShowLogsPanel(!showLogsPanel)}
-                  style={{
-                    background: "transparent",
-                    border: "none",
-                    color: "var(--text-secondary)",
-                    cursor: "pointer",
-                    fontSize: "0.85rem",
-                    padding: "2px"
-                  }}
-                >
-                  {showLogsPanel ? "▼" : "▲"}
-                </button>
-              </div>
-            </div>
-
-            {/* Terminal Body */}
-            {showLogsPanel && (
-              <div
-                style={{
-                  height: "160px",
-                  overflowY: "auto",
-                  padding: "12px 16px",
-                  fontFamily: "var(--font-mono)",
-                  fontSize: "0.75rem",
-                  lineHeight: 1.5,
-                  display: "flex",
-                  flexDirection: "column",
-                  background: "#05080f",
-                  scrollBehavior: "smooth"
-                }}
-              >
-                {(() => {
-                  const filtered = filterLogsCurrentProj
-                    ? systemLogs.filter(l => l.projectId === activeProjectId)
-                    : systemLogs;
-
-                  if (filtered.length === 0) {
-                    return (
-                      <div style={{ color: "var(--text-muted)", fontStyle: "italic", textAlign: "center", marginTop: "40px" }}>
-                        Chưa có log hệ thống nào được ghi nhận.
-                      </div>
-                    );
-                  }
-
-                  return (
-                    <div style={{ display: "flex", flexDirection: "column", gap: "6px" }}>
-                      {filtered.map((log, idx) => {
-                        let badgeColor = "#9ca3af";
-                        let textColor = "var(--text-primary)";
-                        let prefix = "[INFO]";
-
-                        if (log.type === "success") {
-                          badgeColor = "#10b981";
-                          textColor = "#10b981";
-                          prefix = "[SUCCESS]";
-                        } else if (log.type === "error") {
-                          badgeColor = "#f87171";
-                          textColor = "#f87171";
-                          prefix = "[ERROR]";
-                        } else if (log.type === "running") {
-                          badgeColor = "#38bdf8";
-                          textColor = "#38bdf8";
-                          prefix = "[RUNNING]";
-                        }
-
-                        return (
-                          <div key={idx} className="terminal-console-line">
-                            <span style={{ color: "rgba(255,255,255,0.25)", flexShrink: 0 }}>
-                              [{log.timestamp}]
-                            </span>
-                            <span style={{ color: badgeColor, fontWeight: 700, flexShrink: 0, minWidth: "75px" }}>
-                              {prefix}
-                            </span>
-                            <span style={{ color: textColor }}>
-                              {log.message}
-                            </span>
-                          </div>
-                        );
-                      })}
-                      <div ref={logsEndRef} />
-                    </div>
-                  );
-                })()}
-              </div>
-            )}
-          </div>
         </div>
       </main>
     </div>
@@ -3351,6 +5220,339 @@ export default function Home() {
           </div>
         </div>
       )}
+      {/* Custom Project Name Modal */}
+      {isProjectNameModalOpen && (
+        <div className="modal-overlay" onClick={() => setIsProjectNameModalOpen(false)}>
+          <div className="modal-content" onClick={(e) => e.stopPropagation()} style={{ maxWidth: "400px" }}>
+            <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", borderBottom: "1px solid rgba(255,255,255,0.08)", paddingBottom: "12px", marginBottom: "16px" }}>
+              <h3 style={{ fontSize: "1rem", fontWeight: 700, color: "#ffffff" }}>
+                {projectNameModalTitle}
+              </h3>
+              <button
+                onClick={() => setIsProjectNameModalOpen(false)}
+                style={{ background: "transparent", border: "none", color: "var(--text-secondary)", fontSize: "1.1rem", cursor: "pointer" }}
+              >
+                ✕
+              </button>
+            </div>
+
+            <div style={{ display: "flex", flexDirection: "column", gap: "8px", marginBottom: "20px" }}>
+              <label style={{ fontSize: "0.8rem", fontWeight: 600, color: "var(--text-primary)" }}>Tên dự án</label>
+              <input
+                type="text"
+                value={projectNameInput}
+                onChange={(e) => setProjectNameInput(e.target.value)}
+                placeholder="Nhập tên dự án..."
+                autoFocus
+                onKeyDown={(e) => {
+                  if (e.key === "Enter" && projectNameInput.trim()) {
+                    projectNameModalCallback?.(projectNameInput.trim());
+                    setIsProjectNameModalOpen(false);
+                  }
+                }}
+                style={{
+                  width: "100%",
+                  background: "var(--bg-secondary)",
+                  border: "1px solid var(--border-color)",
+                  borderRadius: "var(--border-radius-sm)",
+                  padding: "8px 12px",
+                  color: "var(--text-primary)",
+                  fontSize: "0.85rem",
+                  outline: "none",
+                }}
+              />
+            </div>
+
+            <div style={{ display: "flex", gap: "10px", justifyContent: "flex-end" }}>
+              <button
+                onClick={() => setIsProjectNameModalOpen(false)}
+                className="btn-secondary"
+                style={{ padding: "6px 12px", fontSize: "0.8rem" }}
+              >
+                Hủy
+              </button>
+              <button
+                onClick={() => {
+                  if (!projectNameInput.trim()) {
+                    alert("Vui lòng nhập tên dự án hợp lệ.");
+                    return;
+                  }
+                  projectNameModalCallback?.(projectNameInput.trim());
+                  setIsProjectNameModalOpen(false);
+                }}
+                className="btn-primary"
+                style={{ padding: "6px 16px", fontSize: "0.8rem" }}
+              >
+                Xác nhận
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+      {/* Web Directory Explorer Modal */}
+      {isExplorerOpen && (
+        <div className="modal-overlay" onClick={() => setIsExplorerOpen(false)}>
+          <div className="modal-content" onClick={(e) => e.stopPropagation()} style={{ maxWidth: "600px", width: "90%", display: "flex", flexDirection: "column", height: "80vh", maxHeight: "600px", background: "#0b0f19", border: "1px solid var(--border-color)", padding: "20px", borderRadius: "12px" }}>
+            <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", borderBottom: "1px solid rgba(255,255,255,0.08)", paddingBottom: "12px", marginBottom: "16px" }}>
+              <h3 style={{ fontSize: "1.1rem", fontWeight: 700, color: "#ffffff", display: "flex", alignItems: "center", gap: "8px" }}>
+                <span>📁 Trình duyệt thư mục PC</span>
+              </h3>
+              <button
+                onClick={() => setIsExplorerOpen(false)}
+                style={{ background: "transparent", border: "none", color: "var(--text-secondary)", fontSize: "1.1rem", cursor: "pointer" }}
+              >
+                ✕
+              </button>
+            </div>
+
+            {/* Breadcrumbs & Navigation */}
+            <div style={{ display: "flex", gap: "8px", alignItems: "center", marginBottom: "16px" }}>
+              {explorerParentPath !== null && (
+                <button
+                  onClick={() => explorePath(explorerParentPath)}
+                  className="btn-secondary"
+                  style={{ padding: "6px 12px", fontSize: "0.8rem", borderRadius: "6px", display: "flex", alignItems: "center", gap: "4px" }}
+                  title="Thư mục cha"
+                >
+                  ↑ Lên một cấp
+                </button>
+              )}
+              {explorerCurrentPath && (
+                <button
+                  onClick={() => explorePath("")}
+                  className="btn-secondary"
+                  style={{ padding: "6px 12px", fontSize: "0.8rem", borderRadius: "6px" }}
+                  title="Danh sách ổ đĩa"
+                >
+                  💻 Root
+                </button>
+              )}
+              <input
+                type="text"
+                readOnly
+                value={explorerCurrentPath || "Danh sách ổ đĩa (Root)"}
+                className="custom-input"
+                style={{ flexGrow: 1, padding: "6px 10px", fontSize: "0.8rem", background: "rgba(0,0,0,0.2)", cursor: "default" }}
+              />
+            </div>
+
+            {/* Error message */}
+            {explorerError && (
+              <div style={{ padding: "10px", background: "rgba(239, 68, 68, 0.1)", border: "1px solid rgba(239, 68, 68, 0.2)", color: "#f87171", borderRadius: "6px", fontSize: "0.8rem", marginBottom: "16px" }}>
+                {explorerError}
+              </div>
+            )}
+
+            {/* Folder List */}
+            <div style={{ flexGrow: 1, overflowY: "auto", background: "rgba(0,0,0,0.25)", border: "1px solid var(--border-color)", borderRadius: "8px", padding: "8px", display: "flex", flexDirection: "column", gap: "4px" }}>
+              {explorerFolders.length === 0 ? (
+                <div style={{ padding: "30px", textAlign: "center", color: "var(--text-muted)", fontSize: "0.85rem" }}>
+                  Thư mục trống hoặc không có quyền truy cập.
+                </div>
+              ) : (
+                explorerFolders.map((folder, idx) => (
+                  <div
+                    key={idx}
+                    onClick={() => explorePath(folder.path)}
+                    style={{
+                      display: "flex",
+                      alignItems: "center",
+                      gap: "10px",
+                      padding: "8px 12px",
+                      borderRadius: "6px",
+                      cursor: "pointer",
+                      fontSize: "0.85rem",
+                      color: "var(--text-primary)",
+                      transition: "background 0.2s"
+                    }}
+                    onMouseEnter={(e) => e.currentTarget.style.background = "rgba(255,255,255,0.05)"}
+                    onMouseLeave={(e) => e.currentTarget.style.background = "transparent"}
+                  >
+                    <span style={{ fontSize: "1.1rem" }}>📁</span>
+                    <span style={{ fontWeight: 500 }}>{folder.name}</span>
+                  </div>
+                ))
+              )}
+            </div>
+
+            {/* Create new folder input */}
+            {showNewFolderInput ? (
+              <div style={{ display: "flex", gap: "8px", marginTop: "16px", alignItems: "center" }}>
+                <input
+                  type="text"
+                  value={explorerNewFolderName}
+                  onChange={(e) => setExplorerNewFolderName(e.target.value)}
+                  placeholder="Nhập tên thư mục mới..."
+                  className="custom-input"
+                  style={{ flexGrow: 1, padding: "8px 12px", fontSize: "0.8rem" }}
+                  autoFocus
+                />
+                <button
+                  onClick={handleCreateNewFolder}
+                  className="btn-primary"
+                  style={{ padding: "8px 16px", fontSize: "0.8rem", borderRadius: "6px" }}
+                >
+                  Tạo
+                </button>
+                <button
+                  onClick={() => setShowNewFolderInput(false)}
+                  className="btn-secondary"
+                  style={{ padding: "8px 16px", fontSize: "0.8rem", borderRadius: "6px" }}
+                >
+                  Hủy
+                </button>
+              </div>
+            ) : (
+              explorerCurrentPath && (
+                <div style={{ display: "flex", justifyContent: "flex-start", marginTop: "16px" }}>
+                  <button
+                    onClick={() => setShowNewFolderInput(true)}
+                    className="btn-secondary"
+                    style={{ padding: "6px 12px", fontSize: "0.8rem", borderRadius: "6px", display: "flex", alignItems: "center", gap: "4px" }}
+                  >
+                    ➕ Tạo thư mục mới
+                  </button>
+                </div>
+              )
+            )}
+
+            {/* Action buttons */}
+            <div style={{ display: "flex", gap: "10px", justifyContent: "flex-end", borderTop: "1px solid rgba(255,255,255,0.08)", paddingTop: "12px", marginTop: "16px" }}>
+              <button
+                onClick={() => setIsExplorerOpen(false)}
+                className="btn-secondary"
+                style={{ padding: "8px 16px", fontSize: "0.8rem", borderRadius: "6px" }}
+              >
+                Hủy
+              </button>
+              {explorerCurrentPath && (
+                <button
+                  onClick={() => handleSelectExplorerFolder(explorerCurrentPath)}
+                  className="btn-primary"
+                  style={{
+                    padding: "8px 24px",
+                    fontSize: "0.8rem",
+                    borderRadius: "6px",
+                    background: "linear-gradient(135deg, #7c3aed, #db2777)",
+                    border: "none",
+                    fontWeight: 600
+                  }}
+                >
+                  Chọn thư mục này
+                </button>
+              )}
+            </div>
+          </div>
+        </div>
+      )}
+      {/* Fullscreen Image Zoom Modal Overlay */}
+      {fullscreenImageUrl && (
+        <div
+          className="modal-overlay"
+          onClick={() => setFullscreenImageUrl(null)}
+          style={{
+            position: "fixed",
+            top: 0,
+            left: 0,
+            right: 0,
+            bottom: 0,
+            background: "rgba(3, 7, 18, 0.9)",
+            backdropFilter: "blur(12px)",
+            display: "flex",
+            flexDirection: "column",
+            alignItems: "center",
+            justifyContent: "center",
+            zIndex: 9999,
+            cursor: "zoom-out",
+            animation: "modal-fade-in 0.25s ease-out"
+          }}
+        >
+          {/* Close button top right */}
+          <button
+            onClick={() => setFullscreenImageUrl(null)}
+            style={{
+              position: "absolute",
+              top: "24px",
+              right: "24px",
+              background: "rgba(255,255,255,0.06)",
+              border: "1px solid rgba(255,255,255,0.1)",
+              borderRadius: "50%",
+              width: "48px",
+              height: "48px",
+              color: "#ffffff",
+              fontSize: "1.5rem",
+              display: "flex",
+              alignItems: "center",
+              justifyContent: "center",
+              cursor: "pointer",
+              transition: "all 0.2s"
+            }}
+            title="Đóng"
+          >
+            ✕
+          </button>
+
+          {/* Download button top right next to close */}
+          <button
+            onClick={(e) => {
+              e.stopPropagation();
+              downloadImageUrl(fullscreenImageUrl, "zoom_image.png");
+            }}
+            style={{
+              position: "absolute",
+              top: "24px",
+              right: "88px",
+              background: "rgba(255,255,255,0.06)",
+              border: "1px solid rgba(255,255,255,0.1)",
+              borderRadius: "50%",
+              width: "48px",
+              height: "48px",
+              color: "#ffffff",
+              fontSize: "1.2rem",
+              display: "flex",
+              alignItems: "center",
+              justifyContent: "center",
+              cursor: "pointer",
+              transition: "all 0.2s"
+            }}
+            title="Tải ảnh về"
+          >
+            <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+              <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4" />
+              <polyline points="7 10 12 15 17 10" />
+              <line x1="12" y1="15" x2="12" y2="3" />
+            </svg>
+          </button>
+
+          {/* Centered Large Image */}
+          <div
+            onClick={(e) => e.stopPropagation()}
+            style={{
+              maxWidth: "85vw",
+              maxHeight: "80vh",
+              display: "flex",
+              alignItems: "center",
+              justifyContent: "center",
+              borderRadius: "8px",
+              overflow: "hidden",
+              border: "1px solid rgba(255,255,255,0.1)",
+              boxShadow: "0 25px 50px -12px rgba(0,0,0,0.8)",
+              cursor: "default"
+            }}
+          >
+            <img
+              src={fullscreenImageUrl}
+              alt="Zoomed View"
+              style={{
+                maxWidth: "100%",
+                maxHeight: "80vh",
+                objectFit: "contain"
+              }}
+            />
+          </div>
+        </div>
+      )}
+      <FloatingSystemLogs activeProjectId={activeProjectId} />
     </div>
   );
 }

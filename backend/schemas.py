@@ -24,28 +24,51 @@ class StoryAnalysisResponse(BaseModel):
 # --- Steps 3, 4, 5: Asset Extractors ---
 
 class CharacterAsset(BaseModel):
-    name: str = Field(description="The name of the character.")
-    description: str = Field(description="Short description of the character based on the storyboard (e.g., age, clothing, personality).")
-    prompt: str = Field(description="A highly detailed Pixar-style turnaround prompt for generating reference images. Must specify: turnarounds (front, 45-degree, side views), Pixar 3D stylized style, white background, no text, no shadows.")
+    id: str = Field(description="Unique character ID (e.g. char_lisa)")
+    canonical_name: str = Field(description="The formal, consistent name of the character.")
+    name: str = Field(description="Duplicate of canonical_name for backwards compatibility.")
+    age: str = Field(description="Age or age range of the character.")
+    gender: str = Field(description="Gender of the character.")
+    appearance: str = Field(description="Physical appearance details (face, eyes, height, build, etc.).")
+    outfit: str = Field(description="Clothing details for this character.")
+    hairstyle: str = Field(description="Hair style and color.")
+    accessories: str = Field(description="Any accessories like glasses, hats, backpack, etc.")
+    voice_style: str = Field(description="Voice style description (e.g. cheerful young boy, gentle female tone).")
+    personality: str = Field(description="Personality traits (e.g. energetic, shy, friendly).")
+    turnaround_prompt: str = Field(description="Turnaround prompt for reference image generation.")
+    prompt: str = Field(description="Duplicate of turnaround_prompt for backwards compatibility.")
 
 class CharacterExtractorResponse(BaseModel):
     characters: List[CharacterAsset] = Field(description="List of all unique characters extracted from the storyboard with reference prompts.")
 
 class EnvironmentAsset(BaseModel):
-    name: str = Field(description="The name or description of the location.")
-    prompt: str = Field(description="A highly detailed Pixar-style reference image prompt. Must specify: empty room/area, wide angle, Pixar 3D stylized, consistent lighting, no characters, no text.")
+    id: str = Field(description="Unique environment ID (e.g. env_school_gate)")
+    name: str = Field(description="The name of the location.")
+    reference_prompt: str = Field(description="A highly detailed reference image prompt for the environment.")
+    prompt: str = Field(description="Duplicate of reference_prompt for backwards compatibility.")
 
 class EnvironmentExtractorResponse(BaseModel):
     environments: List[EnvironmentAsset] = Field(description="List of all unique environment environments extracted from the storyboard with reference prompts.")
 
 class PropAsset(BaseModel):
+    id: str = Field(description="Unique prop ID (e.g. prop_lunch_box)")
     name: str = Field(description="The name of the prop object.")
-    prompt: str = Field(description="A detailed Pixar-style reference image prompt for this prop. Must specify: centered, closed/open state, Pixar 3D stylized, white background, reference image, no text.")
+    reference_prompt: str = Field(description="A highly detailed reference image prompt for the prop.")
+    prompt: str = Field(description="Duplicate of reference_prompt for backwards compatibility.")
 
 class PropExtractorResponse(BaseModel):
     props: List[PropAsset] = Field(description="List of all unique props extracted from the storyboard with reference prompts.")
 
 # --- Step 6: Shot Planner ---
+
+class TimelineItem(BaseModel):
+    time: str = Field(description="Time range, e.g., '0-2', '2-6', '6-8' in seconds.")
+    action: str = Field(description="Action description in English, e.g., 'Lisa walks', 'Lisa speaks', 'Lisa smiles'.")
+
+class MotionDetails(BaseModel):
+    primary_motion: str = Field(description="Primary character action in English, e.g., 'Walk'.")
+    secondary_motion: List[str] = Field(default=["Blink", "Breathing"], description="Secondary/idle animation details, e.g., ['Blink', 'Breathing'].")
+    motion_level: str = Field(default="Low", description="Motion level, e.g., 'Low', 'Medium', 'High'.")
 
 class Shot(BaseModel):
     shot_id: str = Field(description="Identifier for the shot, formatted like Shot001, Shot002, etc.")
@@ -58,6 +81,14 @@ class Shot(BaseModel):
     dialogue: List[DialogueItem] = Field(description="Dialogue spoken during this shot.")
     camera_movement: str = Field(description="Camera movement description (e.g., Static, Pan Left, Zoom In, Tilt Up).")
     shot_type: str = Field(description="Shot type composition (e.g., Close Up, Medium Shot, Wide Shot, Extreme Close Up).")
+    transition: str = Field(default="Cut", description="Transition type (e.g. Cut, Dissolve, Fade In, Fade Out).")
+    composition: str = Field(default="Rule of Thirds", description="Cinematic composition (e.g. Rule of Thirds, Centered, Leading Lines).")
+    lighting: str = Field(default="Warm lighting", description="Lighting style (e.g. Warm afternoon sunlight, Soft studio lighting).")
+    camera: str = Field(default="Medium Shot, Static", description="Camera framing and movement description combined, e.g. 'Medium Shot, Static'.")
+    timeline: List[TimelineItem] = Field(default=[], description="Action timeline breakdown in seconds.")
+    motion: MotionDetails = Field(default_factory=lambda: MotionDetails(primary_motion="Idle", secondary_motion=["Blink", "Breathing"], motion_level="Low"), description="Motion details containing primary, secondary, and motion level.")
+    keyframe_prompt: str = Field(default="", description="Detailed image prompt for text-to-image reference. Only describe characters, outfit, environment, props, framing, lighting. No motion, no speech, no timeline.")
+    motion_prompt: str = Field(default="", description="Detailed video motion prompt constructed directly from keyframe prompt and shot data.")
 
 class ShotPlannerResponse(BaseModel):
     shots: List[Shot] = Field(description="List of planned shots for the episode.")
@@ -84,6 +115,12 @@ class AssetsResponse(BaseModel):
     characters: List[CharacterAsset] = Field(description="Unique list of characters with details and turnaround prompts.")
     environments: List[EnvironmentAsset] = Field(description="Unique list of locations with reference prompts.")
     props: List[PropAsset] = Field(description="Unique list of prop objects with reference prompts.")
+
+# --- Step 9: Veo Compliance Checker ---
+
+class ComplianceCheckResult(BaseModel):
+    is_compliant: bool = Field(description="True if the prompt passes all checklist items, False otherwise.")
+    errors: List[str] = Field(description="List of specific checklist items that failed.")
 
 # --- API Request/Response schemas ---
 

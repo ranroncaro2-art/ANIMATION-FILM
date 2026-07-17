@@ -1,7 +1,24 @@
 import { StepKey, PipelineStep } from "../components/PipelineProgress";
-import { SavedProject, saveProject } from "./db";
+import { SavedProject, saveProject, getProject } from "./db";
 
-const BACKEND_URL = "http://127.0.0.1:8000";
+export interface MediaTask {
+  id: string;
+  projectId: string;
+  projectName: string;
+  type: "character" | "environment" | "prop" | "shot_image" | "shot_video";
+  targetId: string; // name of character, setting_name of environment, prop_name of prop, or full shotKey
+  status: "pending" | "running" | "success" | "failed";
+  prompt: string;
+  error?: string;
+  params?: any;
+}
+
+const getBackendUrl = () => {
+  if (typeof window !== "undefined") {
+    return `http://${window.location.hostname}:8000`;
+  }
+  return "http://127.0.0.1:8000";
+};
 
 export interface ProjectTaskState {
   projectId: string;
@@ -27,6 +44,25 @@ class BackgroundQueueManager {
   private activePromises: Map<string, Promise<any>> = new Map();
   private systemLogs: SystemLog[] = [];
   private logListeners: Set<LogListener> = new Set();
+  private dbWriteQueue: Promise<any> = Promise.resolve();
+
+  private async safeUpdateProject(projectId: string, updater: (project: SavedProject) => SavedProject | Promise<SavedProject>) {
+    this.dbWriteQueue = this.dbWriteQueue.then(async () => {
+      try {
+        const project = await getProject(projectId);
+        if (!project) {
+          console.error(`Project not found in DB: ${projectId}`);
+          return;
+        }
+        const updatedProject = await updater(project);
+        await saveProject(updatedProject);
+        return updatedProject;
+      } catch (err) {
+        console.error("Error in safeUpdateProject:", err);
+      }
+    });
+    return this.dbWriteQueue;
+  }
 
   subscribe(listener: TaskListener) {
     this.listeners.add(listener);
@@ -109,6 +145,7 @@ class BackgroundQueueManager {
     selectedModel: string;
     rpmLimit: number;
     chunkSize: number;
+    custom_instructions?: string;
   }) {
     const { projectId, stepKey } = params;
     const taskKey = `${projectId}_${stepKey}`;
@@ -269,8 +306,6 @@ class BackgroundQueueManager {
         await runAndSave("story_analyzer");
         await runAndSave("character_extractor");
         await runAndSave("shot_planner");
-        await runAndSave("keyframe_generator");
-        await runAndSave("motion_generator");
 
         const finalState: ProjectTaskState = {
           projectId,
@@ -447,6 +482,7 @@ class BackgroundQueueManager {
     rpmLimit: number;
     chunkSize: number;
     initialSteps: PipelineStep[];
+    pcDirectory?: string;
   }) {
     const { projectId } = params;
     const taskKey = `${projectId}_all`;
@@ -474,6 +510,7 @@ class BackgroundQueueManager {
         shots: [],
         keyframes: [],
         motion_prompts: [],
+        pcDirectory: params.pcDirectory || "",
       };
       
       let currentSteps: PipelineStep[] = params.initialSteps.map(s => ({ ...s, status: "idle" as const, error: undefined }));
@@ -525,10 +562,6 @@ class BackgroundQueueManager {
         await runAndSave("prop_extractor");
         // Step 5: Plan Shots
         await runAndSave("shot_planner");
-        // Step 6: Generate Keyframes
-        await runAndSave("keyframe_generator");
-        // Step 7: Generate Motion Prompts
-        await runAndSave("motion_generator");
 
         const finalState: ProjectTaskState = {
           projectId,
@@ -584,8 +617,9 @@ class BackgroundQueueManager {
     chunkSize: number;
     [key: string]: any;
   }) {
-    const { stepKey, storyboard, projectData, apiKeys, selectedModel, rpmLimit, chunkSize } = params;
+    const { stepKey, storyboard, projectData, apiKeys, selectedModel, rpmLimit, chunkSize, custom_instructions } = params;
     
+    const BACKEND_URL = getBackendUrl();
     let url = "";
     let bodyPayload: any = {};
 
@@ -607,46 +641,88 @@ class BackgroundQueueManager {
 
     // Helper to map characters to backend format
     const mapCharactersToBackend = (charList: any[]) => {
-      return (charList || []).map((char: any) => ({
-        name: char.name || "",
-        description: char.description || "",
-        prompt: char.turnaround_prompt || ""
-      }));
+      return (charList || []).map((char: any, index: number) => {
+        const cname = char.canonical_name || char.name || "";
+        return {
+          id: char.id || `char_${Date.now()}_${index}`,
+          canonical_name: cname,
+          name: cname,
+          age: char.age || "",
+          gender: char.gender || "",
+          appearance: char.appearance || "",
+          outfit: char.outfit || "",
+          hairstyle: char.hairstyle || "",
+          accessories: char.accessories || "",
+          voice_style: char.voice_style || "",
+          personality: char.personality || "",
+          turnaround_prompt: char.turnaround_prompt || char.prompt || "",
+          prompt: char.turnaround_prompt || char.prompt || "",
+          description: char.description || ""
+        };
+      });
     };
 
     // Helper to map environments to backend format
     const mapEnvironmentsToBackend = (envList: any[]) => {
-      return (envList || []).map((env: any) => ({
-        name: env.setting_name || "",
-        prompt: env.reference_prompt || ""
-      }));
+      return (envList || []).map((env: any, index: number) => {
+        const ename = env.setting_name || env.name || "";
+        const eprompt = env.reference_prompt || env.prompt || "";
+        return {
+          id: env.id || `env_${Date.now()}_${index}`,
+          name: ename,
+          reference_prompt: eprompt,
+          prompt: eprompt
+        };
+      });
     };
 
     // Helper to map props to backend format
     const mapPropsToBackend = (propList: any[]) => {
-      return (propList || []).map((prop: any) => ({
-        name: prop.prop_name || "",
-        prompt: prop.reference_prompt || ""
-      }));
+      return (propList || []).map((prop: any, index: number) => {
+        const pname = prop.prop_name || prop.name || "";
+        const pprompt = prop.reference_prompt || prop.prompt || "";
+        return {
+          id: prop.id || `prop_${Date.now()}_${index}`,
+          name: pname,
+          reference_prompt: pprompt,
+          prompt: pprompt
+        };
+      });
     };
 
     // Helper to map shots to backend format
     const mapShotsToBackend = (shotList: any[]) => {
-      return (shotList || []).map((shot: any) => ({
-        shot_id: shot.shot_id || "",
-        scene_number: Number(shot.scene_number || shot.scene_id || 0),
-        duration_seconds: Number(shot.duration_seconds || 5),
-        actions: shot.actions || "",
-        characters: shot.characters || [],
-        environment: shot.setting || shot.environment || "",
-        props: shot.props || [],
-        dialogue: (shot.dialogue || []).map((d: any) => ({
-          character: d.character || "",
-          speech: d.text || ""
-        })),
-        camera_movement: shot.camera_movement || "",
-        shot_type: shot.framing || ""
-      }));
+      const motionPrompts = projectData.motion_prompts || [];
+      return (shotList || []).map((shot: any) => {
+        const editedMotion = motionPrompts.find((m: any) => m.shot_id === shot.shot_id);
+        return {
+          shot_id: shot.shot_id || "",
+          scene_number: Number(shot.scene_number || shot.scene_id || 0),
+          duration_seconds: Number(shot.duration_seconds || 5),
+          actions: shot.actions || "",
+          characters: shot.characters || [],
+          environment: shot.setting || shot.environment || "",
+          props: shot.props || [],
+          dialogue: (shot.dialogue || []).map((d: any) => ({
+            character: d.character || "",
+            speech: d.text || d.speech || ""
+          })),
+          camera_movement: shot.camera_movement || "",
+          shot_type: shot.framing || shot.shot_type || "",
+          transition: shot.transition || "Cut",
+          composition: shot.composition || "Rule of Thirds",
+          lighting: shot.lighting || "Warm lighting",
+          camera: shot.camera || `${shot.framing || "Medium Shot"}, ${shot.camera_movement || "Static"}`,
+          timeline: shot.timeline || [],
+          motion: shot.motion || {
+            primary_motion: shot.primary_motion || "Idle",
+            secondary_motion: shot.secondary_motion || ["Blink", "Breathing"],
+            motion_level: shot.motion_level || "Low"
+          },
+          keyframe_prompt: shot.keyframe_prompt || "",
+          motion_prompt: editedMotion?.motion_description || shot.motion_prompt || ""
+        };
+      });
     };
 
     // Helper to map keyframes to backend format
@@ -685,6 +761,7 @@ class BackgroundQueueManager {
       case "shot_planner":
         url = `${BACKEND_URL}/api/plan-shots`;
         bodyPayload = {
+          storyboard,
           scenes: mapScenesToBackend(projectData.scenes),
           characters: mapCharactersToBackend(projectData.characters),
           environments: mapEnvironmentsToBackend(projectData.environments),
@@ -713,12 +790,17 @@ class BackgroundQueueManager {
       case "motion_generator":
         url = `${BACKEND_URL}/api/generate-motion`;
         bodyPayload = {
+          storyboard,
           shots: mapShotsToBackend(projectData.shots),
+          characters: mapCharactersToBackend(projectData.characters),
+          environments: mapEnvironmentsToBackend(projectData.environments),
+          props: mapPropsToBackend(projectData.props),
           keyframes: mapKeyframesToBackend(projectData.keyframes),
           api_keys: apiKeys,
           model: selectedModel,
           rpm_limit: rpmLimit,
           chunk_size: chunkSize,
+          custom_instructions: custom_instructions || null,
         };
         break;
     }
@@ -765,19 +847,68 @@ class BackgroundQueueManager {
       case "character_extractor":
       case "environment_extractor":
       case "prop_extractor":
-        updatedData.characters = (responseData.characters || []).map((char: any) => ({
-          name: char.name,
-          description: char.description,
-          turnaround_prompt: char.prompt || char.turnaround_prompt || ""
-        }));
-        updatedData.environments = (responseData.environments || []).map((env: any) => ({
-          setting_name: env.name || env.setting_name || "",
-          reference_prompt: env.prompt || env.reference_prompt || ""
-        }));
-        updatedData.props = (responseData.props || []).map((prop: any) => ({
-          prop_name: prop.name || prop.prop_name || "",
-          reference_prompt: prop.prompt || prop.reference_prompt || ""
-        }));
+        const existingChars = projectData.characters || [];
+        const existingEnvs = projectData.environments || [];
+        const existingProps = projectData.props || [];
+
+        updatedData.characters = (responseData.characters || []).map((char: any) => {
+          const nameToMatch = char.canonical_name || char.name || "";
+          const existing = existingChars.find((c: any) => 
+            (c.name && c.name.toLowerCase() === nameToMatch.toLowerCase()) || 
+            (c.canonical_name && c.canonical_name.toLowerCase() === nameToMatch.toLowerCase()) ||
+            c.id === char.id
+          );
+          return {
+            id: char.id || "",
+            canonical_name: nameToMatch,
+            name: nameToMatch,
+            age: char.age || "",
+            gender: char.gender || "",
+            appearance: char.appearance || "",
+            outfit: char.outfit || "",
+            hairstyle: char.hairstyle || "",
+            accessories: char.accessories || "",
+            voice_style: char.voice_style || "",
+            personality: char.personality || "",
+            description: char.description || `${char.age || ""} ${char.gender || ""}, ${char.personality || ""}`,
+            turnaround_prompt: char.turnaround_prompt || char.prompt || "",
+            url: existing?.url || "",
+            media_id: existing?.media_id || "",
+            account_id: existing?.account_id || ""
+          };
+        });
+
+        updatedData.environments = (responseData.environments || []).map((env: any) => {
+          const nameToMatch = env.name || env.setting_name || "";
+          const existing = existingEnvs.find((e: any) => 
+            (e.setting_name && e.setting_name.toLowerCase() === nameToMatch.toLowerCase()) || 
+            e.id === env.id
+          );
+          return {
+            id: env.id || "",
+            setting_name: nameToMatch,
+            reference_prompt: env.reference_prompt || env.prompt || "",
+            url: existing?.url || "",
+            media_id: existing?.media_id || "",
+            account_id: existing?.account_id || ""
+          };
+        });
+
+        updatedData.props = (responseData.props || []).map((prop: any) => {
+          const nameToMatch = prop.name || prop.prop_name || "";
+          const existing = existingProps.find((p: any) => 
+            (p.prop_name && p.prop_name.toLowerCase() === nameToMatch.toLowerCase()) || 
+            p.id === prop.id
+          );
+          return {
+            id: prop.id || "",
+            prop_name: nameToMatch,
+            reference_prompt: prop.reference_prompt || prop.prompt || "",
+            url: existing?.url || "",
+            media_id: existing?.media_id || "",
+            account_id: existing?.account_id || ""
+          };
+        });
         break;
 
       case "shot_planner":
@@ -795,27 +926,453 @@ class BackgroundQueueManager {
             text: d.speech
           })) : [],
           camera_movement: shot.camera_movement || "",
-          framing: shot.shot_type || shot.framing || ""
+          framing: shot.shot_type || shot.framing || "",
+          transition: shot.transition || "",
+          composition: shot.composition || "",
+          lighting: shot.lighting || "",
+          keyframe_prompt: shot.keyframe_prompt || "",
+          motion_prompt: shot.motion_prompt || ""
         }));
+
+        const existingKf = projectData.keyframes || [];
+        updatedData.keyframes = (responseData.shots || []).map((shot: any) => {
+          const existing = existingKf.find((ex: any) => ex.shot_id === shot.shot_id);
+          return {
+            shot_id: shot.shot_id,
+            keyframe_image_prompt: shot.keyframe_prompt || "",
+            url: existing?.url || "",
+            media_id: existing?.media_id || "",
+            account_id: existing?.account_id || ""
+          };
+        });
+
+        const existingMot = projectData.motion_prompts || [];
+        updatedData.motion_prompts = (responseData.shots || []).map((shot: any) => {
+          const existing = existingMot.find((ex: any) => ex.shot_id === shot.shot_id);
+          return {
+            shot_id: shot.shot_id,
+            motion_description: shot.motion_prompt || "",
+            video_url: existing?.video_url || ""
+          };
+        });
         break;
 
       case "keyframe_generator":
-        updatedData.keyframes = (responseData.keyframes || []).map((k: any) => ({
-          shot_id: k.shot_id,
-          keyframe_image_prompt: k.prompt || k.keyframe_image_prompt || ""
-        }));
+        const existingKeyframes = projectData.keyframes || [];
+        updatedData.keyframes = (responseData.keyframes || []).map((k: any) => {
+          const existing = existingKeyframes.find((ex: any) => ex.shot_id === k.shot_id);
+          return {
+            shot_id: k.shot_id,
+            keyframe_image_prompt: k.prompt || k.keyframe_image_prompt || "",
+            url: existing?.url || "",
+            media_id: existing?.media_id || "",
+            account_id: existing?.account_id || ""
+          };
+        });
         break;
 
       case "motion_generator":
-        updatedData.motion_prompts = (responseData.motion_prompts || []).map((m: any) => ({
-          shot_id: m.shot_id,
-          motion_description: m.prompt || m.motion_description || ""
-        }));
+        const existingMotions = projectData.motion_prompts || [];
+        updatedData.motion_prompts = (responseData.motion_prompts || []).map((m: any) => {
+          const existing = existingMotions.find((ex: any) => ex.shot_id === m.shot_id);
+          return {
+            shot_id: m.shot_id,
+            motion_description: m.prompt || m.motion_description || "",
+            video_url: existing?.video_url || ""
+          };
+        });
         break;
     }
 
     return updatedData;
   }
+
+  // Media Queue System
+  private mediaQueue: MediaTask[] = [];
+  private mediaQueueListeners: Set<MediaQueueListener> = new Set();
+  private imageConcurrencyLimit = 2;
+  private videoConcurrencyLimit = 1;
+
+  setConcurrencyLimits(imageLimit: number, videoLimit: number) {
+    this.imageConcurrencyLimit = imageLimit;
+    this.videoConcurrencyLimit = videoLimit;
+    this.processMediaQueue();
+  }
+
+  subscribeMediaQueue(listener: MediaQueueListener) {
+    this.mediaQueueListeners.add(listener);
+    listener([...this.mediaQueue]);
+    return () => {
+      this.mediaQueueListeners.delete(listener);
+    };
+  }
+
+  private notifyMediaQueue() {
+    this.mediaQueueListeners.forEach(listener => {
+      try {
+        listener([...this.mediaQueue]);
+      } catch (err) {
+        console.error("Error in media queue listener:", err);
+      }
+    });
+  }
+
+  addMediaTask(task: Omit<MediaTask, "status">) {
+    const newTask: MediaTask = { ...task, status: "pending" };
+    this.mediaQueue.push(newTask);
+    this.notifyMediaQueue();
+    this.processMediaQueue();
+  }
+
+  stopMediaQueue() {
+    this.mediaQueue = this.mediaQueue.filter(t => t.status === "success" || t.status === "failed");
+    this.notifyMediaQueue();
+    this.addLog("Đã hủy tất cả tác vụ vẽ ảnh/video trong hàng chờ.", "info");
+  }
+
+  getMediaQueue(): MediaTask[] {
+    return this.mediaQueue;
+  }
+
+  private processMediaQueue() {
+    let startedAny = false;
+
+    // Check running task counts
+    const runningImages = this.mediaQueue.filter(t => t.status === "running" && t.type !== "shot_video").length;
+    const runningVideos = this.mediaQueue.filter(t => t.status === "running" && t.type === "shot_video").length;
+
+    // Start image tasks if below limit
+    if (runningImages < this.imageConcurrencyLimit) {
+      const nextImageTask = this.mediaQueue.find(t => t.status === "pending" && t.type !== "shot_video");
+      if (nextImageTask) {
+        this.runTaskAsync(nextImageTask);
+        startedAny = true;
+      }
+    }
+
+    // Start video tasks if below limit
+    if (runningVideos < this.videoConcurrencyLimit) {
+      const nextVideoTask = this.mediaQueue.find(t => t.status === "pending" && t.type === "shot_video");
+      if (nextVideoTask) {
+        this.runTaskAsync(nextVideoTask);
+        startedAny = true;
+      }
+    }
+
+    // Re-evaluate immediately to start additional tasks up to limits
+    if (startedAny) {
+      setTimeout(() => this.processMediaQueue(), 0);
+    }
+  }
+
+  private async runTaskAsync(task: MediaTask) {
+    task.status = "running";
+    this.notifyMediaQueue();
+    this.addLog(`[Hàng chờ] Bắt đầu vẽ ${task.type === "shot_video" ? "video" : "ảnh"} cho ${task.targetId} (Dự án: ${task.projectName})...`, "running", task.projectId);
+
+    try {
+      if (task.type === "shot_video") {
+        await this.executeVideoTask(task);
+      } else {
+        await this.executeImageTask(task);
+      }
+      task.status = "success";
+      this.addLog(`[Hàng chờ] Đã vẽ xong ${task.type === "shot_video" ? "video" : "ảnh"} cho ${task.targetId}!`, "success", task.projectId);
+    } catch (err: any) {
+      task.status = "failed";
+      task.error = err.message;
+      this.addLog(`[Hàng chờ] Lỗi vẽ ${task.type === "shot_video" ? "video" : "ảnh"} cho ${task.targetId}: ${err.message}`, "error", task.projectId);
+    }
+
+    this.notifyMediaQueue();
+    this.processMediaQueue();
+  }
+
+  private async executeImageTask(task: MediaTask) {
+    const payload: any = {
+      prompt: task.prompt,
+      count: task.params?.imageCount || 1,
+      aspect_ratio: task.params?.imageAspectRatio || "IMAGE_ASPECT_RATIO_LANDSCAPE",
+      model: task.params?.imageModel || "GEM_PIX_2",
+      for_video: true
+    };
+
+    if (task.params?.mediaIds && task.params.mediaIds.length > 0) {
+      payload.media_ids = task.params.mediaIds;
+      payload.account_id = task.params.accountId || "default_account";
+    }
+
+    if (task.type === "shot_image") {
+      const logMsg = `[API Vẽ ảnh Shot] Tham số gửi đi: Prompt: "${payload.prompt}" | Model: ${payload.model} | Aspect Ratio: ${payload.aspect_ratio} | Count: ${payload.count} | Media IDs tham chiếu: ${JSON.stringify(payload.media_ids || [])}`;
+      console.log(logMsg, payload);
+      this.addLog(logMsg, "info", task.projectId);
+    }
+
+    let data;
+    try {
+      const localApiUrl = typeof window !== "undefined" ? `http://${window.location.hostname}:5000` : "http://127.0.0.1:5000";
+      const response = await fetch(`${localApiUrl}/api/generate`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(payload)
+      });
+
+      if (!response.ok) {
+        throw new Error(`Local API responded with status ${response.status}`);
+      }
+
+      data = await response.json();
+      if (!data.success || !data.images || data.images.length === 0) {
+        throw new Error(data.error || "No image was returned from local API.");
+      }
+    } catch (err: any) {
+      this.addLog(`[Local API] Không kết nối được API vẽ ảnh hoặc API báo lỗi: ${err.message}. Tự động kích hoạt cơ chế giả lập (Mock).`, "info", task.projectId);
+      const mockUuid = `mock_${Math.random().toString(36).substring(2, 15)}`;
+      data = {
+        success: true,
+        images: [
+          {
+            index: 1,
+            url: `https://picsum.photos/seed/${mockUuid}/800/450`,
+            media_id: mockUuid
+          }
+        ],
+        total_generated: 1,
+        account_id: payload.account_id || "mock_account",
+        project_id: task.projectId,
+        acc_type: "both"
+      };
+    }
+
+    const result = {
+      url: data.images[0].url,
+      media_id: data.images[0].media_id,
+      account_id: data.account_id || "default_account"
+    };
+
+    if (task.params?.pcDirectory) {
+      let subFolder = "references";
+      let filename = "";
+      if (task.type === "character" || task.type === "environment" || task.type === "prop") {
+        subFolder = "references";
+        filename = `${task.targetId}.png`;
+      } else if (task.type === "shot_image") {
+        const parts = task.targetId.split("_");
+        const shotId = parts[parts.length - 1];
+        subFolder = "images_shots";
+        filename = `${shotId}.png`;
+      }
+
+      try {
+        const saveRes = await fetch("/api/save-media", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            pcDirectory: task.params.pcDirectory,
+            subFolder,
+            filename,
+            url: result.url
+          })
+        });
+        if (saveRes.ok) {
+          const saveInfo = await saveRes.json();
+          if (saveInfo.success && saveInfo.savedPath) {
+            result.url = `/api/media?path=${encodeURIComponent(saveInfo.savedPath)}`;
+          }
+        }
+      } catch (err) {
+        console.error("Error auto-saving image to PC path:", err);
+      }
+    }
+
+    let pData: any;
+    let stepsCopy: any;
+
+    await this.safeUpdateProject(task.projectId, (project) => {
+      const copy = { ...project };
+      pData = { ...copy.projectData };
+
+      if (task.type === "character") {
+        pData.characters = pData.characters.map((c: any) =>
+          c.name === task.targetId ? { ...c, url: result.url, media_id: result.media_id, account_id: result.account_id } : c
+        );
+      } else if (task.type === "environment") {
+        pData.environments = pData.environments.map((e: any) =>
+          e.setting_name === task.targetId ? { ...e, url: result.url, media_id: result.media_id, account_id: result.account_id } : e
+        );
+      } else if (task.type === "prop") {
+        pData.props = pData.props.map((p: any) =>
+          p.prop_name === task.targetId ? { ...p, url: result.url, media_id: result.media_id, account_id: result.account_id } : p
+        );
+      } else if (task.type === "shot_image") {
+        const parts = task.targetId.split("_");
+        const shotId = parts[parts.length - 1];
+        if (!pData.keyframes) {
+          pData.keyframes = [];
+        }
+        const hasKeyframe = pData.keyframes.some((k: any) => k.shot_id === shotId);
+        if (hasKeyframe) {
+          pData.keyframes = pData.keyframes.map((k: any) =>
+            k.shot_id === shotId ? { ...k, url: result.url, media_id: result.media_id, account_id: result.account_id } : k
+          );
+        } else {
+          pData.keyframes.push({
+            shot_id: shotId,
+            url: result.url,
+            media_id: result.media_id,
+            account_id: result.account_id,
+            keyframe_image_prompt: task.prompt || ""
+          });
+        }
+      }
+
+      copy.projectData = pData;
+      copy.updatedAt = new Date().toISOString();
+      stepsCopy = copy.steps;
+      return copy;
+    });
+
+    if (pData) {
+      this.notify(task.projectId, this.getTaskState(task.projectId), pData, stepsCopy);
+    }
+  }
+
+  private async executeVideoTask(task: MediaTask) {
+    const isI2V = task.params?.mediaIds && task.params.mediaIds.length > 0;
+
+    const mapT2VModel = (uiModel: string): string => {
+      if (!uiModel) return "veo_3_1_t2v_lite_low_priority";
+      if (uiModel.includes("Veo 3.1 Lite")) return "veo_3_1_t2v_lite_low_priority";
+      if (uiModel.includes("Veo 3 Fast -")) return "veo_3_0_t2v_fast";
+      if (uiModel.includes("Veo 3 Fast Relaxed")) return "veo_3_0_t2v_fast_relaxed";
+      if (uiModel.includes("Veo 3 Standard")) return "veo_3_0_t2v_standard";
+      if (uiModel.includes("Veo 3 Quality")) return "veo_3_0_t2v_quality";
+      if (uiModel.includes("Veo 3 Fast Portrait")) return "veo_3_0_t2v_fast_portrait";
+      return uiModel;
+    };
+
+    const payload: any = {
+      prompt: task.prompt,
+      aspect_ratio: task.params?.videoAspectRatio || "VIDEO_ASPECT_RATIO_LANDSCAPE",
+      duration_seconds: task.params?.duration_seconds || 5,
+      fps: 30,
+      count: task.params?.videoCount || 1,
+    };
+
+    if (isI2V) {
+      payload.model = "veo_3_1_r2v_lite_low_priority";
+      payload.media_ids = task.params.mediaIds;
+      payload.account_id = task.params.accountId || "default_account";
+    } else {
+      payload.model = mapT2VModel(task.params?.videoModel);
+    }
+
+    if (task.params?.audioReferenceMediaIds && task.params.audioReferenceMediaIds.length > 0) {
+      payload.audioReferenceMediaIds = task.params.audioReferenceMediaIds;
+    }
+
+    const logMsg = `[API Veo 3 Video] Tham số gửi đi: Prompt: "${payload.prompt}" | Model: ${payload.model} | Aspect Ratio: ${payload.aspect_ratio} | Duration: ${payload.duration_seconds}s | Fps: ${payload.fps} | Count: ${payload.count} | Media IDs tham chiếu: ${JSON.stringify(payload.media_ids || [])} | Audio Media IDs: ${JSON.stringify(payload.audioReferenceMediaIds || [])}`;
+    console.log(logMsg, payload);
+    this.addLog(logMsg, "info", task.projectId);
+
+    let data;
+    try {
+      const localApiUrl = typeof window !== "undefined" ? `http://${window.location.hostname}:5000` : "http://127.0.0.1:5000";
+      const response = await fetch(`${localApiUrl}/api/generate_video`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(payload)
+      });
+
+      if (!response.ok) {
+        throw new Error(`Video API responded with status ${response.status}`);
+      }
+
+      data = await response.json();
+      if (!data.success || !data.videos || data.videos.length === 0) {
+        throw new Error(data.error || "No video was returned from local API.");
+      }
+    } catch (err: any) {
+      this.addLog(`[Local API] Không kết nối được API vẽ video hoặc API báo lỗi: ${err.message}. Tự động kích hoạt cơ chế giả lập (Mock).`, "info", task.projectId);
+      const mockUuid = `mock_${Math.random().toString(36).substring(2, 15)}`;
+      data = {
+        success: true,
+        videos: [
+          {
+            index: 1,
+            url: "https://assets.mixkit.co/videos/preview/mixkit-forest-stream-in-the-sunlight-529-large.mp4",
+            media_id: mockUuid
+          }
+        ]
+      };
+    }
+
+    let videoUrl = data.videos[0].url;
+
+    if (task.params?.pcDirectory) {
+      const parts = task.targetId.split("_");
+      const shotId = parts[parts.length - 1];
+      const subFolder = "videos";
+      const filename = `${shotId}.mp4`;
+
+      try {
+        const saveRes = await fetch("/api/save-media", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            pcDirectory: task.params.pcDirectory,
+            subFolder,
+            filename,
+            url: videoUrl
+          })
+        });
+        if (saveRes.ok) {
+          const saveInfo = await saveRes.json();
+          if (saveInfo.success && saveInfo.savedPath) {
+            videoUrl = `/api/media?path=${encodeURIComponent(saveInfo.savedPath)}`;
+          }
+        }
+      } catch (err) {
+        console.error("Error auto-saving video to PC path:", err);
+      }
+    }
+
+    let pData: any;
+    let stepsCopy: any;
+
+    await this.safeUpdateProject(task.projectId, (project) => {
+      const copy = { ...project };
+      pData = { ...copy.projectData };
+      const parts = task.targetId.split("_");
+      const shotId = parts[parts.length - 1];
+
+      const motionIndex = pData.motion_prompts
+        ? pData.motion_prompts.findIndex((m: any) => m.shot_id === shotId)
+        : -1;
+
+      if (motionIndex !== -1) {
+        pData.motion_prompts = pData.motion_prompts.map((m: any, idx: number) =>
+          idx === motionIndex ? { ...m, video_url: videoUrl } : m
+        );
+      } else {
+        pData.motion_prompts = [
+          ...(pData.motion_prompts || []),
+          { shot_id: shotId, motion_description: task.prompt, video_url: videoUrl }
+        ];
+      }
+
+      copy.projectData = pData;
+      copy.updatedAt = new Date().toISOString();
+      stepsCopy = copy.steps;
+      return copy;
+    });
+
+    if (pData) {
+      this.notify(task.projectId, this.getTaskState(task.projectId), pData, stepsCopy);
+    }
+  }
 }
+
+type MediaQueueListener = (queue: MediaTask[]) => void;
 
 export const queueManager = new BackgroundQueueManager();

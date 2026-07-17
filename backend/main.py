@@ -32,6 +32,7 @@ from pipeline import (
     run_motion_prompt_generator
 )
 
+# AI Kids Animation Studio API Startup Reloaded Final V2
 app = FastAPI(title="AI Kids Animation Studio API")
 
 # Enable CORS for Next.js frontend running on localhost:3000
@@ -54,6 +55,7 @@ class AssetsRequest(BaseModel):
     chunk_size: int = 3
 
 class ShotsRequest(BaseModel):
+    storyboard: Optional[str] = None
     scenes: List[SceneAnalysis]
     characters: List[CharacterAsset]
     environments: List[EnvironmentAsset]
@@ -74,12 +76,17 @@ class KeyframesRequest(BaseModel):
     chunk_size: int = 3
 
 class MotionRequest(BaseModel):
+    storyboard: str
     shots: List[Shot]
-    keyframes: List[ShotKeyframePrompt]
+    characters: List[CharacterAsset]
+    environments: List[EnvironmentAsset]
+    props: List[PropAsset]
+    keyframes: Optional[List[ShotKeyframePrompt]] = None
     api_keys: List[str]
     model: str
     rpm_limit: int = 5
     chunk_size: int = 3
+    custom_instructions: Optional[str] = None
 
 class ExportRequest(BaseModel):
     storyboard: str
@@ -124,7 +131,7 @@ async def plan_shots(req: ShotsRequest):
         props_json = json.dumps([p.model_dump() for p in req.props], ensure_ascii=False)
         
         return await run_shot_planner(
-            scenes_json, characters_json, environments_json, props_json, req.api_keys, req.model, req.rpm_limit, req.chunk_size
+            scenes_json, characters_json, environments_json, props_json, req.api_keys, req.model, req.rpm_limit, req.chunk_size, req.storyboard
         )
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
@@ -147,10 +154,12 @@ async def generate_keyframes(req: KeyframesRequest):
 async def generate_motion(req: MotionRequest):
     try:
         shots_json = json.dumps([s.model_dump() for s in req.shots], ensure_ascii=False)
-        keyframes_json = json.dumps([k.model_dump() for k in req.keyframes], ensure_ascii=False)
+        characters_json = json.dumps([c.model_dump() for c in req.characters], ensure_ascii=False)
+        environments_json = json.dumps([e.model_dump() for e in req.environments], ensure_ascii=False)
+        props_json = json.dumps([p.model_dump() for p in req.props], ensure_ascii=False)
         
         return await run_motion_prompt_generator(
-            shots_json, keyframes_json, req.api_keys, req.model, req.rpm_limit, req.chunk_size
+            req.storyboard, shots_json, characters_json, environments_json, props_json, req.api_keys, req.model, req.rpm_limit, req.chunk_size, req.custom_instructions
         )
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
@@ -188,25 +197,22 @@ async def run_full_pipeline(req: PipelineRequest):
         environments_json = json.dumps([e.model_dump() for e in environments], ensure_ascii=False)
         props_json = json.dumps([p.model_dump() for p in props], ensure_ascii=False)
         
-        # Step 3: Shot Planner
+        # Step 3: Shot Planner (Shot Prompt Generator)
         shots_resp = await run_shot_planner(
-            scenes_json, characters_json, environments_json, props_json, req.api_keys, req.model, req.rpm_limit, req.chunk_size
+            scenes_json, characters_json, environments_json, props_json, req.api_keys, req.model, req.rpm_limit, req.chunk_size, storyboard
         )
         shots = shots_resp.shots
-        shots_json = json.dumps([s.model_dump() for s in shots], ensure_ascii=False)
         
-        # Step 4: Keyframe Prompt Generator
-        keyframe_resp = await run_keyframe_prompt_generator(
-            shots_json, characters_json, environments_json, props_json, req.api_keys, req.model, req.rpm_limit, req.chunk_size
-        )
-        keyframes = keyframe_resp.keyframes
-        keyframes_json = json.dumps([k.model_dump() for k in keyframes], ensure_ascii=False)
+        # Extract keyframes and motion prompts directly from shots
+        keyframes = [
+            ShotKeyframePrompt(shot_id=s.shot_id, prompt=s.keyframe_prompt)
+            for s in shots
+        ]
         
-        # Step 5: Motion Prompt Generator
-        motion_resp = await run_motion_prompt_generator(
-            shots_json, keyframes_json, req.api_keys, req.model, req.rpm_limit, req.chunk_size
-        )
-        motion_prompts = motion_resp.motion_prompts
+        motion_prompts = [
+            ShotMotionPrompt(shot_id=s.shot_id, prompt=s.motion_prompt)
+            for s in shots
+        ]
         
         return FullPipelineResponse(
             storyboard=storyboard,

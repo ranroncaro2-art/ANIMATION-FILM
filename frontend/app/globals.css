@@ -721,3 +721,78 @@ code, pre {
   animation: pulse-cyan 2s infinite;
 }
 
+/* Cinema Preview Player Styles */
+.ken-burns {
+  animation: kenburns-zoom 10s ease-out forwards;
+}
+
+@keyframes kenburns-zoom {
+  from {
+    transform: scale(1.0);
+  }
+  to {
+    transform: scale(1.12);
+  }
+}
+
+/* Custom segmented controller for Alignment */
+.segmented-control {
+  display: flex;
+  background: rgba(0, 0, 0, 0.25);
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  border-radius: 8px;
+  padding: 3px;
+  gap: 4px;
+}
+
+.segmented-control-btn {
+  flex: 1;
+  background: transparent;
+  border: none;
+  border-radius: 6px;
+  color: var(--text-secondary);
+  font-size: 0.75rem;
+  font-weight: 700;
+  padding: 8px 12px;
+  cursor: pointer;
+  transition: all 0.2s ease;
+}
+
+.segmented-control-btn:hover {
+  color: #ffffff;
+  background: rgba(255, 255, 255, 0.04);
+}
+
+.segmented-control-btn.active {
+  color: #ffffff;
+  background: var(--accent-purple);
+  box-shadow: 0 2px 8px rgba(124, 58, 237, 0.4);
+}
+
+/* Custom range inputs */
+.cinema-range {
+  -webkit-appearance: none;
+  width: 100%;
+  height: 6px;
+  background: rgba(255, 255, 255, 0.1);
+  border-radius: 3px;
+  outline: none;
+}
+
+.cinema-range::-webkit-slider-thumb {
+  -webkit-appearance: none;
+  appearance: none;
+  width: 16px;
+  height: 16px;
+  border-radius: 50%;
+  background: #a78bfa;
+  cursor: pointer;
+  transition: transform 0.1s ease;
+  box-shadow: 0 0 8px rgba(167, 139, 250, 0.5);
+}
+
+.cinema-range::-webkit-slider-thumb:hover {
+  transform: scale(1.2);
+}
+
+
