@@ -478,15 +478,10 @@ def main():
 
         for f_i in range(budget):
             if len(source_frames) > 0:
-                if duration < 8:
-                    # Play at normal 1-to-1 speed. Trim if shot is shorter, freeze if source is shorter.
-                    if f_i < len(source_frames):
-                        frame = source_frames[f_i].copy()
-                    else:
-                        frame = source_frames[-1].copy()
-                else:
-                    # For shots >= 8s, loop at normal speed to fill duration without speeding up
-                    frame = source_frames[f_i % len(source_frames)].copy()
+                # Play at normal 1-to-1 speed. Trim if shot is shorter, freeze on last frame if video source is shorter.
+                # Absolutely no looping under any circumstances.
+                idx = min(f_i, len(source_frames) - 1)
+                frame = source_frames[idx].copy()
             else:
                 # Scenario C: Fallback animated graphic card
                 frame = generate_fallback_frame(
