@@ -272,6 +272,7 @@ async def run_assets_extractor(
         "- name: The prop name\n"
         "- reference_prompt: A detailed Pixar-style prop reference image prompt (centered, white background, no text)\n"
         "- prompt: Duplicate of reference_prompt\n\n"
+        "SAFETY RULE: Do NOT include any age-identifying words like 'child', 'children', 'boy', 'girl', 'kid', 'kids', 'young boy', 'young girl', 'schoolboy', 'schoolgirl' or similar child-related terms in the character descriptions or turnaround_prompts. Instead, refer to them only by name or generic terms like 'character' or 'person' to prevent Gemini API safety blocks.\n\n"
         "Return the unique assets in the requested JSON structure. Do not invent any assets not present in the storyboard."
     )
     
@@ -335,7 +336,7 @@ async def run_shot_planner(
         "   - Only describe the visual appearance: integrate details about character clothing/look (from character reference), environment (from environment reference), active props (from prop reference), camera framing (e.g. Close Up), and mood/lighting.\n"
         "   - Ensure the prompt is formatted in a Pixar-quality stylized 3D, cinematic composition, reference keyframe, no motion blur, no text, no captions.\n"
         "   - Do NOT describe motion, timeline, movement, or speech in the keyframe prompt.\n"
-        "   - Clean the text for safety: do not include age descriptors or sensitive child-related terms (use generic terms like 'boy', 'girl', or 'character' to prevent Gemini API safety blocks).\n\n"
+        "   - Clean the text for safety: do not include age descriptors or sensitive child-related terms (ONLY refer to characters by their specific names like 'Lisa', 'Tom', or generic terms like 'person' or 'character' to prevent Gemini API safety blocks. Do NOT use terms like 'boy', 'girl', 'child', or 'kids').\n\n"
         "3. Timeline:\n"
         "   - Generate a chronological breakdown of actions in seconds, matching the shot duration. Example:\n"
         "     [{\"time\": \"0-2\", \"action\": \"Lisa walks toward camera\"}, {\"time\": \"2-6\", \"action\": \"Lisa speaks\"}, {\"time\": \"6-8\", \"action\": \"Lisa smiles\"}]\n\n"
@@ -525,7 +526,8 @@ async def run_keyframe_prompt_generator(
         "Integrate details about character clothing/look (from character reference), environment (from environment reference), "
         "active props (from prop reference), camera framing (e.g., Close Up), and mood/lighting. "
         "Ensure the prompt is formatted in a Pixar-quality stylized 3D, cinematic composition, reference keyframe, "
-        "no motion blur, no text, no captions."
+        "no motion blur, no text, no captions.\n"
+        "SAFETY RULE: Do NOT use any age-identifying words like 'child', 'children', 'boy', 'girl', 'kid', 'kids', 'young boy', 'young girl', 'schoolboy', 'schoolgirl' or similar child-related terms in the prompts. Instead, ONLY refer to characters by their specific names (e.g. 'Lisa', 'Tom') or generic terms (e.g. 'person', 'character')."
     )
     
     for chunk in shot_chunks:
@@ -756,7 +758,8 @@ async def run_motion_prompt_generator(
         "11. Style Rule: Characters are cute, gentle, innocent, calm, natural—not hyperactive.\n"
         "12. Timing Rule: Actions must have enough duration.\n"
         "13. Animation Density Rule: 1 Primary Motion and max 2 Secondary Motions per shot.\n"
-        "14. Cinematic Acting Rule: Prioritize eyes, micro-expressions, breathing, and pauses over large full-body motions."
+        "14. Cinematic Acting Rule: Prioritize eyes, micro-expressions, breathing, and pauses over large full-body motions.\n"
+        "15. SAFETY RULE: Do NOT use any age-identifying words like 'child', 'children', 'boy', 'girl', 'kid', 'kids', 'young boy', 'young girl', 'schoolboy', 'schoolgirl' or similar child-related terms in the motion prompts. Instead, ONLY refer to characters by their specific names (e.g. 'Lisa', 'Tom') or general pronouns (e.g. 'they', 'he', 'she')."
     )
     
     for chunk in shot_chunks:
