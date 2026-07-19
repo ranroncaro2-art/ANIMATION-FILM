@@ -31,6 +31,8 @@ interface ApiKeyInputProps {
   onChangeImageConcurrency: (val: number) => void;
   videoConcurrency: number;
   onChangeVideoConcurrency: (val: number) => void;
+  mediaDelaySeconds: number;
+  onChangeMediaDelaySeconds: (val: number) => void;
 }
 
 export default function ApiKeyInput({
@@ -59,6 +61,8 @@ export default function ApiKeyInput({
   onChangeImageConcurrency,
   videoConcurrency,
   onChangeVideoConcurrency,
+  mediaDelaySeconds,
+  onChangeMediaDelaySeconds,
 }: ApiKeyInputProps) {
   const [rawText, setRawText] = useState("");
   const [isSaved, setIsSaved] = useState(false);
@@ -234,6 +238,28 @@ export default function ApiKeyInput({
                   onChange={(e) => onChangeChunkSize(parseInt(e.target.value) || 1)}
                   min="1"
                   max="20"
+                  style={{
+                    background: "var(--bg-secondary)",
+                    color: "#ffffff",
+                    border: "1px solid var(--border-color)",
+                    borderRadius: "var(--border-radius-sm)",
+                    padding: "6px 10px",
+                    fontSize: "0.85rem",
+                    outline: "none",
+                  }}
+                />
+              </div>
+
+              <div style={{ display: "flex", flexDirection: "column", gap: "6px", flex: 1 }}>
+                <label style={{ fontSize: "0.8rem", fontWeight: 600, color: "var(--text-primary)", display: "flex", alignItems: "center", gap: "4px" }}>
+                  Trễ gọi API (giây)
+                </label>
+                <input
+                  type="number"
+                  value={mediaDelaySeconds}
+                  onChange={(e) => onChangeMediaDelaySeconds(Math.max(0, parseInt(e.target.value) || 0))}
+                  min="0"
+                  max="120"
                   style={{
                     background: "var(--bg-secondary)",
                     color: "#ffffff",

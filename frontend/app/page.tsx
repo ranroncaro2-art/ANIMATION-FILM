@@ -31,12 +31,16 @@ interface ProjectData {
   keyframes: any[];
   motion_prompts: any[];
   pcDirectory?: string;
+  input_tokens?: number;
+  output_tokens?: number;
 }
 
 function mergeProjectData(uiData: any, dbData: any) {
   if (!dbData) return uiData;
 
   const merged = { ...uiData };
+  merged.input_tokens = uiData.input_tokens || dbData.input_tokens || 0;
+  merged.output_tokens = uiData.output_tokens || dbData.output_tokens || 0;
 
   // 0.1. Merge scenes
   if (merged.scenes && dbData.scenes) {
@@ -218,6 +222,8 @@ const INITIAL_PROJECT_DATA: ProjectData = {
   keyframes: [],
   motion_prompts: [],
   pcDirectory: "",
+  input_tokens: 0,
+  output_tokens: 0,
 };
 
 const INITIAL_STEPS: PipelineStep[] = [
@@ -638,6 +644,9 @@ export default function Home() {
 
   const [imageConcurrency, setImageConcurrency] = useState<number>(2);
   const [videoConcurrency, setVideoConcurrency] = useState<number>(1);
+  const [mediaDelaySeconds, setMediaDelaySeconds] = useState<number>(0);
+  const [globalInputTokens, setGlobalInputTokens] = useState<number>(0);
+  const [globalOutputTokens, setGlobalOutputTokens] = useState<number>(0);
   const [isLoaded, setIsLoaded] = useState<boolean>(false);
 
 
@@ -649,15 +658,65 @@ export default function Home() {
   const [isRenderingVideo, setIsRenderingVideo] = useState<boolean>(false);
   const [videoRenderPercent, setVideoRenderPercent] = useState<number>(0);
   const [videoRenderStage, setVideoRenderStage] = useState<string>("");
+  const [isRenderModalOpen, setIsRenderModalOpen] = useState<boolean>(false);
+  const [renderShotsStatus, setRenderShotsStatus] = useState<any[]>([]);
+  const [renderLogs, setRenderLogs] = useState<string[]>([]);
   const [isVideoGenerated, setIsVideoGenerated] = useState<boolean>(false);
   const [videoResolution, setVideoResolution] = useState<string>("720");
+  const [burnSubtitle, setBurnSubtitle] = useState<boolean>(true);
   const [renderTimestamp, setRenderTimestamp] = useState<number>(Date.now());
+
+  // Image Shots pagination & filter states
+  const [imageFilterTab, setImageFilterTab] = useState<"all" | "success" | "failed" | "none">("all");
+  const [imagePageSize, setImagePageSize] = useState<number>(30);
+  const [imageCurrentPage, setImageCurrentPage] = useState<number>(1);
+
+  // Video Segments pagination & filter states
+  const [videoFilterTab, setVideoFilterTab] = useState<"all" | "success" | "failed" | "none">("all");
+  const [videoPageSize, setVideoPageSize] = useState<number>(30);
+  const [videoCurrentPage, setVideoCurrentPage] = useState<number>(1);
 
   // Video Player state
   const videoRef = useRef<HTMLVideoElement>(null);
   const [playheadTime, setPlayheadTime] = useState<number>(0);
   const [videoDuration, setVideoDuration] = useState<number>(0);
   const [isPlaying, setIsPlaying] = useState<boolean>(false);
+
+  const getImageStatus = (shot: any) => {
+    const shotKey = `shot_${shot.scene_number || shot.scene_id || ''}_${shot.shot_id}`;
+    const keyframeObj = projectData.keyframes
+      ? projectData.keyframes.find((k: any) => k.shot_id === shot.shot_id)
+      : null;
+    const keyframeUrl = keyframeObj?.url || "";
+    const hasImg = !!(keyframeUrl && !keyframeUrl.startsWith("mock_"));
+    if (hasImg) return "success";
+
+    const task = mediaQueue.find(t => t.type === "shot_image" && t.targetId === shotKey);
+    if (task) {
+      if (task.status === "failed") return "failed";
+      if (task.status === "pending" || task.status === "running") return "pending";
+    }
+    return "none";
+  };
+
+  const getVideoStatus = (shot: any) => {
+    const shotKey = `shot_${shot.scene_number || shot.scene_id || ''}_${shot.shot_id}`;
+    const motionIndex = projectData.motion_prompts
+      ? projectData.motion_prompts.findIndex((m: any) => m.shot_id === shot.shot_id)
+      : -1;
+    const videoUrl = motionIndex !== -1 && projectData.motion_prompts
+      ? projectData.motion_prompts[motionIndex].video_url || ""
+      : "";
+    const hasVideo = !!(videoUrl && !videoUrl.startsWith("mock_"));
+    if (hasVideo) return "success";
+
+    const task = mediaQueue.find(t => t.type === "shot_video" && t.targetId === shotKey);
+    if (task) {
+      if (task.status === "failed") return "failed";
+      if (task.status === "pending" || task.status === "running") return "pending";
+    }
+    return "none";
+  };
 
   // Video Segment rendering states
   const [selectedShots, setSelectedShots] = useState<Record<string, boolean>>({});
@@ -869,6 +928,9 @@ export default function Home() {
     const savedVidConcurrency = localStorage.getItem("local_video_concurrency");
     if (savedVidConcurrency) setVideoConcurrency(parseInt(savedVidConcurrency) || 1);
 
+    const savedDelaySeconds = localStorage.getItem("local_media_delay_seconds");
+    if (savedDelaySeconds) setMediaDelaySeconds(parseInt(savedDelaySeconds) || 0);
+
     // Recover last active workspace state from IndexedDB
     const lastActiveId = localStorage.getItem("last_active_project_id") || "active";
     getProject(lastActiveId)
@@ -891,8 +953,7 @@ export default function Home() {
             setIsRunningAll(taskState.isRunningAll);
           }
         } else {
-          // Preset sample storyboard
-          setStoryboard(SAMPLE_SCRIPT_AUTO);
+          setStoryboard("");
         }
       })
       .catch(console.error)
@@ -908,6 +969,19 @@ export default function Home() {
   useEffect(() => {
     queueManager.setConcurrencyLimits(imageConcurrency, videoConcurrency);
   }, [imageConcurrency, videoConcurrency]);
+
+  useEffect(() => {
+    if (typeof window !== "undefined") {
+      const gIn = parseInt(localStorage.getItem("global_input_tokens") || "0") || 0;
+      const gOut = parseInt(localStorage.getItem("global_output_tokens") || "0") || 0;
+      setGlobalInputTokens(gIn);
+      setGlobalOutputTokens(gOut);
+    }
+  }, [projectData.input_tokens, projectData.output_tokens]);
+
+  useEffect(() => {
+    queueManager.setMediaDelaySeconds(mediaDelaySeconds);
+  }, [mediaDelaySeconds]);
 
   // Debounced auto-save to IndexedDB for the active workspace
   useEffect(() => {
@@ -1076,7 +1150,7 @@ export default function Home() {
           id: newId,
           name: finalName,
           updatedAt: new Date().toISOString(),
-          storyboard: workflowMode === "script_auto" ? SAMPLE_SCRIPT_AUTO : SAMPLE_SRT,
+          storyboard: "",
           projectData: INITIAL_PROJECT_DATA,
           steps: INITIAL_STEPS,
           model: selectedModel,
@@ -1120,7 +1194,7 @@ export default function Home() {
       if (activeProjectId === id) {
         setActiveProjectId("active");
         setActiveProjectName("Untitled Project");
-        setStoryboard(workflowMode === "script_auto" ? SAMPLE_SCRIPT_AUTO : SAMPLE_SRT);
+        setStoryboard("");
         setProjectData(INITIAL_PROJECT_DATA);
         setSteps(INITIAL_STEPS);
         setSelectedStep(null);
@@ -2118,14 +2192,14 @@ export default function Home() {
   };
 
   // Video renderer caller using Next.js streaming API
-  const startVideoRendering = async () => {
+  // Video renderer preparation and resource scanning
+  const prepareVideoRendering = async () => {
     if (!checkPcDirectory()) return;
     if (projectData.shots.length === 0) {
       alert("Vui lòng tạo danh sách shot trước khi render.");
       return;
     }
 
-    // Scan videos directory first to verify all shots possess a compiled video segment
     let scanData;
     try {
       const scanRes = await fetch("/api/scan-assets", {
@@ -2143,7 +2217,6 @@ export default function Home() {
     }
 
     const scannedVideos = scanData.videos || [];
-    const missingShots: string[] = [];
 
     const getBaseName = (filename: string) => {
       const parts = filename.split(".");
@@ -2166,24 +2239,28 @@ export default function Home() {
       return false;
     };
 
-    // Check if every shot has a matching video segment file in the local videos directory
-    projectData.shots.forEach((shot: any) => {
-      const hasMatch = scannedVideos.some((f: any) => isShotMatch(f.name, shot.shot_id));
-      if (!hasMatch) {
-        missingShots.push(shot.shot_id);
-      }
+    const shotsStatus = projectData.shots.map((shot: any) => {
+      const matchFile = scannedVideos.find((f: any) => isShotMatch(f.name, shot.shot_id));
+      return {
+        shot_id: shot.shot_id,
+        duration: shot.duration_seconds || 5,
+        environment: shot.environment || "Chưa rõ",
+        hasVideo: !!matchFile,
+        fileName: matchFile ? matchFile.name : `Shot_${shot.shot_id}.mp4`
+      };
     });
 
-    if (missingShots.length > 0) {
-      const msg = `Không thể xuất video! Thiếu video của các phân cảnh: ${missingShots.join(", ")}. Số lượng video phân đoạn phải bằng số lượng phân cảnh (${projectData.shots.length} shots) đã phân tích.`;
-      alert(msg);
-      queueManager.addLog(msg, "error", activeProjectId);
-      return;
-    }
-    
+    setRenderShotsStatus(shotsStatus);
+    setRenderLogs([]);
+    setIsRenderModalOpen(true);
+  };
+
+  // Video renderer execution using Next.js streaming API
+  const executeVideoRendering = async () => {
     setIsRenderingVideo(true);
     setVideoRenderPercent(0);
     setVideoRenderStage("Khởi chạy engine render...");
+    setRenderLogs(["[Engine] Khởi động tiến trình render...", "[Engine] Đang đọc cấu trúc phân cảnh..."]);
     queueManager.addLog("Bắt đầu tiến trình Render Video...", "running", activeProjectId);
     
     // Prepare the payload for the rendering API
@@ -2227,7 +2304,8 @@ export default function Home() {
           shots: payloadShots,
           keyframes: payloadKeyframes,
           motion_prompts: payloadMotion,
-          pcDirectory: projectData.pcDirectory
+          pcDirectory: projectData.pcDirectory,
+          burnSubtitle
         })
       });
 
@@ -2262,11 +2340,13 @@ export default function Home() {
               }
               if (data.stage) {
                 setVideoRenderStage(data.stage);
+                setRenderLogs(prev => [...prev, `[Render Engine] ${data.stage}`]);
                 queueManager.addLog(`[Render Engine] ${data.stage}`, "info", activeProjectId);
               }
               
               if (data.status === "success") {
                 queueManager.addLog("Quá trình render video hoàn tất! File MP4 đã được tạo.", "success", activeProjectId);
+                setRenderLogs(prev => [...prev, "✓ [Thành công] Đã xuất video hoàn chỉnh!"]);
                 setRenderTimestamp(Date.now());
                 setIsRenderingVideo(false);
                 setIsVideoGenerated(true);
@@ -2282,6 +2362,7 @@ export default function Home() {
       }
     } catch (err: any) {
       console.error(err);
+      setRenderLogs(prev => [...prev, `❌ [Lỗi] ${err.message}`]);
       alert(`Render failed: ${err.message}`);
       queueManager.addLog(`[Render Engine] Lỗi render: ${err.message}`, "error", activeProjectId);
       setIsRenderingVideo(false);
@@ -3162,6 +3243,43 @@ export default function Home() {
 
         {/* Right Header Panel */}
         <div style={{ display: "flex", alignItems: "center", gap: "16px" }}>
+          {/* Token & Cost Usage Stats */}
+          <div
+            style={{
+              display: "flex",
+              alignItems: "center",
+              gap: "10px",
+              background: "rgba(255, 255, 255, 0.02)",
+              border: "1px solid rgba(255, 255, 255, 0.06)",
+              padding: "6px 14px",
+              borderRadius: "20px",
+              fontSize: "0.78rem",
+            }}
+          >
+            {/* Active Project stats */}
+            <div style={{ display: "flex", alignItems: "center", gap: "6px" }}>
+              <span title="Token sử dụng của dự án hiện tại">🪙</span>
+              <span style={{ color: "var(--text-secondary)" }}>Dự án:</span>
+              <strong style={{ color: "#ffffff", fontFamily: "var(--font-mono)" }}>
+                {((projectData.input_tokens || 0) + (projectData.output_tokens || 0)).toLocaleString()} tkn
+              </strong>
+              <span style={{ color: "var(--accent-cyan)", fontFamily: "var(--font-mono)", fontWeight: 700 }}>
+                (${((projectData.input_tokens || 0) * 0.000000075 + (projectData.output_tokens || 0) * 0.00000030).toFixed(5)})
+              </span>
+            </div>
+            
+            <span style={{ color: "rgba(255, 255, 255, 0.15)" }}>|</span>
+
+            {/* Global cumulative cost */}
+            <div style={{ display: "flex", alignItems: "center", gap: "6px" }}>
+              <span title="Tổng chi phí tích lũy của tất cả dự án">📊</span>
+              <span style={{ color: "var(--text-secondary)" }}>Tổng lũy kế:</span>
+              <strong style={{ color: "var(--accent-purple)", fontFamily: "var(--font-mono)", fontWeight: 700 }}>
+                ${((globalInputTokens * 0.000000075) + (globalOutputTokens * 0.00000030)).toFixed(5)}
+              </strong>
+            </div>
+          </div>
+
           {/* Model Status */}
           <div
             style={{
@@ -3399,7 +3517,7 @@ export default function Home() {
                           onBlur={(e) => handleManualPcDirectoryBlur(e.target.value)}
                           placeholder="Nhập hoặc dán đường dẫn thư mục PC tại đây (ví dụ: D:\KidsProjects)..."
                           className="custom-input"
-                          style={{ flexGrow: 1, padding: "8px 12px", fontSize: "0.85rem", background: "rgba(0,0,0,0.3)" }}
+                          style={{ flexGrow: 1, padding: "8px 12px", fontSize: "0.85rem", background: "rgba(0,0,0,0.3)", color: "#ffffff" }}
                         />
                         <button
                           onClick={handleSelectPcDirectory}
@@ -3504,7 +3622,7 @@ export default function Home() {
                             Combo 3: Tự động toàn bộ
                           </h4>
                           <p className="combo-desc">
-                            Chạy tự động: Sinh Voice/SRT → Phân cảnh → Prompt → Ảnh tham chiếu → Ảnh Shots → Video → Xuất video .mp4
+                            Chạy tự động: Phân cảnh (Story Analyzer) → Tạo Prompt → Ảnh tham chiếu (Assets) → Ảnh Shots → Video → Xuất video .mp4
                           </p>
                         </div>
                         <button
@@ -3517,49 +3635,6 @@ export default function Home() {
                       </div>
                     </div>
 
-                    {/* Workflow Mode Selector Title */}
-                    <div className="workflow-section-title" style={{ marginTop: "24px", marginBottom: "12px", fontSize: "0.8rem", color: "var(--text-muted)", fontWeight: 700, letterSpacing: "0.05em" }}>
-                      CHỌN TIẾN TRÌNH LÀM VIỆC (WORKFLOW)
-                    </div>
-
-                    {/* Workflow Selectors */}
-                    <div className="workflow-selector">
-                      <button
-                        onClick={() => {
-                          setWorkflowMode("srt_existing");
-                          if (!storyboard.trim() || storyboard === SAMPLE_SCRIPT_AUTO) {
-                            setStoryboard(SAMPLE_SRT);
-                          }
-                        }}
-                        className={`workflow-btn ${workflowMode === "srt_existing" ? "active" : ""}`}
-                      >
-                        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
-                          <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/>
-                          <polyline points="14 2 14 8 20 8"/>
-                          <line x1="16" y1="13" x2="8" y2="13"/>
-                          <line x1="16" y1="17" x2="8" y2="17"/>
-                          <polyline points="10 9 9 9 8 9"/>
-                        </svg>
-                        Chế độ 1: Phụ đề SRT sẵn có
-                      </button>
-
-                      <button
-                        onClick={() => {
-                          setWorkflowMode("script_auto");
-                          if (!storyboard.trim() || storyboard === SAMPLE_SRT) {
-                            setStoryboard(SAMPLE_SCRIPT_AUTO);
-                          }
-                        }}
-                        className={`workflow-btn ${workflowMode === "script_auto" ? "active" : ""}`}
-                      >
-                        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
-                          <polygon points="11 5 6 9 2 9 2 15 6 15 11 19 11 5"/>
-                          <path d="M19.07 4.93a10 10 0 0 1 0 14.14M15.54 8.46a5 5 0 0 1 0 7.07"/>
-                        </svg>
-                        Chế độ 2: Sinh Voice & SRT tự động từ kịch bản
-                      </button>
-                    </div>
-
                     {/* Subtitle / Script input Panel */}
                     <div className="style-panel" style={{ flexGrow: 1, marginTop: "16px" }}>
                       <div className="panel-header">
@@ -3569,14 +3644,12 @@ export default function Home() {
                             <path d="M19 10v2a7 7 0 0 1-14 0v-2M12 19v4M8 23h8"/>
                           </svg>
                           <h4 style={{ fontSize: "0.9rem", fontWeight: 700 }}>
-                            {workflowMode === "script_auto"
-                              ? "Sinh Phụ đề & Giọng đọc tự động từ Kịch bản"
-                              : "Nội dung phụ đề SRT sẵn có"}
+                            Nhập Kịch bản Phân cảnh (Storyboard Script)
                           </h4>
                         </div>
                         <div style={{ display: "flex", gap: "6px" }}>
                           <button
-                            onClick={() => setStoryboard(workflowMode === "script_auto" ? SAMPLE_SCRIPT_AUTO : SAMPLE_SRT)}
+                            onClick={() => setStoryboard(SAMPLE_SCRIPT_AUTO)}
                             className="btn-secondary"
                             style={{ padding: "4px 8px", fontSize: "0.7rem", borderRadius: "4px" }}
                           >
@@ -3594,20 +3667,14 @@ export default function Home() {
 
                       <div style={{ position: "relative", flexGrow: 1, display: "flex", flexDirection: "column" }}>
                         <span style={{ fontSize: "0.75rem", color: "var(--text-muted)", marginBottom: "6px", display: "block" }}>
-                          {workflowMode === "script_auto"
-                            ? "NỘI DUNG KỊCH BẢN (MỖI DÒNG LÀ 1 CÂU THOẠI)"
-                            : "NỘI DUNG SRT SUBTITLE"}
+                          NỘI DUNG KỊCH BẢN (MỖI DÒNG LÀ 1 CÂU THOẠI)
                           {` (${storyboard.trim() ? storyboard.split("\n").filter(l => l.trim()).length : 0} dòng)`}
                         </span>
 
                         <textarea
                           value={storyboard}
                           onChange={(e) => handleStoryboardChange(e.target.value)}
-                          placeholder={
-                            workflowMode === "script_auto"
-                              ? "Nhập kịch bản tại đây...\nVí dụ:\nScene 1 (6s)\nLisa vẫy tay chào..."
-                              : "Nhập tệp phụ đề SRT tại đây...\nVí dụ:\n1\n00:00:00,000 --> 00:00:06,000\nLisa vẫy tay..."
-                          }
+                          placeholder="Nhập kịch bản tại đây...\nVí dụ:\nScene 1 (6s)\nLisa vẫy tay chào..."
                           className="custom-textarea"
                           style={{ minHeight: "180px", flexGrow: 1, fontFamily: "var(--font-sans)" }}
                         />
@@ -4230,87 +4297,172 @@ export default function Home() {
                         )}
                       </div>
 
-                      {projectData.shots.map((shot: any, idx) => {
-                        const shotKey = `shot_${shot.scene_number || shot.scene_id || ''}_${shot.shot_id}`;
-                        const keyframeObj = projectData.keyframes 
-                          ? projectData.keyframes.find((k: any) => k.shot_id === shot.shot_id)
-                          : null;
-                        const keyframePrompt = keyframeObj?.keyframe_image_prompt || "";
-                        const keyframeUrl = keyframeObj?.url || "";
-                        const hasImg = !!(keyframeUrl && !keyframeUrl.startsWith("mock_"));
-                        const isGen = generatingShotKeys[shotKey];
+                      {/* Status filter tabs for images */}
+                      <div style={{ display: "flex", gap: "8px", margin: "0 0 16px 0", flexWrap: "wrap" }}>
+                        <button
+                          onClick={() => { setImageFilterTab("all"); setImageCurrentPage(1); }}
+                          style={{
+                            padding: "6px 12px",
+                            borderRadius: "16px",
+                            border: imageFilterTab === "all" ? "1px solid var(--accent-cyan)" : "1px solid rgba(255,255,255,0.08)",
+                            background: imageFilterTab === "all" ? "rgba(6,182,212,0.15)" : "transparent",
+                            color: imageFilterTab === "all" ? "#06b6d4" : "var(--text-secondary)",
+                            fontSize: "0.75rem",
+                            fontWeight: 600,
+                            cursor: "pointer"
+                          }}
+                        >
+                          Tổng ({projectData.shots.length})
+                        </button>
+                        <button
+                          onClick={() => { setImageFilterTab("success"); setImageCurrentPage(1); }}
+                          style={{
+                            padding: "6px 12px",
+                            borderRadius: "16px",
+                            border: imageFilterTab === "success" ? "1px solid #10b981" : "1px solid rgba(255,255,255,0.08)",
+                            background: imageFilterTab === "success" ? "rgba(16,185,129,0.15)" : "transparent",
+                            color: imageFilterTab === "success" ? "#10b981" : "var(--text-secondary)",
+                            fontSize: "0.75rem",
+                            fontWeight: 600,
+                            cursor: "pointer"
+                          }}
+                        >
+                          Thành công ({projectData.shots.filter(s => getImageStatus(s) === "success").length})
+                        </button>
+                        <button
+                          onClick={() => { setImageFilterTab("failed"); setImageCurrentPage(1); }}
+                          style={{
+                            padding: "6px 12px",
+                            borderRadius: "16px",
+                            border: imageFilterTab === "failed" ? "1px solid #ef4444" : "1px solid rgba(255,255,255,0.08)",
+                            background: imageFilterTab === "failed" ? "rgba(239,68,68,0.15)" : "transparent",
+                            color: imageFilterTab === "failed" ? "#ef4444" : "var(--text-secondary)",
+                            fontSize: "0.75rem",
+                            fontWeight: 600,
+                            cursor: "pointer"
+                          }}
+                        >
+                          Thất bại ({projectData.shots.filter(s => getImageStatus(s) === "failed").length})
+                        </button>
+                        <button
+                          onClick={() => { setImageFilterTab("none"); setImageCurrentPage(1); }}
+                          style={{
+                            padding: "6px 12px",
+                            borderRadius: "16px",
+                            border: imageFilterTab === "none" ? "1px solid #f59e0b" : "1px solid rgba(255,255,255,0.08)",
+                            background: imageFilterTab === "none" ? "rgba(245,158,11,0.15)" : "transparent",
+                            color: imageFilterTab === "none" ? "#f59e0b" : "var(--text-secondary)",
+                            fontSize: "0.75rem",
+                            fontWeight: 600,
+                            cursor: "pointer"
+                          }}
+                        >
+                          Chưa tạo ({projectData.shots.filter(s => { const st = getImageStatus(s); return st === "none" || st === "pending"; }).length})
+                        </button>
+                      </div>
+
+                      {(() => {
+                        const filtered = projectData.shots.filter(s => {
+                          const status = getImageStatus(s);
+                          if (imageFilterTab === "all") return true;
+                          if (imageFilterTab === "success") return status === "success";
+                          if (imageFilterTab === "failed") return status === "failed";
+                          if (imageFilterTab === "none") return status === "none" || status === "pending";
+                          return true;
+                        });
+                        
+                        const totalPages = Math.ceil(filtered.length / imagePageSize) || 1;
+                        const page = Math.min(imageCurrentPage, totalPages);
+                        const paginated = filtered.slice((page - 1) * imagePageSize, page * imagePageSize);
 
                         return (
-                          <div key={idx} className="glass-panel" style={{ padding: "16px", display: "grid", gridTemplateColumns: "180px 1fr", gap: "16px", alignItems: "start" }}>
-                            <div style={{ aspectRatio: "16/9", background: "#060910", borderRadius: "8px", overflow: "hidden", display: "flex", alignItems: "center", justifyContent: "center", position: "relative" }}>
-                               {isGen ? (
-                                 renderMediaLoader(isGen, "Vẽ ảnh...")
-                               ) : hasImg ? (
-                                 <div style={{ width: "100%", height: "100%", position: "relative" }}>
-                                   <img
-                                     src={keyframeUrl}
-                                     alt={`Scene ${shot.scene_id} - Shot ${shot.shot_id}`}
-                                     style={{ width: "100%", height: "100%", objectFit: "cover" }}
-                                   />
-                                   {renderImageActionToolbar(keyframeUrl, `shot_${shot.shot_id}.png`, () => triggerGenerateShotImage(shotKey))}
-                                 </div>
-                               ) : (
-                                 <div style={{ display: "flex", flexDirection: "column", alignItems: "center", gap: "6px" }}>
-                                   <button
-                                     onClick={() => triggerGenerateShotImage(shotKey)}
-                                     disabled={activeStep !== null || isRunningAll}
-                                     className="btn-primary"
-                                     style={{ padding: "4px 8px", fontSize: "0.7rem", borderRadius: "4px" }}
-                                   >
-                                     Tạo
-                                   </button>
-                                 </div>
-                               )}
-                            </div>
-
-                            <div style={{ display: "flex", flexDirection: "column", gap: "4px" }}>
-                              <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
-                                <h4 style={{ color: "#a78bfa", fontSize: "0.9rem", display: "flex", alignItems: "center", gap: "8px", margin: 0 }}>
-                                  Scene {shot.scene_id} - Shot {String(shot.shot_id).replace('Shot', '')}
-                                  <div style={{ display: "inline-flex", alignItems: "center", gap: "4px", background: "rgba(255,255,255,0.05)", padding: "2px 6px", borderRadius: "4px", border: "1px solid rgba(255,255,255,0.1)" }}>
-                                    <span style={{ fontSize: "0.7rem", color: "var(--text-muted)" }}>Thời lượng:</span>
-                                    <input
-                                      type="number"
-                                      value={shot.duration_seconds || 5}
-                                      min={1}
-                                      max={8}
-                                      onChange={(e) => {
-                                        const val = Math.min(8, Math.max(1, Number(e.target.value) || 1));
-                                        const updatedShots = projectData.shots.map((s: any) => 
-                                          s.shot_id === shot.shot_id ? { ...s, duration_seconds: val } : s
-                                        );
-                                        handleUpdateStepData("shot_planner", updatedShots);
-                                      }}
-                                      style={{ width: "45px", background: "transparent", border: "none", color: "#10b981", fontSize: "0.75rem", fontWeight: "bold", outline: "none", padding: 0, textAlign: "center" }}
-                                    />
-                                    <span style={{ fontSize: "0.7rem", color: "var(--text-muted)" }}>s</span>
-                                  </div>
-                                </h4>
-                                <span style={{ fontSize: "0.75rem", color: "var(--text-muted)" }}>
-                                  Camera: {shot.framing} | {shot.camera_movement}
-                                </span>
+                          <>
+                            {paginated.length === 0 ? (
+                              <div style={{ padding: "40px", textAlign: "center", border: "1px dashed var(--border-color)", borderRadius: "8px", color: "var(--text-muted)", fontSize: "0.85rem" }}>
+                                Không tìm thấy shots nào khớp bộ lọc.
                               </div>
+                            ) : (
+                              <div style={{ display: "flex", flexDirection: "column", gap: "16px" }}>
+                                {paginated.map((shot: any) => {
+                                  const shotKey = `shot_${shot.scene_number || shot.scene_id || ''}_${shot.shot_id}`;
+                                  const keyframeObj = projectData.keyframes 
+                                    ? projectData.keyframes.find((k: any) => k.shot_id === shot.shot_id)
+                                    : null;
+                                  const keyframePrompt = keyframeObj?.keyframe_image_prompt || "";
+                                  const keyframeUrl = keyframeObj?.url || "";
+                                  const hasImg = !!(keyframeUrl && !keyframeUrl.startsWith("mock_"));
+                                  const isGen = generatingShotKeys[shotKey];
 
-                              <p style={{ fontSize: "0.8rem", color: "var(--text-secondary)", lineHeight: 1.4 }}>
-                                <strong>Hành động:</strong> {shot.actions}
-                              </p>
+                                  return (
+                                    <div key={shot.shot_id} className="glass-panel" style={{ padding: "16px", display: "grid", gridTemplateColumns: "180px 1fr", gap: "16px", alignItems: "start" }}>
+                                      <div style={{ aspectRatio: "16/9", background: "#060910", borderRadius: "8px", overflow: "hidden", display: "flex", alignItems: "center", justifyContent: "center", position: "relative" }}>
+                                         {isGen ? (
+                                           renderMediaLoader(isGen, "Vẽ ảnh...")
+                                         ) : hasImg ? (
+                                           <div style={{ width: "100%", height: "100%", position: "relative" }}>
+                                             <img
+                                               src={keyframeUrl}
+                                               alt={`Scene ${shot.scene_id} - Shot ${shot.shot_id}`}
+                                               style={{ width: "100%", height: "100%", objectFit: "cover" }}
+                                             />
+                                             {renderImageActionToolbar(keyframeUrl, `shot_${shot.shot_id}.png`, () => triggerGenerateShotImage(shotKey))}
+                                           </div>
+                                         ) : (
+                                           <div style={{ display: "flex", flexDirection: "column", alignItems: "center", gap: "6px" }}>
+                                             <button
+                                               onClick={() => triggerGenerateShotImage(shotKey)}
+                                               disabled={activeStep !== null || isRunningAll}
+                                               className="btn-primary"
+                                               style={{ padding: "4px 8px", fontSize: "0.7rem", borderRadius: "4px" }}
+                                             >
+                                               Tạo
+                                             </button>
+                                           </div>
+                                         )}
+                                      </div>
 
-                              {keyframePrompt ? (
-                                <div style={{ marginTop: "6px", background: "rgba(255,255,255,0.02)", padding: "8px", borderRadius: "4px", border: "1px solid rgba(255,255,255,0.04)" }}>
-                                  <strong style={{ fontSize: "0.7rem", color: "#06b6d4", display: "block", marginBottom: "2px" }}>KEYFRAME IMAGE PROMPT:</strong>
-                                  <p style={{ fontSize: "0.75rem", fontStyle: "italic", margin: 0 }}>{keyframePrompt}</p>
-                                </div>
-                              ) : (
-                                <div style={{ marginTop: "6px", background: "rgba(255,255,255,0.01)", padding: "8px", borderRadius: "4px", border: "1px dashed rgba(255,255,255,0.04)" }}>
-                                  <strong style={{ fontSize: "0.7rem", color: "var(--text-muted)", display: "block", marginBottom: "2px" }}>KEYFRAME IMAGE PROMPT:</strong>
-                                  <p style={{ fontSize: "0.75rem", fontStyle: "italic", margin: 0, color: "var(--text-muted)" }}>Chưa sinh prompt</p>
-                                </div>
-                              )}
+                                      <div style={{ display: "flex", flexDirection: "column", gap: "4px" }}>
+                                        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+                                          <h4 style={{ color: "#a78bfa", fontSize: "0.9rem", display: "flex", alignItems: "center", gap: "8px", margin: 0 }}>
+                                            Scene {shot.scene_id} - Shot {String(shot.shot_id).replace('Shot', '')}
+                                            <div style={{ display: "inline-flex", alignItems: "center", gap: "4px", background: "rgba(255,255,255,0.05)", padding: "2px 6px", borderRadius: "4px", border: "1px solid rgba(255,255,255,0.1)" }}>
+                                              <span style={{ fontSize: "0.7rem", color: "var(--text-muted)" }}>Thời lượng:</span>
+                                              <input
+                                                type="number"
+                                                value={shot.duration_seconds || 5}
+                                                min={1}
+                                                max={8}
+                                                onChange={(e) => {
+                                                  const val = Math.min(8, Math.max(1, Number(e.target.value) || 1));
+                                                  const updatedShots = projectData.shots.map((s: any) => 
+                                                    s.shot_id === shot.shot_id ? { ...s, duration_seconds: val } : s
+                                                  );
+                                                  handleUpdateStepData("shot_planner", updatedShots);
+                                                }}
+                                                style={{ width: "45px", background: "transparent", border: "none", color: "#10b981", fontSize: "0.75rem", fontWeight: "bold", outline: "none", padding: 0, textAlign: "center" }}
+                                              />
+                                              <span style={{ fontSize: "0.7rem", color: "var(--text-muted)" }}>s</span>
+                                            </div>
+                                          </h4>
+                                          <span style={{ fontSize: "0.75rem", color: "var(--text-muted)" }}>
+                                            Camera: {shot.framing} | {shot.camera_movement}
+                                          </span>
+                                        </div>
+
+                                        <p style={{ fontSize: "0.8rem", color: "var(--text-secondary)", lineHeight: 1.4 }}>
+                                          <strong>Hành động:</strong> {shot.actions}
+                                        </p>
+
+                                        {keyframePrompt ? (
+                                          <div style={{ marginTop: "6px", background: "rgba(255,255,255,0.02)", padding: "8px", borderRadius: "4px", border: "1px solid rgba(255,255,255,0.04)" }}>
+                                            <strong style={{ fontSize: "0.7rem", color: "#06b6d4", display: "block", marginBottom: "2px" }}>KEYFRAME IMAGE PROMPT:</strong>
+                                            <p style={{ fontSize: "0.75rem", fontStyle: "italic", margin: 0 }}>{keyframePrompt}</p>
+                                          </div>
+                                        ) : (
+                                          <div style={{ marginTop: "6px", background: "rgba(255,255,255,0.01)", padding: "8px", borderRadius: "4px", border: "1px dashed rgba(255,255,255,0.04)" }}>
+                                            <span style={{ fontSize: "0.75rem", color: "var(--text-muted)", fontStyle: "italic" }}>Chưa có keyframe image prompt.</span>
+                                          </div>
+                                        )}
 
                               {/* Referenced Assets previews on segment */}
                               {(() => {
@@ -4456,10 +4608,67 @@ export default function Home() {
                                   </div>
                                 );
                               })()}
+                                      </div>
+                                    </div>
+                                  );
+                                })}
+                              </div>
+                            )}
+                            
+                            {/* Pagination controls */}
+                            <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginTop: "16px", padding: "12px", background: "rgba(255,255,255,0.02)", border: "1px solid rgba(255,255,255,0.05)", borderRadius: "8px" }}>
+                              <div style={{ display: "flex", alignItems: "center", gap: "8px" }}>
+                                <span style={{ fontSize: "0.75rem", color: "var(--text-secondary)" }}>Mỗi trang:</span>
+                                <select
+                                  value={imagePageSize}
+                                  onChange={(e) => { setImagePageSize(Number(e.target.value)); setImageCurrentPage(1); }}
+                                  style={{ padding: "4px 8px", background: "#0c101d", border: "1px solid rgba(255,255,255,0.08)", borderRadius: "4px", fontSize: "0.75rem", color: "#ffffff" }}
+                                >
+                                  <option value={30}>30</option>
+                                  <option value={50}>50</option>
+                                  <option value={100}>100</option>
+                                </select>
+                              </div>
+                              
+                              <div style={{ display: "flex", alignItems: "center", gap: "10px" }}>
+                                <button
+                                  disabled={page === 1}
+                                  onClick={() => setImageCurrentPage(prev => Math.max(1, prev - 1))}
+                                  style={{
+                                    padding: "4px 10px",
+                                    borderRadius: "4px",
+                                    background: page === 1 ? "rgba(255,255,255,0.02)" : "rgba(255,255,255,0.08)",
+                                    border: "1px solid rgba(255,255,255,0.05)",
+                                    color: page === 1 ? "var(--text-muted)" : "#ffffff",
+                                    fontSize: "0.75rem",
+                                    cursor: page === 1 ? "not-allowed" : "pointer"
+                                  }}
+                                >
+                                  Trước
+                                </button>
+                                <span style={{ fontSize: "0.75rem", color: "var(--text-secondary)", fontFamily: "var(--font-mono)" }}>
+                                  Trang {page} / {totalPages}
+                                </span>
+                                <button
+                                  disabled={page === totalPages}
+                                  onClick={() => setImageCurrentPage(prev => Math.min(totalPages, prev + 1))}
+                                  style={{
+                                    padding: "4px 10px",
+                                    borderRadius: "4px",
+                                    background: page === totalPages ? "rgba(255,255,255,0.02)" : "rgba(255,255,255,0.08)",
+                                    border: "1px solid rgba(255,255,255,0.05)",
+                                    color: page === totalPages ? "var(--text-muted)" : "#ffffff",
+                                    fontSize: "0.75rem",
+                                    cursor: page === totalPages ? "not-allowed" : "pointer"
+                                  }}
+                                >
+                                  Sau
+                                </button>
+                              </div>
                             </div>
-                          </div>
+                          </>
                         );
-                      })}
+                      })()}
                     </div>
                   )}
                 </div>
@@ -4608,33 +4817,7 @@ export default function Home() {
                     </div>
                   )}
 
-                  {/* AI Custom Instructions Input for Motion Generator */}
-                  {projectData.shots.length > 0 && (
-                    <div className="glass-panel" style={{ padding: "16px", background: "rgba(255, 255, 255, 0.01)", border: "1px solid rgba(255, 255, 255, 0.03)" }}>
-                      <span style={{ fontSize: "0.75rem", color: "var(--text-secondary)", fontWeight: 700, display: "block", marginBottom: "8px" }}>
-                        💡 YÊU CẦU BỔ SUNG KHI TẠO CHUYỂN ĐỘNG BẰNG AI (TÙY CHỌN)
-                      </span>
-                      <textarea
-                        value={customMotionInstructions}
-                        onChange={(e) => setCustomMotionInstructions(e.target.value)}
-                        placeholder="Nhập hướng dẫn bổ sung cho Gemini khi tạo chuyển động (ví dụ: 'Hãy mô tả các nhân vật chuyển động cực kỳ chậm rãi', 'Thêm các hành động phụ như cười tươi', 'Máy quay luôn hướng theo nhân vật...')"
-                        className="custom-textarea"
-                        style={{
-                          width: "100%",
-                          minHeight: "60px",
-                          fontSize: "0.8rem",
-                          padding: "10px 12px",
-                          lineHeight: 1.4,
-                          background: "rgba(0, 0, 0, 0.2)",
-                          border: "1px solid rgba(255,255,255,0.05)",
-                          borderRadius: "4px"
-                        }}
-                      />
-                      <span style={{ fontSize: "0.68rem", color: "var(--text-muted)", marginTop: "4px", display: "block" }}>
-                        * Nếu nhập yêu cầu này, hệ thống sẽ sử dụng AI Gemini để viết lại chuyển động theo ý bạn thay vì tự động chuyển đổi từ bảng phân cảnh.
-                      </span>
-                    </div>
-                  )}
+
 
                   {/* Action panel: Generate Motion Prompts / Render Selected Videos */}
                   {projectData.shots.length > 0 && (
@@ -4737,267 +4920,410 @@ export default function Home() {
                     </div>
                   ) : (
                     <div style={{ display: "flex", flexDirection: "column", gap: "16px" }}>
-                      {projectData.shots.map((shot: any, idx) => {
-                        const shotKey = `shot_${shot.scene_number || shot.scene_id || ''}_${shot.shot_id}`;
-                        const keyframeObj = projectData.keyframes 
-                          ? projectData.keyframes.find((k: any) => k.shot_id === shot.shot_id)
-                          : null;
-                        const keyframeUrl = keyframeObj?.url || "";
-                        const hasShotImg = !!(keyframeUrl && !keyframeUrl.startsWith("mock_"));
+                      {/* Status filter tabs for videos */}
+                      <div style={{ display: "flex", gap: "8px", margin: "0 0 16px 0", flexWrap: "wrap" }}>
+                        <button
+                          onClick={() => { setVideoFilterTab("all"); setVideoCurrentPage(1); }}
+                          style={{
+                            padding: "6px 12px",
+                            borderRadius: "16px",
+                            border: videoFilterTab === "all" ? "1px solid var(--accent-cyan)" : "1px solid rgba(255,255,255,0.08)",
+                            background: videoFilterTab === "all" ? "rgba(6,182,212,0.15)" : "transparent",
+                            color: videoFilterTab === "all" ? "#06b6d4" : "var(--text-secondary)",
+                            fontSize: "0.75rem",
+                            fontWeight: 600,
+                            cursor: "pointer"
+                          }}
+                        >
+                          Tổng ({projectData.shots.length})
+                        </button>
+                        <button
+                          onClick={() => { setVideoFilterTab("success"); setVideoCurrentPage(1); }}
+                          style={{
+                            padding: "6px 12px",
+                            borderRadius: "16px",
+                            border: videoFilterTab === "success" ? "1px solid #10b981" : "1px solid rgba(255,255,255,0.08)",
+                            background: videoFilterTab === "success" ? "rgba(16,185,129,0.15)" : "transparent",
+                            color: videoFilterTab === "success" ? "#10b981" : "var(--text-secondary)",
+                            fontSize: "0.75rem",
+                            fontWeight: 600,
+                            cursor: "pointer"
+                          }}
+                        >
+                          Thành công ({projectData.shots.filter(s => getVideoStatus(s) === "success").length})
+                        </button>
+                        <button
+                          onClick={() => { setVideoFilterTab("failed"); setVideoCurrentPage(1); }}
+                          style={{
+                            padding: "6px 12px",
+                            borderRadius: "16px",
+                            border: videoFilterTab === "failed" ? "1px solid #ef4444" : "1px solid rgba(255,255,255,0.08)",
+                            background: videoFilterTab === "failed" ? "rgba(239,68,68,0.15)" : "transparent",
+                            color: videoFilterTab === "failed" ? "#ef4444" : "var(--text-secondary)",
+                            fontSize: "0.75rem",
+                            fontWeight: 600,
+                            cursor: "pointer"
+                          }}
+                        >
+                          Thất bại ({projectData.shots.filter(s => getVideoStatus(s) === "failed").length})
+                        </button>
+                        <button
+                          onClick={() => { setVideoFilterTab("none"); setVideoCurrentPage(1); }}
+                          style={{
+                            padding: "6px 12px",
+                            borderRadius: "16px",
+                            border: videoFilterTab === "none" ? "1px solid #f59e0b" : "1px solid rgba(255,255,255,0.08)",
+                            background: videoFilterTab === "none" ? "rgba(245,158,11,0.15)" : "transparent",
+                            color: videoFilterTab === "none" ? "#f59e0b" : "var(--text-secondary)",
+                            fontSize: "0.75rem",
+                            fontWeight: 600,
+                            cursor: "pointer"
+                          }}
+                        >
+                          Chưa tạo ({projectData.shots.filter(s => { const st = getVideoStatus(s); return st === "none" || st === "pending"; }).length})
+                        </button>
+                      </div>
+
+                      {(() => {
+                        const filtered = projectData.shots.filter(s => {
+                          const status = getVideoStatus(s);
+                          if (videoFilterTab === "all") return true;
+                          if (videoFilterTab === "success") return status === "success";
+                          if (videoFilterTab === "failed") return status === "failed";
+                          if (videoFilterTab === "none") return status === "none" || status === "pending";
+                          return true;
+                        });
                         
-                        // Find corresponding motion prompt by shot_id safely
-                        const motionIndex = projectData.motion_prompts 
-                          ? projectData.motion_prompts.findIndex((m: any) => m.shot_id === shot.shot_id)
-                          : -1;
-                        const motionText = motionIndex !== -1 && projectData.motion_prompts 
-                          ? projectData.motion_prompts[motionIndex].motion_description 
-                          : "";
-                        const videoUrl = motionIndex !== -1 && projectData.motion_prompts
-                          ? projectData.motion_prompts[motionIndex].video_url || ""
-                          : "";
-                        
-                        const hasVideo = !!videoUrl || mockGeneratedSegmentVideos[shotKey] || isVideoGenerated;
-                        const isGenVideo = generatingSegmentVideoKeys[shotKey];
-                        const isGenShot = generatingShotKeys[shotKey];
-                        
+                        const totalPages = Math.ceil(filtered.length / videoPageSize) || 1;
+                        const page = Math.min(videoCurrentPage, totalPages);
+                        const paginated = filtered.slice((page - 1) * videoPageSize, page * videoPageSize);
+
                         return (
-                          <div
-                            key={idx}
-                            className="glass-panel"
-                            style={{
-                              display: "grid",
-                              gridTemplateColumns: "80px 1fr 220px 220px",
-                              gap: "20px",
-                              padding: "20px",
-                              alignItems: "stretch",
-                              background: "#090e18",
-                              border: "1px solid rgba(255,255,255,0.04)"
-                            }}
-                          >
-                            {/* Column 1: Checkbox selector & ID */}
-                            <div style={{ display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", borderRight: "1px solid rgba(255,255,255,0.05)", paddingRight: "12px", gap: "6px" }}>
-                              <span style={{ fontSize: "0.68rem", color: "var(--text-muted)", fontWeight: 700, marginBottom: "2px" }}>CHỌN</span>
-                              <input
-                                type="checkbox"
-                                checked={!!selectedShots[shotKey]}
-                                onChange={(e) => {
-                                  setSelectedShots(prev => ({ ...prev, [shotKey]: e.target.checked }));
-                                }}
-                                style={{ width: "16px", height: "16px", cursor: "pointer", accentColor: "#a78bfa" }}
-                              />
-                              <span style={{ fontSize: "0.85rem", color: "#a78bfa", fontFamily: "var(--font-mono)", fontWeight: 700 }}>
-                                #{String(idx + 1).padStart(2, '0')}
-                              </span>
-                              
-                              <div style={{ display: "flex", flexDirection: "column", alignItems: "center", gap: "2px", marginTop: "6px", width: "100%" }}>
-                                <span style={{ fontSize: "0.55rem", color: "var(--text-muted)", fontWeight: 600 }}>GIÂY</span>
-                                <div style={{ display: "flex", alignItems: "center", background: "rgba(255,255,255,0.04)", border: "1px solid rgba(255,255,255,0.08)", borderRadius: "4px", padding: "2px 4px", width: "55px", justifyContent: "center" }}>
-                                  <input
-                                    type="number"
-                                    value={shot.duration_seconds || 5}
-                                    min={1}
-                                    max={8}
-                                    onChange={(e) => {
-                                      const val = Math.min(8, Math.max(1, Number(e.target.value) || 1));
-                                      const updatedShots = projectData.shots.map((s: any) => 
-                                        s.shot_id === shot.shot_id ? { ...s, duration_seconds: val } : s
-                                      );
-                                      handleUpdateStepData("shot_planner", updatedShots);
-                                    }}
-                                    style={{ width: "28px", background: "transparent", border: "none", color: "#10b981", fontSize: "0.75rem", fontWeight: "bold", textAlign: "center", outline: "none", padding: 0 }}
-                                  />
-                                  <span style={{ fontSize: "0.65rem", color: "var(--text-muted)" }}>s</span>
-                                </div>
+                          <>
+                            {paginated.length === 0 ? (
+                              <div style={{ padding: "40px", textAlign: "center", border: "1px dashed var(--border-color)", borderRadius: "8px", color: "var(--text-muted)", fontSize: "0.85rem" }}>
+                                Không tìm thấy shots nào khớp bộ lọc.
                               </div>
-                            </div>
+                            ) : (
+                              <div style={{ display: "flex", flexDirection: "column", gap: "16px" }}>
+                                {paginated.map((shot: any) => {
+                                  const idx = projectData.shots.findIndex((s: any) => s.shot_id === shot.shot_id);
+                                  const shotKey = `shot_${shot.scene_number || shot.scene_id || ''}_${shot.shot_id}`;
+                                  const keyframeObj = projectData.keyframes 
+                                    ? projectData.keyframes.find((k: any) => k.shot_id === shot.shot_id)
+                                    : null;
+                                  const keyframeUrl = keyframeObj?.url || "";
+                                  const hasShotImg = !!(keyframeUrl && !keyframeUrl.startsWith("mock_"));
+                                  
+                                  const motionIndex = projectData.motion_prompts 
+                                    ? projectData.motion_prompts.findIndex((m: any) => m.shot_id === shot.shot_id)
+                                    : -1;
+                                  const motionText = motionIndex !== -1 && projectData.motion_prompts 
+                                    ? projectData.motion_prompts[motionIndex].motion_description 
+                                    : "";
+                                  const videoUrl = motionIndex !== -1 && projectData.motion_prompts
+                                    ? projectData.motion_prompts[motionIndex].video_url || ""
+                                    : "";
+                                  
+                                  const hasVideo = !!videoUrl || mockGeneratedSegmentVideos[shotKey] || isVideoGenerated;
+                                  const isGenVideo = generatingSegmentVideoKeys[shotKey];
+                                  const isGenShot = generatingShotKeys[shotKey];
+                                  
+                                  return (
+                                    <div
+                                      key={shot.shot_id}
+                                      className="glass-panel"
+                                      style={{
+                                        display: "grid",
+                                        gridTemplateColumns: "80px 1fr 220px 220px",
+                                        gap: "20px",
+                                        padding: "20px",
+                                        alignItems: "stretch",
+                                        border: `1px solid ${selectedShots[shotKey] ? "var(--accent-purple)" : "rgba(255,255,255,0.06)"}`,
+                                        background: selectedShots[shotKey] ? "rgba(139, 92, 246, 0.03)" : "rgba(13,19,33,0.3)"
+                                      }}
+                                    >
+                                      {/* Column 1: Checkbox selector & ID */}
+                                      <div style={{ display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", borderRight: "1px solid rgba(255,255,255,0.05)", paddingRight: "12px", gap: "6px" }}>
+                                        <span style={{ fontSize: "0.68rem", color: "var(--text-muted)", fontWeight: 700, marginBottom: "2px" }}>CHỌN</span>
+                                        <input
+                                          type="checkbox"
+                                          checked={!!selectedShots[shotKey]}
+                                          onChange={(e) => {
+                                            setSelectedShots(prev => ({ ...prev, [shotKey]: e.target.checked }));
+                                          }}
+                                          style={{ width: "16px", height: "16px", cursor: "pointer", accentColor: "#a78bfa" }}
+                                        />
+                                        <span style={{ fontSize: "0.85rem", color: "#a78bfa", fontFamily: "var(--font-mono)", fontWeight: 700 }}>
+                                          #{String(idx + 1).padStart(2, '0')}
+                                        </span>
+                                        
+                                        <div style={{ display: "flex", flexDirection: "column", alignItems: "center", gap: "2px", marginTop: "6px", width: "100%" }}>
+                                          <span style={{ fontSize: "0.55rem", color: "var(--text-muted)", fontWeight: 600 }}>GIÂY</span>
+                                          <div style={{ display: "flex", alignItems: "center", background: "rgba(255,255,255,0.04)", border: "1px solid rgba(255,255,255,0.08)", borderRadius: "4px", padding: "2px 4px", width: "55px", justifyContent: "center" }}>
+                                            <input
+                                              type="number"
+                                              value={shot.duration_seconds || 5}
+                                              min={1}
+                                              max={8}
+                                              onChange={(e) => {
+                                                const val = Math.min(8, Math.max(1, Number(e.target.value) || 1));
+                                                const updatedShots = projectData.shots.map((s: any) => 
+                                                  s.shot_id === shot.shot_id ? { ...s, duration_seconds: val } : s
+                                                );
+                                                handleUpdateStepData("shot_planner", updatedShots);
+                                              }}
+                                              style={{ width: "28px", background: "transparent", border: "none", color: "#10b981", fontSize: "0.75rem", fontWeight: "bold", textAlign: "center", outline: "none", padding: 0 }}
+                                            />
+                                            <span style={{ fontSize: "0.65rem", color: "var(--text-muted)" }}>s</span>
+                                          </div>
+                                        </div>
+                                      </div>
 
-                            {/* Column 2: Motion Prompt Description */}
-                            <div style={{ display: "flex", flexDirection: "column", gap: "6px" }}>
-                              <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
-                                <span style={{ fontSize: "0.7rem", color: "var(--text-muted)", fontWeight: 700 }}>
-                                  MÔ TẢ CHUYỂN ĐỘNG (MOTION PROMPT)
-                                </span>
-                                <span style={{ color: "#a78bfa", fontSize: "0.75rem", fontWeight: 700, fontFamily: "var(--font-mono)" }}>
-                                  Scene {shot.scene_id} - Shot {String(shot.shot_id).replace('Shot', '')}
-                                </span>
-                              </div>
-                              <textarea
-                                value={motionText}
-                                onChange={(e) => {
-                                  if (motionIndex !== -1 && projectData.motion_prompts) {
-                                    const updated = [...projectData.motion_prompts];
-                                    updated[motionIndex].motion_description = e.target.value;
-                                    handleUpdateStepData("motion_generator", updated);
-                                  } else {
-                                    const updated = [...(projectData.motion_prompts || []), {
-                                      shot_id: shot.shot_id,
-                                      motion_description: e.target.value,
-                                      speed_profile: "Medium"
-                                    }];
-                                    handleUpdateStepData("motion_generator", updated);
-                                  }
-                                }}
-                                placeholder="Nhập mô tả chuyển động camera & nhân vật..."
-                                className="custom-textarea"
-                                style={{
-                                  flexGrow: 1,
-                                  minHeight: "80px",
-                                  fontSize: "0.8rem",
-                                  padding: "8px 12px",
-                                  lineHeight: 1.4,
-                                  background: "rgba(0, 0, 0, 0.2)",
-                                  border: "1px solid rgba(255,255,255,0.05)"
-                                }}
-                              />
-                            </div>
+                                      {/* Column 2: Motion Prompt Description */}
+                                      <div style={{ display: "flex", flexDirection: "column", gap: "6px" }}>
+                                        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+                                          <span style={{ fontSize: "0.7rem", color: "var(--text-muted)", fontWeight: 700 }}>
+                                            MÔ TẢ CHUYỂN ĐỘNG (MOTION PROMPT)
+                                          </span>
+                                          <span style={{ color: "#a78bfa", fontSize: "0.75rem", fontWeight: 700, fontFamily: "var(--font-mono)" }}>
+                                            Scene {shot.scene_id} - Shot {String(shot.shot_id).replace('Shot', '')}
+                                          </span>
+                                        </div>
+                                        <textarea
+                                          value={motionText}
+                                          onChange={(e) => {
+                                            if (motionIndex !== -1 && projectData.motion_prompts) {
+                                              const updated = [...projectData.motion_prompts];
+                                              updated[motionIndex].motion_description = e.target.value;
+                                              handleUpdateStepData("motion_generator", updated);
+                                            } else {
+                                              const updated = [...(projectData.motion_prompts || []), {
+                                                shot_id: shot.shot_id,
+                                                motion_description: e.target.value,
+                                                speed_profile: "Medium"
+                                              }];
+                                              handleUpdateStepData("motion_generator", updated);
+                                            }
+                                          }}
+                                          placeholder="Nhập mô tả chuyển động camera & nhân vật..."
+                                          className="custom-textarea"
+                                          style={{
+                                            flexGrow: 1,
+                                            minHeight: "80px",
+                                            fontSize: "0.8rem",
+                                            padding: "8px 12px",
+                                            lineHeight: 1.4,
+                                            background: "rgba(0, 0, 0, 0.2)",
+                                            border: "1px solid rgba(255,255,255,0.05)"
+                                          }}
+                                        />
+                                      </div>
 
-                            {/* Column 3: Reference Shot Image */}
-                            <div style={{ display: "flex", flexDirection: "column", gap: "6px" }}>
-                              <span style={{ fontSize: "0.7rem", color: "var(--text-muted)", fontWeight: 700 }}>
-                                ẢNH SHOTS THAM CHIẾU
-                              </span>
-                              <div
-                                style={{
-                                  flexGrow: 1,
-                                  aspectRatio: "16/10",
-                                  background: "#060910",
-                                  borderRadius: "4px",
-                                  overflow: "hidden",
-                                  display: "flex",
-                                  alignItems: "center",
-                                  justifyContent: "center",
-                                  position: "relative"
-                                }}
-                              >
-                                {hasShotImg ? (
-                                  <div style={{ width: "100%", height: "100%", position: "relative" }}>
-                                    <img
-                                      src={keyframeUrl}
-                                      alt={`Scene ${shot.scene_id} - Shot ${shot.shot_id}`}
-                                      style={{ width: "100%", height: "100%", objectFit: "cover" }}
-                                    />
-                                    {renderImageActionToolbar(keyframeUrl, `shot_${shot.shot_id}.png`)}
-                                  </div>
-                                ) : (
-                                  <div style={{ display: "flex", flexDirection: "column", alignItems: "center", gap: "4px" }}>
-                                    {isGenShot ? (
-                                      renderMediaLoader(isGenShot, "Vẽ ảnh...")
-                                    ) : (
-                                      <>
-                                        <span style={{ fontSize: "1.2rem" }}>🖼️</span>
-                                        <span style={{ fontSize: "0.65rem", color: "var(--text-muted)", fontWeight: 500 }}>Chưa tạo ảnh</span>
-                                      </>
-                                    )}
-                                  </div>
-                                )}
-                              </div>
-                              <button
-                                onClick={() => {
-                                  if (hasShotImg) {
-                                    setFullscreenImageUrl(keyframeUrl);
-                                  }
-                                }}
-                                disabled={!hasShotImg}
-                                className="btn-secondary"
-                                style={{
-                                  width: "100%",
-                                  padding: "4px 8px",
-                                  fontSize: "0.7rem",
-                                  display: "flex",
-                                  alignItems: "center",
-                                  justifyContent: "center",
-                                  gap: "4px",
-                                  opacity: hasShotImg ? 1 : 0.4,
-                                  cursor: hasShotImg ? "pointer" : "not-allowed"
-                                }}
-                              >
-                                <svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5">
-                                  <circle cx="11" cy="11" r="8"/>
-                                  <line x1="21" y1="21" x2="16.65" y2="16.65"/>
-                                </svg>
-                                Xem ảnh Shots
-                              </button>
-                            </div>
+                                      {/* Column 3: Reference Shot Image */}
+                                      <div style={{ display: "flex", flexDirection: "column", gap: "6px" }}>
+                                        <span style={{ fontSize: "0.7rem", color: "var(--text-muted)", fontWeight: 700 }}>
+                                          ẢNH SHOTS THAM CHIẾU
+                                        </span>
+                                        <div
+                                          style={{
+                                            flexGrow: 1,
+                                            aspectRatio: "16/10",
+                                            background: "#060910",
+                                            borderRadius: "4px",
+                                            overflow: "hidden",
+                                            display: "flex",
+                                            alignItems: "center",
+                                            justifyContent: "center",
+                                            position: "relative"
+                                          }}
+                                        >
+                                          {hasShotImg ? (
+                                            <div style={{ width: "100%", height: "100%", position: "relative" }}>
+                                              <img
+                                                src={keyframeUrl}
+                                                alt={`Scene ${shot.scene_id} - Shot ${shot.shot_id}`}
+                                                style={{ width: "100%", height: "100%", objectFit: "cover" }}
+                                              />
+                                              {renderImageActionToolbar(keyframeUrl, `shot_${shot.shot_id}.png`)}
+                                            </div>
+                                          ) : (
+                                            <div style={{ display: "flex", flexDirection: "column", alignItems: "center", gap: "4px" }}>
+                                              {isGenShot ? (
+                                                renderMediaLoader(isGenShot, "Vẽ ảnh...")
+                                              ) : (
+                                                <>
+                                                  <span style={{ fontSize: "1.2rem" }}>🖼️</span>
+                                                  <span style={{ fontSize: "0.65rem", color: "var(--text-muted)", fontWeight: 500 }}>Chưa tạo ảnh</span>
+                                                </>
+                                              )}
+                                            </div>
+                                          )}
+                                        </div>
+                                        <button
+                                          onClick={() => {
+                                            if (hasShotImg) {
+                                              setFullscreenImageUrl(keyframeUrl);
+                                            }
+                                          }}
+                                          disabled={!hasShotImg}
+                                          className="btn-secondary"
+                                          style={{
+                                            width: "100%",
+                                            padding: "4px 8px",
+                                            fontSize: "0.7rem",
+                                            display: "flex",
+                                            alignItems: "center",
+                                            justifyContent: "center",
+                                            gap: "4px",
+                                            opacity: hasShotImg ? 1 : 0.4,
+                                            cursor: hasShotImg ? "pointer" : "not-allowed"
+                                          }}
+                                        >
+                                          <svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5">
+                                            <circle cx="11" cy="11" r="8"/>
+                                            <line x1="21" y1="21" x2="16.65" y2="16.65"/>
+                                          </svg>
+                                          Xem ảnh Shots
+                                        </button>
+                                      </div>
 
-                            {/* Column 4: Resulting Video */}
-                            <div style={{ display: "flex", flexDirection: "column", gap: "6px" }}>
-                              <span style={{ fontSize: "0.7rem", color: "var(--text-muted)", fontWeight: 700 }}>
-                                VIDEO KẾT QUẢ
-                              </span>
-                              <div
-                                style={{
-                                  flexGrow: 1,
-                                  aspectRatio: "16/10",
-                                  background: "#060910",
-                                  borderRadius: "4px",
-                                  overflow: "hidden",
-                                  border: "1px solid rgba(255,255,255,0.04)",
-                                  display: "flex",
-                                  alignItems: "center",
-                                  justifyContent: "center"
-                                }}
-                              >
-                                {isGenVideo ? (
-                                  renderMediaLoader(isGenVideo, "Rendering...")
-                                ) : hasVideo ? (
-                                  <video
-                                    src={videoUrl || "https://assets.mixkit.co/videos/preview/mixkit-beautiful-aerial-view-of-forest-and-mountains-42646-large.mp4"}
-                                    controls
-                                    style={{ width: "100%", height: "100%", objectFit: "cover" }}
-                                  />
-                                ) : (
-                                  <div style={{ display: "flex", flexDirection: "column", alignItems: "center", gap: "4px" }}>
-                                    <span style={{ fontSize: "1.2rem" }}>🎬</span>
-                                    <span style={{ fontSize: "0.65rem", color: "var(--text-muted)" }}>Chưa tạo video</span>
-                                  </div>
-                                )}
+                                      {/* Column 4: Video segment control */}
+                                      <div style={{ display: "flex", flexDirection: "column", gap: "6px" }}>
+                                        <span style={{ fontSize: "0.7rem", color: "var(--text-muted)", fontWeight: 700 }}>
+                                          VIDEO KẾT QUẢ
+                                        </span>
+                                        <div
+                                          style={{
+                                            flexGrow: 1,
+                                            aspectRatio: "16/10",
+                                            background: "#060910",
+                                            borderRadius: "4px",
+                                            overflow: "hidden",
+                                            display: "flex",
+                                            alignItems: "center",
+                                            justifyContent: "center",
+                                            position: "relative"
+                                          }}
+                                        >
+                                          {isGenVideo ? (
+                                            renderMediaLoader(isGenVideo, "Rendering...")
+                                          ) : hasVideo ? (
+                                            <video
+                                              src={videoUrl || "https://assets.mixkit.co/videos/preview/mixkit-beautiful-aerial-view-of-forest-and-mountains-42646-large.mp4"}
+                                              controls
+                                              style={{ width: "100%", height: "100%", objectFit: "cover" }}
+                                            />
+                                          ) : (
+                                            <div style={{ display: "flex", flexDirection: "column", alignItems: "center", gap: "4px" }}>
+                                              <span style={{ fontSize: "1.2rem" }}>🎬</span>
+                                              <span style={{ fontSize: "0.65rem", color: "var(--text-muted)" }}>Chưa tạo video</span>
+                                            </div>
+                                          )}
+                                        </div>
+                                        <div style={{ display: "flex", gap: "4px" }}>
+                                          <button
+                                            onClick={() => triggerGenerateSegmentVideo(shotKey)}
+                                            disabled={!!isGenVideo || activeStep !== null || isRunningAll}
+                                            className="btn-secondary"
+                                            style={{
+                                              flexGrow: 1,
+                                              padding: "4px 8px",
+                                              fontSize: "0.7rem",
+                                              display: "flex",
+                                              alignItems: "center",
+                                              justifyContent: "center",
+                                              gap: "4px"
+                                            }}
+                                          >
+                                            <svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5">
+                                              <path d="M21.5 2v6h-6M21.34 15.57a10 10 0 1 1-.57-8.38l5.67-5.67"/>
+                                            </svg>
+                                            Tạo lại video
+                                          </button>
+                                          <button
+                                            onClick={() => {
+                                              if (hasVideo) {
+                                                alert(`Đang tải video của phân cảnh #${String(shot.scene_number || shot.scene_id || '').padStart(2, '0')}...`);
+                                              } else {
+                                                alert("Vui lòng tạo video trước.");
+                                              }
+                                            }}
+                                            className="btn-secondary"
+                                            style={{
+                                              width: "32px",
+                                              padding: "4px",
+                                              display: "flex",
+                                              alignItems: "center",
+                                              justifyContent: "center"
+                                            }}
+                                          >
+                                            <svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5">
+                                              <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4M7 10l5 5 5-5M12 15V3"/>
+                                            </svg>
+                                          </button>
+                                        </div>
+                                      </div>
+                                    </div>
+                                  );
+                                })}
                               </div>
-                              <div style={{ display: "flex", gap: "4px" }}>
+                            )}
+
+                            {/* Pagination controls */}
+                            <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginTop: "16px", padding: "12px", background: "rgba(255,255,255,0.02)", border: "1px solid rgba(255,255,255,0.05)", borderRadius: "8px" }}>
+                              <div style={{ display: "flex", alignItems: "center", gap: "8px" }}>
+                                <span style={{ fontSize: "0.75rem", color: "var(--text-secondary)" }}>Mỗi trang:</span>
+                                <select
+                                  value={videoPageSize}
+                                  onChange={(e) => { setVideoPageSize(Number(e.target.value)); setVideoCurrentPage(1); }}
+                                  style={{ padding: "4px 8px", background: "#0c101d", border: "1px solid rgba(255,255,255,0.08)", borderRadius: "4px", fontSize: "0.75rem", color: "#ffffff" }}
+                                >
+                                  <option value={30}>30</option>
+                                  <option value={50}>50</option>
+                                  <option value={100}>100</option>
+                                </select>
+                              </div>
+
+                              <div style={{ display: "flex", alignItems: "center", gap: "10px" }}>
                                 <button
-                                  onClick={() => triggerGenerateSegmentVideo(shotKey)}
-                                  disabled={!!isGenVideo || activeStep !== null || isRunningAll}
-                                  className="btn-secondary"
+                                  disabled={page === 1}
+                                  onClick={() => setVideoCurrentPage(prev => Math.max(1, prev - 1))}
                                   style={{
-                                    flexGrow: 1,
-                                    padding: "4px 8px",
-                                    fontSize: "0.7rem",
-                                    display: "flex",
-                                    alignItems: "center",
-                                    justifyContent: "center",
-                                    gap: "4px"
+                                    padding: "4px 10px",
+                                    borderRadius: "4px",
+                                    background: page === 1 ? "rgba(255,255,255,0.02)" : "rgba(255,255,255,0.08)",
+                                    border: "1px solid rgba(255,255,255,0.05)",
+                                    color: page === 1 ? "var(--text-muted)" : "#ffffff",
+                                    fontSize: "0.75rem",
+                                    cursor: page === 1 ? "not-allowed" : "pointer"
                                   }}
                                 >
-                                  <svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5">
-                                    <path d="M21.5 2v6h-6M21.34 15.57a10 10 0 1 1-.57-8.38l5.67-5.67"/>
-                                  </svg>
-                                  Tạo lại video
+                                  Trước
                                 </button>
+                                <span style={{ fontSize: "0.75rem", color: "var(--text-secondary)", fontFamily: "var(--font-mono)" }}>
+                                  Trang {page} / {totalPages}
+                                </span>
                                 <button
-                                  onClick={() => {
-                                    if (hasVideo) {
-                                      alert(`Đang tải video của phân cảnh #${String(shot.scene_number || shot.scene_id || '').padStart(2, '0')}...`);
-                                    } else {
-                                      alert("Vui lòng tạo video trước.");
-                                    }
-                                  }}
-                                  className="btn-secondary"
+                                  disabled={page === totalPages}
+                                  onClick={() => setVideoCurrentPage(prev => Math.min(totalPages, prev + 1))}
                                   style={{
-                                    width: "32px",
-                                    padding: "4px",
-                                    display: "flex",
-                                    alignItems: "center",
-                                    justifyContent: "center"
+                                    padding: "4px 10px",
+                                    borderRadius: "4px",
+                                    background: page === totalPages ? "rgba(255,255,255,0.02)" : "rgba(255,255,255,0.08)",
+                                    border: "1px solid rgba(255,255,255,0.05)",
+                                    color: page === totalPages ? "var(--text-muted)" : "#ffffff",
+                                    fontSize: "0.75rem",
+                                    cursor: page === totalPages ? "not-allowed" : "pointer"
                                   }}
                                 >
-                                  <svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5">
-                                    <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4M7 10l5 5 5-5M12 15V3"/>
-                                  </svg>
+                                  Sau
                                 </button>
                               </div>
                             </div>
-                          </div>
+                          </>
                         );
-                      })}
+                      })()}
                     </div>
                   )}
                 </div>
@@ -5439,7 +5765,7 @@ export default function Home() {
                       </div>
 
                       <button
-                        onClick={startVideoRendering}
+                        onClick={prepareVideoRendering}
                         disabled={isRenderingVideo || projectData.shots.length === 0}
                         className="btn-primary"
                         style={{
@@ -5821,6 +6147,11 @@ export default function Home() {
                 setVideoConcurrency(val);
                 localStorage.setItem("local_video_concurrency", val.toString());
               }}
+              mediaDelaySeconds={mediaDelaySeconds}
+              onChangeMediaDelaySeconds={(val) => {
+                setMediaDelaySeconds(val);
+                localStorage.setItem("local_media_delay_seconds", val.toString());
+              }}
             />
 
             <div style={{ borderTop: "1px solid rgba(255,255,255,0.08)", paddingTop: "12px", display: "flex", justifyContent: "flex-end" }}>
@@ -5900,6 +6231,208 @@ export default function Home() {
               >
                 Xác nhận
               </button>
+            </div>
+          </div>
+        </div>
+      )}
+      {/* Video Rendering Progress & Verification Modal */}
+      {isRenderModalOpen && (
+        <div className="modal-overlay" style={{ display: "flex", justifyContent: "center", alignItems: "center" }}>
+          <div className="modal-content" onClick={(e) => e.stopPropagation()} style={{ maxWidth: "680px", width: "95%", display: "flex", flexDirection: "column", maxHeight: "90vh", background: "#0b0f19", border: "1px solid rgba(139, 92, 246, 0.25)", padding: "24px", borderRadius: "12px", boxShadow: "0 10px 30px rgba(0,0,0,0.5)" }}>
+            
+            {/* Modal Header */}
+            <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", borderBottom: "1px solid rgba(255,255,255,0.08)", paddingBottom: "14px", marginBottom: "18px" }}>
+              <h3 style={{ fontSize: "1.1rem", fontWeight: 800, color: "#ffffff", display: "flex", alignItems: "center", gap: "8px" }}>
+                <span>🎬 XUẤT PHIM MP4 HOÀN CHỈNH</span>
+              </h3>
+              <button
+                onClick={() => {
+                  if (isRenderingVideo) {
+                    if (!confirm("Tiến trình render đang chạy. Bạn có chắc muốn đóng và chạy ẩn không?")) return;
+                  }
+                  setIsRenderModalOpen(false);
+                }}
+                style={{ background: "transparent", border: "none", color: "var(--text-secondary)", fontSize: "1.1rem", cursor: "pointer" }}
+              >
+                ✕
+              </button>
+            </div>
+
+            {/* Modal Content */}
+            <div style={{ display: "flex", flexDirection: "column", gap: "16px", flexGrow: 1, overflowY: "auto", paddingRight: "4px" }}>
+              
+              {/* PC Location Info */}
+              <div style={{ background: "rgba(255,255,255,0.02)", border: "1px solid rgba(255,255,255,0.06)", borderRadius: "8px", padding: "10px 14px", fontSize: "0.8rem", color: "var(--text-secondary)" }}>
+                <span>📁 Thư mục lưu trữ: </span>
+                <strong style={{ color: "#ffffff", fontFamily: "monospace" }}>{projectData.pcDirectory}</strong>
+              </div>
+
+              {/* Missing Videos summary listing */}
+              {renderShotsStatus.filter(s => !s.hasVideo).length > 0 && (
+                <div style={{ background: "rgba(239, 68, 68, 0.08)", border: "1px solid rgba(239, 68, 68, 0.25)", borderRadius: "8px", padding: "12px 16px", display: "flex", flexDirection: "column", gap: "6px" }}>
+                  <span style={{ color: "#f87171", fontSize: "0.82rem", fontWeight: 700, display: "flex", alignItems: "center", gap: "6px" }}>
+                    ⚠️ DANH SÁCH CÁC PHÂN CẢNH BỊ THIẾU VIDEO SEGMENT ({renderShotsStatus.filter(s => !s.hasVideo).length} shots):
+                  </span>
+                  <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fill, minmax(130px, 1fr))", gap: "8px", maxHeight: "100px", overflowY: "auto", marginTop: "4px" }}>
+                    {renderShotsStatus.filter(s => !s.hasVideo).map((shot, idx) => (
+                      <div key={idx} style={{ background: "rgba(0,0,0,0.3)", border: "1px solid rgba(239, 68, 68, 0.2)", padding: "5px 8px", borderRadius: "4px", fontSize: "0.72rem", color: "#f87171" }}>
+                        <strong>{idx + 1}.</strong> {shot.shot_id}
+                      </div>
+                    ))}
+                  </div>
+                </div>
+              )}
+
+              {/* Status Table / List */}
+              <div style={{ display: "flex", flexDirection: "column", gap: "8px" }}>
+                <span style={{ fontSize: "0.8rem", fontWeight: 700, color: "var(--text-primary)" }}>
+                  Tài nguyên phân cảnh ({renderShotsStatus.length} Shots)
+                </span>
+                
+                <div style={{ maxHeight: "180px", overflowY: "auto", border: "1px solid rgba(255,255,255,0.08)", borderRadius: "8px", background: "rgba(0,0,0,0.2)" }}>
+                  <table style={{ width: "100%", borderCollapse: "collapse", fontSize: "0.75rem", textAlign: "left" }}>
+                    <thead>
+                      <tr style={{ background: "rgba(255,255,255,0.04)", borderBottom: "1px solid rgba(255,255,255,0.08)" }}>
+                        <th style={{ padding: "8px 12px", color: "var(--text-secondary)" }}>Phân Cảnh</th>
+                        <th style={{ padding: "8px 12px", color: "var(--text-secondary)" }}>Thời lượng</th>
+                        <th style={{ padding: "8px 12px", color: "var(--text-secondary)" }}>Bối Cảnh</th>
+                        <th style={{ padding: "8px 12px", color: "var(--text-secondary)" }}>Tập Tin</th>
+                        <th style={{ padding: "8px 12px", color: "var(--text-secondary)" }}>Trạng Thái</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {renderShotsStatus.map((shot, i) => (
+                        <tr key={i} style={{ borderBottom: "1px solid rgba(255,255,255,0.04)", background: i % 2 === 0 ? "rgba(255,255,255,0.01)" : "transparent" }}>
+                          <td style={{ padding: "8px 12px", fontWeight: 700 }}>{shot.shot_id}</td>
+                          <td style={{ padding: "8px 12px" }}>{shot.duration}s</td>
+                          <td style={{ padding: "8px 12px", color: "var(--text-secondary)" }}>{shot.environment}</td>
+                          <td style={{ padding: "8px 12px", fontFamily: "monospace", color: shot.hasVideo ? "#34d399" : "var(--text-muted)" }}>{shot.fileName}</td>
+                          <td style={{ padding: "8px 12px" }}>
+                            {shot.hasVideo ? (
+                              <span style={{ color: "#10b981", fontWeight: 600 }}>✓ Sẵn sàng</span>
+                            ) : (
+                              <span style={{ color: "#ef4444", fontWeight: 600 }}>✗ Thiếu</span>
+                            )}
+                          </td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </div>
+              </div>
+
+              {/* Warnings / Resolution Selector */}
+              {!isRenderingVideo && (
+                <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", background: "rgba(124, 58, 237, 0.05)", border: "1px solid rgba(124, 58, 237, 0.15)", borderRadius: "8px", padding: "12px 16px" }}>
+                  <div style={{ display: "flex", gap: "24px", alignItems: "center" }}>
+                    <div style={{ display: "flex", flexDirection: "column", gap: "4px" }}>
+                      <span style={{ fontSize: "0.8rem", fontWeight: 700, color: "#ffffff" }}>Độ phân giải video xuất</span>
+                      <select
+                        className="custom-select"
+                        value={videoResolution}
+                        onChange={(e) => setVideoResolution(e.target.value)}
+                        style={{ padding: "6px 10px", background: "rgba(0,0,0,0.3)", border: "1px solid rgba(255,255,255,0.1)", borderRadius: "6px", fontSize: "0.8rem", color: "#ffffff" }}
+                      >
+                        <option value="1080">Full HD (1920x1080) - Chất lượng cao</option>
+                        <option value="720">HD (1280x720) - Khuyên dùng</option>
+                        <option value="360">SD (640x360) - Tốc độ nhanh</option>
+                      </select>
+                    </div>
+
+                    <div style={{ display: "flex", alignItems: "center", gap: "8px", marginTop: "16px" }}>
+                      <input
+                        type="checkbox"
+                        id="burnSubtitleCheckbox"
+                        checked={burnSubtitle}
+                        onChange={(e) => setBurnSubtitle(e.target.checked)}
+                        style={{ width: "16px", height: "16px", cursor: "pointer", accentColor: "#7c3aed" }}
+                      />
+                      <label htmlFor="burnSubtitleCheckbox" style={{ fontSize: "0.8rem", fontWeight: 600, color: "#ffffff", cursor: "pointer", userSelect: "none" }}>
+                        Ghi đè phụ đề (Burn Subtitles)
+                      </label>
+                    </div>
+                  </div>
+                  
+                  {renderShotsStatus.some(s => !s.hasVideo) && (
+                    <span style={{ color: "#f87171", fontSize: "0.75rem", fontWeight: 600, maxWidth: "300px", textAlign: "right" }}>
+                      ⚠️ Không thể render do thiếu video segment. Vui lòng sinh video cho các phân cảnh bị thiếu.
+                    </span>
+                  )}
+                </div>
+              )}
+
+              {/* Progress & Live Console Logs */}
+              {(isRenderingVideo || renderLogs.length > 0) && (
+                <div style={{ display: "flex", flexDirection: "column", gap: "8px", borderTop: "1px solid rgba(255,255,255,0.08)", paddingTop: "16px" }}>
+                  <div style={{ display: "flex", justifyContent: "space-between", fontSize: "0.8rem", fontWeight: 600 }}>
+                    <span style={{ color: "#a78bfa" }}>
+                      {isRenderingVideo ? "⚡ Đang xử lý biên dịch phim..." : "✓ Tiến trình hoàn tất!"}
+                    </span>
+                    <span style={{ color: "#ffffff" }}>{videoRenderPercent}%</span>
+                  </div>
+                  
+                  {/* Progress Bar */}
+                  <div style={{ width: "100%", height: "8px", background: "rgba(255,255,255,0.06)", borderRadius: "4px", overflow: "hidden" }}>
+                    <div style={{ width: `${videoRenderPercent}%`, height: "100%", background: "linear-gradient(90deg, #7c3aed, #db2777)", transition: "width 0.2s ease" }} />
+                  </div>
+
+                  {/* Console Log Display */}
+                  <span style={{ fontSize: "0.72rem", color: "var(--text-muted)", marginTop: "4px" }}>
+                    NHẬT KÝ CHI TIẾT (LIVE RENDER CONSOLE)
+                  </span>
+                  <div style={{ background: "#05070c", border: "1px solid rgba(255,255,255,0.08)", borderRadius: "8px", padding: "12px", height: "140px", overflowY: "auto", fontFamily: "monospace", fontSize: "0.7rem", color: "#10b981", display: "flex", flexDirection: "column", gap: "4px" }}>
+                    {renderLogs.map((log, idx) => (
+                      <div key={idx} style={{ color: log.startsWith("❌") ? "#f87171" : log.startsWith("✓") ? "#34d399" : "#10b981" }}>
+                        &gt; {log}
+                      </div>
+                    ))}
+                    {isRenderingVideo && (
+                      <div style={{ color: "#a78bfa", display: "flex", alignItems: "center", gap: "6px" }}>
+                        <span className="pulse-dot" style={{ background: "#a78bfa", width: "6px", height: "6px" }} />
+                        <span>Đang xử lý: {videoRenderStage}...</span>
+                      </div>
+                    )}
+                  </div>
+                </div>
+              )}
+            </div>
+
+            {/* Modal Actions */}
+            <div style={{ display: "flex", gap: "12px", justifyContent: "flex-end", borderTop: "1px solid rgba(255,255,255,0.08)", paddingTop: "14px", marginTop: "18px" }}>
+              <button
+                onClick={() => setIsRenderModalOpen(false)}
+                className="btn-secondary"
+                disabled={isRenderingVideo}
+                style={{ padding: "8px 18px", fontSize: "0.8rem", borderRadius: "6px" }}
+              >
+                Đóng
+              </button>
+              
+              {!isRenderingVideo && !isVideoGenerated && (
+                <button
+                  onClick={executeVideoRendering}
+                  disabled={renderShotsStatus.some(s => !s.hasVideo)}
+                  className="btn-primary"
+                  style={{
+                    padding: "8px 20px",
+                    fontSize: "0.8rem",
+                    borderRadius: "6px",
+                    fontWeight: 700,
+                    background: renderShotsStatus.some(s => !s.hasVideo) ? "rgba(255,255,255,0.05)" : "linear-gradient(135deg, #7c3aed, #db2777)",
+                    cursor: renderShotsStatus.some(s => !s.hasVideo) ? "not-allowed" : "pointer",
+                    border: "none",
+                    color: renderShotsStatus.some(s => !s.hasVideo) ? "rgba(255,255,255,0.2)" : "#ffffff"
+                  }}
+                >
+                  🚀 Bắt đầu render
+                </button>
+              )}
+              
+              {isVideoGenerated && !isRenderingVideo && (
+                <span style={{ color: "#34d399", fontSize: "0.8rem", fontWeight: 600, display: "flex", alignItems: "center" }}>
+                  ✓ Đã tạo phim thành công!
+                </span>
+              )}
             </div>
           </div>
         </div>

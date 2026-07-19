@@ -31,6 +31,7 @@ from pipeline import (
     run_keyframe_prompt_generator,
     run_motion_prompt_generator
 )
+from gemini_client import input_tokens_var, output_tokens_var
 
 # AI Kids Animation Studio API Startup Reloaded Final V2
 app = FastAPI(title="AI Kids Animation Studio API")
@@ -108,59 +109,84 @@ def read_root():
 @app.post("/api/analyze-story", response_model=StoryAnalysisResponse)
 async def analyze_story(req: PipelineRequest):
     try:
-        return await run_story_analyzer(req.storyboard, req.api_keys, req.model, req.rpm_limit)
+        input_tokens_var.set(0)
+        output_tokens_var.set(0)
+        res = await run_story_analyzer(req.storyboard, req.api_keys, req.model, req.rpm_limit)
+        res.input_tokens = input_tokens_var.get()
+        res.output_tokens = output_tokens_var.get()
+        return res
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.post("/api/extract-assets", response_model=AssetsResponse)
 async def extract_assets(req: AssetsRequest):
     try:
+        input_tokens_var.set(0)
+        output_tokens_var.set(0)
         scenes_json = json.dumps([s.model_dump() for s in req.scenes], ensure_ascii=False)
-        return await run_assets_extractor(
+        res = await run_assets_extractor(
             req.storyboard, scenes_json, req.api_keys, req.model, req.rpm_limit, req.chunk_size
         )
+        res.input_tokens = input_tokens_var.get()
+        res.output_tokens = output_tokens_var.get()
+        return res
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.post("/api/plan-shots", response_model=ShotPlannerResponse)
 async def plan_shots(req: ShotsRequest):
     try:
+        input_tokens_var.set(0)
+        output_tokens_var.set(0)
         scenes_json = json.dumps([s.model_dump() for s in req.scenes], ensure_ascii=False)
         characters_json = json.dumps([c.model_dump() for c in req.characters], ensure_ascii=False)
         environments_json = json.dumps([e.model_dump() for e in req.environments], ensure_ascii=False)
         props_json = json.dumps([p.model_dump() for p in req.props], ensure_ascii=False)
         
-        return await run_shot_planner(
+        res = await run_shot_planner(
             scenes_json, characters_json, environments_json, props_json, req.api_keys, req.model, req.rpm_limit, req.chunk_size, req.storyboard
         )
+        res.input_tokens = input_tokens_var.get()
+        res.output_tokens = output_tokens_var.get()
+        return res
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.post("/api/generate-keyframes", response_model=KeyframePromptResponse)
 async def generate_keyframes(req: KeyframesRequest):
     try:
+        input_tokens_var.set(0)
+        output_tokens_var.set(0)
         shots_json = json.dumps([s.model_dump() for s in req.shots], ensure_ascii=False)
         characters_json = json.dumps([c.model_dump() for c in req.characters], ensure_ascii=False)
         environments_json = json.dumps([e.model_dump() for e in req.environments], ensure_ascii=False)
         props_json = json.dumps([p.model_dump() for p in req.props], ensure_ascii=False)
         
-        return await run_keyframe_prompt_generator(
+        res = await run_keyframe_prompt_generator(
             shots_json, characters_json, environments_json, props_json, req.api_keys, req.model, req.rpm_limit, req.chunk_size
         )
+        res.input_tokens = input_tokens_var.get()
+        res.output_tokens = output_tokens_var.get()
+        return res
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.post("/api/generate-motion", response_model=MotionPromptResponse)
 async def generate_motion(req: MotionRequest):
     try:
+        input_tokens_var.set(0)
+        output_tokens_var.set(0)
         shots_json = json.dumps([s.model_dump() for s in req.shots], ensure_ascii=False)
         characters_json = json.dumps([c.model_dump() for c in req.characters], ensure_ascii=False)
         environments_json = json.dumps([e.model_dump() for e in req.environments], ensure_ascii=False)
         props_json = json.dumps([p.model_dump() for p in req.props], ensure_ascii=False)
         
-        return await run_motion_prompt_generator(
+        res = await run_motion_prompt_generator(
             req.storyboard, shots_json, characters_json, environments_json, props_json, req.api_keys, req.model, req.rpm_limit, req.chunk_size, req.custom_instructions
         )
+        res.input_tokens = input_tokens_var.get()
+        res.output_tokens = output_tokens_var.get()
+        return res
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
@@ -175,10 +201,15 @@ class FullPipelineResponse(BaseModel):
     shots: List[Shot]
     keyframes: List[ShotKeyframePrompt]
     motion_prompts: List[ShotMotionPrompt]
+    input_tokens: Optional[int] = 0
+    output_tokens: Optional[int] = 0
 
 @app.post("/api/run-full-pipeline", response_model=FullPipelineResponse)
 async def run_full_pipeline(req: PipelineRequest):
     try:
+        input_tokens_var.set(0)
+        output_tokens_var.set(0)
+        
         # Step 1: Story Analyzer
         storyboard = req.storyboard
         scenes_resp = await run_story_analyzer(storyboard, req.api_keys, req.model, req.rpm_limit)
@@ -222,7 +253,9 @@ async def run_full_pipeline(req: PipelineRequest):
             props=props,
             shots=shots,
             keyframes=keyframes,
-            motion_prompts=motion_prompts
+            motion_prompts=motion_prompts,
+            input_tokens=input_tokens_var.get(),
+            output_tokens=output_tokens_var.get()
         )
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))

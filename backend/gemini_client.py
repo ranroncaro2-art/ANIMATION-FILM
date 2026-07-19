@@ -3,11 +3,16 @@ import json
 import logging
 import asyncio
 import time
+import contextvars
 from typing import List, Optional, Type
 from pydantic import BaseModel
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("GeminiClient")
+
+# Context variables to track input/output tokens per request lifecycle
+input_tokens_var = contextvars.ContextVar("input_tokens", default=0)
+output_tokens_var = contextvars.ContextVar("output_tokens", default=0)
 
 # Rate limit tracking variables
 last_request_time = 0.0
@@ -217,7 +222,19 @@ async def generate_gemini_content(
                                 parts = candidate.get("content", {}).get("parts", [])
                                 if parts and len(parts) > 0:
                                     text = parts[0].get("text", "")
-                                    logger.info(f"API request succeeded with key index {index} using model '{current_model}'.")
+                                    
+                                    # Parse token usage metadata
+                                    usage = data.get("usageMetadata", {})
+                                    prompt_tokens = usage.get("promptTokenCount", 0)
+                                    candidates_tokens = usage.get("candidatesTokenCount", 0)
+                                    input_tokens_var.set(input_tokens_var.get() + prompt_tokens)
+                                    output_tokens_var.set(output_tokens_var.get() + candidates_tokens)
+                                    
+                                    logger.info(
+                                        f"API request succeeded with key index {index} using model '{current_model}'. "
+                                        f"Tokens this call: Input={prompt_tokens}, Output={candidates_tokens}. "
+                                        f"Accumulated in lifecycle: Input={input_tokens_var.get()}, Output={output_tokens_var.get()}"
+                                    )
                                     return text
                             raise ValueError(f"Gemini API returned 200 OK but structure was unexpected: {json.dumps(data)}")
                         

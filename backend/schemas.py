@@ -20,6 +20,8 @@ class SceneAnalysis(BaseModel):
 
 class StoryAnalysisResponse(BaseModel):
     scenes: List[SceneAnalysis] = Field(description="List of analyzed scenes in chronological order.")
+    input_tokens: Optional[int] = 0
+    output_tokens: Optional[int] = 0
 
 # --- Steps 3, 4, 5: Asset Extractors ---
 
@@ -101,6 +103,8 @@ class Shot(BaseModel):
 
 class ShotPlannerResponse(BaseModel):
     shots: List[Shot] = Field(description="List of planned shots for the episode.")
+    input_tokens: Optional[int] = 0
+    output_tokens: Optional[int] = 0
 
 # --- Step 7: Keyframe Prompt Generator ---
 
@@ -110,6 +114,8 @@ class ShotKeyframePrompt(BaseModel):
 
 class KeyframePromptResponse(BaseModel):
     keyframes: List[ShotKeyframePrompt] = Field(description="Keyframe reference image generation prompts for all shots.")
+    input_tokens: Optional[int] = 0
+    output_tokens: Optional[int] = 0
 
 # --- Step 8: Motion Prompt Generator ---
 
@@ -119,11 +125,15 @@ class ShotMotionPrompt(BaseModel):
 
 class MotionPromptResponse(BaseModel):
     motion_prompts: List[ShotMotionPrompt] = Field(description="Veo 3 motion and video prompts for all shots.")
+    input_tokens: Optional[int] = 0
+    output_tokens: Optional[int] = 0
 
 class AssetsResponse(BaseModel):
     characters: List[CharacterAsset] = Field(description="Unique list of characters with details and turnaround prompts.")
     environments: List[EnvironmentAsset] = Field(description="Unique list of locations with reference prompts.")
     props: List[PropAsset] = Field(description="Unique list of prop objects with reference prompts.")
+    input_tokens: Optional[int] = 0
+    output_tokens: Optional[int] = 0
 
 # --- Step 9: Veo Compliance Checker ---
 

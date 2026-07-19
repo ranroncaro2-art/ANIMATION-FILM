@@ -286,6 +286,7 @@ def main():
     parser.add_argument("--output", required=True, help="Output target MP4 file path")
     parser.add_argument("--width", type=int, default=1280, help="Output video width")
     parser.add_argument("--height", type=int, default=720, help="Output video height")
+    parser.add_argument("--no-subtitle", action="store_true", help="Disable burning subtitles/dialogue overlay on video")
     args = parser.parse_args()
 
     # Load configuration
@@ -498,7 +499,7 @@ def main():
                 )
 
             # Dialogue Overlay (Subtitles)
-            if dialogues:
+            if dialogues and not args.no_subtitle:
                 # Divide time evenly among dialogue phrases
                 d_idx = int((f_i / budget) * len(dialogues))
                 d_item = dialogues[min(d_idx, len(dialogues) - 1)]

@@ -832,6 +832,22 @@ class BackgroundQueueManager {
     const responseData = await response.json();
     const updatedData = { ...projectData };
 
+    // Extract tokens from API response
+    const inTokens = responseData.input_tokens || 0;
+    const outTokens = responseData.output_tokens || 0;
+
+    // Accumulate project-specific tokens
+    updatedData.input_tokens = (projectData.input_tokens || 0) + inTokens;
+    updatedData.output_tokens = (projectData.output_tokens || 0) + outTokens;
+
+    // Accumulate global cumulative tokens in localStorage
+    if (typeof window !== "undefined") {
+      const globalIn = parseInt(localStorage.getItem("global_input_tokens") || "0") || 0;
+      const globalOut = parseInt(localStorage.getItem("global_output_tokens") || "0") || 0;
+      localStorage.setItem("global_input_tokens", (globalIn + inTokens).toString());
+      localStorage.setItem("global_output_tokens", (globalOut + outTokens).toString());
+    }
+
     switch (stepKey) {
       case "story_analyzer":
         updatedData.scenes = (responseData.scenes || []).map((scene: any) => ({
@@ -1040,6 +1056,7 @@ class BackgroundQueueManager {
   // Media Queue System
   private mediaQueue: MediaTask[] = [];
   private mediaQueueListeners: Set<MediaQueueListener> = new Set();
+  private mediaDelaySeconds = 0;
   private imageConcurrencyLimit = 2;
   private videoConcurrencyLimit = 1;
 
@@ -1047,6 +1064,10 @@ class BackgroundQueueManager {
     this.imageConcurrencyLimit = imageLimit;
     this.videoConcurrencyLimit = videoLimit;
     this.processMediaQueue();
+  }
+
+  setMediaDelaySeconds(delaySeconds: number) {
+    this.mediaDelaySeconds = delaySeconds;
   }
 
   subscribeMediaQueue(listener: MediaQueueListener) {
@@ -1118,6 +1139,12 @@ class BackgroundQueueManager {
   private async runTaskAsync(task: MediaTask) {
     task.status = "running";
     this.notifyMediaQueue();
+
+    if (this.mediaDelaySeconds > 0) {
+      this.addLog(`[Hàng chờ] Chờ ${this.mediaDelaySeconds} giây trễ giãn cách trước khi chạy ${task.targetId}...`, "info", task.projectId);
+      await new Promise(resolve => setTimeout(resolve, this.mediaDelaySeconds * 1000));
+    }
+
     this.addLog(`[Hàng chờ] Bắt đầu vẽ ${task.type === "shot_video" ? "video" : "ảnh"} cho ${task.targetId} (Dự án: ${task.projectName})...`, "running", task.projectId);
 
     const maxAttempts = 3;

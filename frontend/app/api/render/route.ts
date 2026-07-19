@@ -6,7 +6,7 @@ import path from "path";
 export async function POST(req: NextRequest) {
   try {
     const body = await req.json();
-    const { projectId, resolution, shots, keyframes, motion_prompts, pcDirectory } = body;
+    const { projectId, resolution, shots, keyframes, motion_prompts, pcDirectory, burnSubtitle } = body;
 
     // Validate
     if (!projectId || !shots) {
@@ -64,6 +64,10 @@ export async function POST(req: NextRequest) {
       "--width", String(width),
       "--height", String(height)
     ];
+
+    if (burnSubtitle === false) {
+      args.push("--no-subtitle");
+    }
 
     const child = spawn(pythonExe, args, {
       env: {
