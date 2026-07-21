@@ -1,0 +1,34 @@
+{
+  "appId": "com.animekids.studio",
+  "productName": "AI Kids Animation Studio",
+  "directories": {
+    "output": "dist-electron"
+  },
+  "win": {
+    "target": [
+      "nsis"
+    ]
+  },
+  "nsis": {
+    "oneClick": false,
+    "allowToChangeInstallationDirectory": true,
+    "createDesktopShortcut": true,
+    "createStartMenuShortcut": true,
+    "shortcutName": "AI Kids Animation Studio",
+    "artifactName": "AI_Kids_Studio_Setup_v1.0.exe"
+  },
+  "files": [
+    "**/*",
+    "!.next/cache/**/*",
+    "!dist/**/*",
+    "!dist-electron/**/*",
+    "!.git/**/*"
+  ],
+  "asar": false,
+  "extraResources": [
+    {
+      "from": "../backend/dist/backend",
+      "to": "backend"
+    }
+  ]
+}

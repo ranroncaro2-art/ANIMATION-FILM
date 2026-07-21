@@ -33,13 +33,25 @@ export async function POST(req: NextRequest) {
     };
 
     const references = getFiles("references");
-    const imagesShots = getFiles("images_shots");
+    const imagesNew = getFiles("images");
+    const imagesShotsLegacy = getFiles("images_shots");
+    
+    // Combine images folder and legacy images_shots folder (avoiding duplicate paths)
+    const existingPaths = new Set(imagesNew.map(f => f.path));
+    const combinedImages = [...imagesNew];
+    for (const item of imagesShotsLegacy) {
+      if (!existingPaths.has(item.path)) {
+        combinedImages.push(item);
+      }
+    }
+
     const videos = getFiles("videos");
 
     return NextResponse.json({
       success: true,
       references,
-      images_shots: imagesShots,
+      images: combinedImages,
+      images_shots: combinedImages,
       videos
     });
   } catch (err: any) {

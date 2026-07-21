@@ -3,6 +3,7 @@
 import React, { useState, useEffect, useRef } from "react";
 import ApiKeyInput from "../components/ApiKeyInput";
 import JsonEditor from "../components/JsonEditor";
+import LoginScreen from "../components/LoginScreen";
 import { StepKey, PipelineStep } from "../components/PipelineProgress";
 import { FloatingSystemLogs } from "../components/FloatingSystemLogs";
 import {
@@ -340,6 +341,48 @@ Lisa: "You dropped your lunch box."
 Boy: "Thank you!"`;
 
 export default function Home() {
+  // Authentication & Device Binding States
+  const [isAuthenticated, setIsAuthenticated] = useState<boolean>(false);
+  const [deployRedirectUrl, setDeployRedirectUrl] = useState<string | null>(null);
+  const [checkingAuth, setCheckingAuth] = useState<boolean>(true);
+  const [currentUser, setCurrentUser] = useState<string | null>(null);
+
+  const isValidAbsoluteUrl = (url: string | null | undefined): boolean => {
+    if (!url) return false;
+    const cleaned = url.trim().toLowerCase();
+    if (cleaned === '' || cleaned === 'undefined' || cleaned === 'null' || cleaned === '/') return false;
+    return cleaned.startsWith('http://') || cleaned.startsWith('https://');
+  };
+
+  // Check login session on mount
+  useEffect(() => {
+    const sessionActive = localStorage.getItem('login_session_active') === 'true';
+    const savedRedirect = localStorage.getItem('login_deploy_link');
+    const savedUser = localStorage.getItem('login_session_user');
+
+    if (sessionActive) {
+      setIsAuthenticated(true);
+      setCurrentUser(savedUser);
+      if (savedRedirect && isValidAbsoluteUrl(savedRedirect)) {
+        setDeployRedirectUrl(savedRedirect);
+      } else {
+        localStorage.removeItem('login_deploy_link');
+        setDeployRedirectUrl(null);
+      }
+    }
+    setCheckingAuth(false);
+  }, []);
+
+  // Automatic redirection if deploy link set
+  useEffect(() => {
+    if (isAuthenticated && deployRedirectUrl && isValidAbsoluteUrl(deployRedirectUrl)) {
+      const timer = setTimeout(() => {
+        window.location.href = deployRedirectUrl;
+      }, 500);
+      return () => clearTimeout(timer);
+    }
+  }, [isAuthenticated, deployRedirectUrl]);
+
   // Subscribe to Media Queue from Background Queue Manager
   const [mediaQueue, setMediaQueue] = useState<any[]>([]);
   useEffect(() => {
@@ -645,6 +688,10 @@ export default function Home() {
   const [imageConcurrency, setImageConcurrency] = useState<number>(2);
   const [videoConcurrency, setVideoConcurrency] = useState<number>(1);
   const [mediaDelaySeconds, setMediaDelaySeconds] = useState<number>(0);
+
+  const [selectedImageAccounts, setSelectedImageAccounts] = useState<string[]>([]);
+  const [selectedUltraAccount, setSelectedUltraAccount] = useState<string>("");
+
   const [globalInputTokens, setGlobalInputTokens] = useState<number>(0);
   const [globalOutputTokens, setGlobalOutputTokens] = useState<number>(0);
   const [isLoaded, setIsLoaded] = useState<boolean>(false);
@@ -930,6 +977,14 @@ export default function Home() {
 
     const savedDelaySeconds = localStorage.getItem("local_media_delay_seconds");
     if (savedDelaySeconds) setMediaDelaySeconds(parseInt(savedDelaySeconds) || 0);
+
+    const savedImgAccounts = localStorage.getItem("local_selected_image_accounts");
+    if (savedImgAccounts) {
+      try { setSelectedImageAccounts(JSON.parse(savedImgAccounts)); } catch (e) {}
+    }
+
+    const savedUltraAccount = localStorage.getItem("local_selected_ultra_account");
+    if (savedUltraAccount) setSelectedUltraAccount(savedUltraAccount);
 
     // Recover last active workspace state from IndexedDB
     const lastActiveId = localStorage.getItem("last_active_project_id") || "active";
@@ -1729,7 +1784,8 @@ export default function Home() {
         throw new Error(data.error || "Lỗi quét thư mục Assets.");
       }
 
-      const { references = [], images_shots = [], videos = [] } = data;
+      const { references = [], images = [], images_shots = [], videos = [] } = data;
+      const shotImages = images.length > 0 ? images : images_shots;
 
       const getBaseName = (filename: string) => {
         const parts = filename.split(".");
@@ -1741,7 +1797,9 @@ export default function Home() {
         const base = getBaseName(filename);
         const name = assetName.toLowerCase().trim();
         if (base === name) return true;
-        if (base === name.replace(/[^a-z0-9]+/g, "_")) return true;
+        const normBase = base.replace(/[^a-z0-9]+/g, "_");
+        const normName = name.replace(/[^a-z0-9]+/g, "_");
+        if (base === normName || normBase === normName) return true;
         return false;
       };
 
@@ -1750,7 +1808,9 @@ export default function Home() {
         const sId = shotId.toLowerCase().trim();
         if (base === sId) return true;
         if (base === `shot_${sId}`) return true;
+        if (base === `shots_${sId}`) return true;
         if (base === `shot_${sId.padStart(3, '0')}`) return true;
+        if (base === `shots_${sId.padStart(3, '0')}`) return true;
         
         const numOnlyBase = base.replace(/[^0-9]/g, "");
         const numOnlyId = sId.replace(/[^0-9]/g, "");
@@ -1804,7 +1864,7 @@ export default function Home() {
         // 4. Scan & Map shot keyframes
         const updatedKeyframes = [...(copy.keyframes || [])];
         (copy.shots || []).forEach((shot: any) => {
-          const match = images_shots.find((f: any) => isShotMatch(f.name, shot.shot_id));
+          const match = shotImages.find((f: any) => isShotMatch(f.name, shot.shot_id));
           if (match) {
             const mediaUrl = `/api/media?path=${encodeURIComponent(match.path)}`;
             const kIdx = updatedKeyframes.findIndex((k: any) => k.shot_id === shot.shot_id);
@@ -2040,18 +2100,18 @@ export default function Home() {
     if (id.startsWith("char_")) {
       type = "character";
       name = id.substring(5);
-      const found = projectData.characters.find(c => c.name === name);
-      promptText = found ? found.turnaround_prompt : `character turnaround Pixar style ${name}`;
+      const found = projectData.characters.find(c => (c.name || c.canonical_name || "").toLowerCase().trim() === name.toLowerCase().trim());
+      promptText = found ? (found.turnaround_prompt || found.prompt || "") : `character turnaround Pixar style ${name}`;
     } else if (id.startsWith("env_")) {
       type = "environment";
       name = id.substring(4);
-      const found = projectData.environments.find(e => e.setting_name === name);
-      promptText = found ? found.reference_prompt : `environment background Pixar style ${name}`;
+      const found = projectData.environments.find(e => (e.setting_name || e.name || "").toLowerCase().trim() === name.toLowerCase().trim());
+      promptText = found ? (found.reference_prompt || found.prompt || "") : `environment background Pixar style ${name}`;
     } else if (id.startsWith("prop_")) {
       type = "prop";
       name = id.substring(5);
-      const found = projectData.props.find(p => p.prop_name === name);
-      promptText = found ? found.reference_prompt : `prop Pixar style ${name}`;
+      const found = projectData.props.find(p => (p.prop_name || p.name || "").toLowerCase().trim() === name.toLowerCase().trim());
+      promptText = found ? (found.reference_prompt || found.prompt || "") : `prop Pixar style ${name}`;
     }
 
     const taskId = `media_task_${Date.now()}_${Math.random().toString(36).substring(2, 5)}`;
@@ -2066,6 +2126,7 @@ export default function Home() {
         imageCount,
         imageAspectRatio,
         imageModel,
+        selectedImageAccounts,
         pcDirectory: projectData.pcDirectory,
       }
     });
@@ -2082,22 +2143,29 @@ export default function Home() {
     const shotObj = projectData.shots.find((s: any) => s.shot_id === shotId);
     const referencedAssets = shotObj ? getReferencedAssetsForShot(shotObj) : [];
 
-    // Collect media_ids and account_id from referenced assets
+    // Collect media_ids, account_id, and referenced asset local file paths
     const mediaIds: string[] = [];
+    const referencedAssetPaths: string[] = [];
     let accountId = "";
 
     referencedAssets.forEach(ref => {
-      let assetData = null;
+      let assetData: any = null;
+      const refNameLower = ref.name.toLowerCase().trim();
       if (ref.type === "character") {
-        assetData = projectData.characters.find(c => c.name === ref.name);
+        assetData = projectData.characters.find(c => (c.name || c.canonical_name || c.id || "").toLowerCase().trim() === refNameLower);
       } else if (ref.type === "environment") {
-        assetData = projectData.environments.find(e => e.setting_name === ref.name);
+        assetData = projectData.environments.find(e => (e.setting_name || e.name || e.id || "").toLowerCase().trim() === refNameLower);
       } else if (ref.type === "prop") {
-        assetData = projectData.props.find(p => p.prop_name === ref.name);
+        assetData = projectData.props.find(p => (p.prop_name || p.name || p.id || "").toLowerCase().trim() === refNameLower);
       }
 
-      if (assetData && assetData.media_id && !assetData.media_id.startsWith("mock_")) {
-        mediaIds.push(assetData.media_id);
+      if (assetData) {
+        if (assetData.media_id && !assetData.media_id.startsWith("mock_")) {
+          mediaIds.push(assetData.media_id);
+        }
+        if (assetData.url) {
+          referencedAssetPaths.push(assetData.url);
+        }
         if (!accountId && assetData.account_id) {
           accountId = assetData.account_id;
         }
@@ -2122,7 +2190,9 @@ export default function Home() {
         imageAspectRatio,
         imageModel,
         mediaIds: mediaIds.length > 0 ? mediaIds : undefined,
+        referencedAssetPaths: referencedAssetPaths.length > 0 ? referencedAssetPaths : undefined,
         accountId: accountId || undefined,
+        selectedImageAccounts,
         pcDirectory: projectData.pcDirectory,
       }
     });
@@ -2143,13 +2213,14 @@ export default function Home() {
       ? projectData.motion_prompts[motionIndex].motion_description
       : "cinematic camera motion";
 
-    // Find keyframe image media_id and account_id
+    // Find keyframe image media_id, account_id, and url
     const keyframeObj = projectData.keyframes
       ? projectData.keyframes.find((k: any) => k.shot_id === shotId)
       : null;
     const hasImage = !!(keyframeObj && keyframeObj.url && !keyframeObj.url.startsWith("mock_") && keyframeObj.media_id);
     const mediaIds = hasImage ? [keyframeObj.media_id] : undefined;
     const accountId = hasImage ? (keyframeObj.account_id || "default_account") : undefined;
+    const keyframeUrl = keyframeObj?.url || undefined;
 
     // Resolve audioReferenceMediaIds from referenced characters in the shot
     const audioReferenceMediaIds: string[] = [];
@@ -2183,7 +2254,9 @@ export default function Home() {
         videoAspectRatio,
         videoModel,
         mediaIds,
+        keyframeUrl,
         accountId,
+        selectedUltraAccount: selectedUltraAccount || undefined,
         audioReferenceMediaIds: audioReferenceMediaIds.length > 0 ? audioReferenceMediaIds : undefined,
         duration_seconds: shotObj?.duration_seconds || 5,
         pcDirectory: projectData.pcDirectory,
@@ -2866,90 +2939,77 @@ export default function Home() {
   }, []);
 
 
-  // Scan shot to match referenced assets
+  // Scan shot to match referenced assets precisely
   const getReferencedAssetsForShot = (shot: any) => {
     const refs: { name: string; type: 'character' | 'environment' | 'prop'; key: string; url?: string }[] = [];
-    const actionsLower = (shot.actions || "").toLowerCase();
-    
-    // Find the parent scene to matching setting/location and scene props
+    const actionsLower = (shot.actions || "").toLowerCase().trim();
+    const shotEnvLower = (shot.environment || shot.setting || "").toLowerCase().trim();
+    const shotChars = (shot.characters || []).map((c: any) => String(c).toLowerCase().trim());
+    const shotProps = (shot.props || []).map((p: any) => String(p).toLowerCase().trim());
+
+    // Find the parent scene for setting/location fallback if shot.environment is missing
     const parentScene = projectData.scenes.find((s: any) => Number(s.scene_id) === Number(shot.scene_number || shot.scene_id));
-    const sceneSettingLower = parentScene ? (parentScene.setting || "").toLowerCase() : "";
-    const sceneProps = parentScene ? parentScene.props || [] : [];
+    const sceneLocationLower = parentScene ? (parentScene.location || parentScene.setting || "").toLowerCase().trim() : "";
 
-    // Check characters
-    const shotChars = shot.characters || [];
+    // 1. Characters matching:
     projectData.characters.forEach(char => {
-      if (
-        char.name && 
-        (actionsLower.includes(char.name.toLowerCase()) || 
-         shotChars.some((c: any) => String(c).toLowerCase().includes(char.name.toLowerCase()) || char.name.toLowerCase().includes(String(c).toLowerCase())))
-      ) {
-        refs.push({ name: char.name, type: 'character', key: `char_${char.name}`, url: char.url });
-      }
-    });
+      const charName = (char.name || char.canonical_name || "").trim();
+      if (!charName) return;
+      const charNameLower = charName.toLowerCase();
+      
+      const inShotChars = shotChars.some((c: string) => c === charNameLower || c.includes(charNameLower) || charNameLower.includes(c));
+      const inActions = actionsLower.length > 0 && new RegExp(`\\b${charNameLower.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\b`, 'i').test(actionsLower);
 
-    // Check setting matching environments
-    const settingLower = (shot.setting || shot.environment || "").toLowerCase();
-    projectData.environments.forEach(env => {
-      const envName = env.setting_name || env.name || "";
-      if (envName) {
-        const envNameLower = envName.toLowerCase();
-        // Fuzzy checks: check containment, parent scene setting, actions text, or keyword overlaps
-        const isMatch = 
-          settingLower.includes(envNameLower) || 
-          envNameLower.includes(settingLower) || 
-          (sceneSettingLower && (sceneSettingLower.includes(envNameLower) || envNameLower.includes(sceneSettingLower))) ||
-          actionsLower.includes(envNameLower) ||
-          (settingLower.length > 2 && envNameLower.length > 2 && (
-            settingLower.split(/\s+/).some((word: string) => word.length > 2 && envNameLower.includes(word)) ||
-            envNameLower.split(/\s+/).some((word: string) => word.length > 2 && settingLower.includes(word))
-          )) ||
-          (sceneSettingLower.length > 2 && envNameLower.length > 2 && (
-            sceneSettingLower.split(/\s+/).some((word: string) => word.length > 2 && envNameLower.includes(word)) ||
-            envNameLower.split(/\s+/).some((word: string) => word.length > 2 && sceneSettingLower.includes(word))
-          ));
-          
-        if (isMatch) {
-          if (!refs.some(r => r.name.toLowerCase() === envName.toLowerCase())) {
-            refs.push({ name: envName, type: 'environment', key: `env_${envName}`, url: env.url });
-          }
+      if (inShotChars || inActions) {
+        if (!refs.some(r => r.name.toLowerCase() === charNameLower)) {
+          refs.push({ name: charName, type: 'character', key: `char_${charName}`, url: char.url });
         }
       }
     });
 
-    // Check props
-    const shotProps = shot.props || [];
+    // 2. Environment matching: find the single best matching environment asset for this specific shot
+    let matchedEnv: any = null;
+    if (shotEnvLower) {
+      matchedEnv = projectData.environments.find(env => {
+        const envName = (env.setting_name || env.name || "").toLowerCase().trim();
+        return envName && (envName === shotEnvLower || shotEnvLower.includes(envName) || envName.includes(shotEnvLower));
+      });
+    }
+    
+    if (!matchedEnv && sceneLocationLower) {
+      matchedEnv = projectData.environments.find(env => {
+        const envName = (env.setting_name || env.name || "").toLowerCase().trim();
+        return envName && (envName === sceneLocationLower || sceneLocationLower.includes(envName) || envName.includes(sceneLocationLower));
+      });
+    }
+
+    if (!matchedEnv && shotEnvLower) {
+      matchedEnv = projectData.environments.find(env => {
+        const envName = (env.setting_name || env.name || "").toLowerCase().trim();
+        const words = envName.split(/\s+/).filter((w: string) => w.length > 3);
+        return words.length > 0 && words.every((w: string) => shotEnvLower.includes(w));
+      });
+    }
+
+    if (matchedEnv) {
+      const envName = matchedEnv.setting_name || matchedEnv.name;
+      if (!refs.some(r => r.name.toLowerCase() === envName.toLowerCase())) {
+        refs.push({ name: envName, type: 'environment', key: `env_${envName}`, url: matchedEnv.url });
+      }
+    }
+
+    // 3. Props matching:
     projectData.props.forEach(prop => {
-      const propName = prop.prop_name || prop.name || "";
-      if (propName) {
-        const propNameLower = propName.toLowerCase();
-        // Fuzzy checks: check containment in actions, shotProps list, parent scene props, or keyword overlaps
-        const isMatch = 
-          actionsLower.includes(propNameLower) || 
-          shotProps.some((p: any) => {
-            const pLower = String(p).toLowerCase();
-            return pLower.includes(propNameLower) || propNameLower.includes(pLower);
-          }) ||
-          sceneProps.some((p: any) => {
-            const pLower = String(p).toLowerCase();
-            return pLower.includes(propNameLower) || propNameLower.includes(pLower);
-          }) ||
-          (propNameLower.length > 2 && (
-            propNameLower.split(/\s+/).some((word: string) => word.length > 2 && actionsLower.includes(word)) ||
-            shotProps.some((p: any) => {
-              const pLower = String(p).toLowerCase();
-              return pLower.split(/\s+/).some((word: string) => word.length > 2 && propNameLower.includes(word));
-            }) ||
-            sceneProps.some((p: any) => {
-              const pLower = String(p).toLowerCase();
-              return pLower.split(/\s+/).some((word: string) => word.length > 2 && propNameLower.includes(word));
-            })
-          ));
-          
-        if (isMatch) {
-          if (!refs.some(r => r.name.toLowerCase() === propName.toLowerCase())) {
-            refs.push({ name: propName, type: 'prop', key: `prop_${propName}`, url: prop.url });
-          }
+      const propName = (prop.prop_name || prop.name || "").trim();
+      if (!propName) return;
+      const propNameLower = propName.toLowerCase();
+
+      const inShotProps = shotProps.some((p: string) => p === propNameLower || p.includes(propNameLower) || propNameLower.includes(p));
+      const inActions = actionsLower.length > 0 && new RegExp(`\\b${propNameLower.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\b`, 'i').test(actionsLower);
+
+      if (inShotProps || inActions) {
+        if (!refs.some(r => r.name.toLowerCase() === propNameLower)) {
+          refs.push({ name: propName, type: 'prop', key: `prop_${propName}`, url: prop.url });
         }
       }
     });
@@ -3101,6 +3161,66 @@ export default function Home() {
       </div>
     );
   };
+
+  // Auth gate checks
+  if (checkingAuth) {
+    return (
+      <div className="min-h-screen bg-[#070b13] flex items-center justify-center text-slate-400 select-none font-sans">
+        <div className="flex flex-col items-center gap-3">
+          <div className="w-8 h-8 rounded-full border-2 border-violet-500 border-t-transparent animate-spin" />
+          <p className="text-xs uppercase tracking-widest font-semibold text-slate-400">Đang kiểm tra bảo mật...</p>
+        </div>
+      </div>
+    );
+  }
+
+  if (isAuthenticated && deployRedirectUrl) {
+    return (
+      <div className="min-h-screen bg-[#070b13] flex items-center justify-center text-slate-400 select-none px-4 font-sans">
+        <div className="w-full max-w-sm bg-slate-900 border border-slate-800 rounded-2xl p-8 text-center flex flex-col items-center gap-5 shadow-2xl relative">
+          <div className="w-12 h-12 rounded-xl bg-violet-500/10 border border-violet-500/20 flex items-center justify-center text-violet-400">
+            <div className="w-6 h-6 rounded-full border-2 border-violet-500 border-t-transparent animate-spin" />
+          </div>
+          <div>
+            <p className="text-sm font-semibold text-slate-200">Đang khởi chạy hệ thống...</p>
+            <p className="text-xs text-slate-500 mt-2 break-all leading-relaxed max-w-xs">
+              Đang điều hướng đến: <br/>
+              <span className="font-mono text-violet-400 font-medium mt-1.5 block">{deployRedirectUrl}</span>
+            </p>
+          </div>
+          <button
+            onClick={() => {
+              localStorage.removeItem('login_session_active');
+              localStorage.removeItem('login_session_user');
+              localStorage.removeItem('login_session_mac');
+              localStorage.removeItem('login_deploy_link');
+              setIsAuthenticated(false);
+              setDeployRedirectUrl(null);
+            }}
+            className="text-xs text-slate-500 hover:text-slate-300 underline cursor-pointer transition-colors pt-2"
+          >
+            Đăng xuất / Huỷ điều hướng
+          </button>
+        </div>
+      </div>
+    );
+  }
+
+  if (!isAuthenticated) {
+    return (
+      <LoginScreen
+        onLoginSuccess={(link) => {
+          setIsAuthenticated(true);
+          setCurrentUser(localStorage.getItem('login_session_user'));
+          if (link && isValidAbsoluteUrl(link)) {
+            setDeployRedirectUrl(link);
+          } else {
+            setDeployRedirectUrl(null);
+          }
+        }}
+      />
+    );
+  }
 
   return (
     <div style={{ minHeight: "100vh", display: "flex", flexDirection: "column", background: "#080c14", color: "#f3f4f6" }}>
@@ -3317,6 +3437,53 @@ export default function Home() {
             <IconSettings />
             Settings
           </button>
+
+          {/* User Account Session & Logout */}
+          <div
+            style={{
+              display: "flex",
+              alignItems: "center",
+              gap: "8px",
+              background: "rgba(15, 23, 42, 0.8)",
+              border: "1px solid rgba(51, 65, 85, 0.8)",
+              padding: "4px 10px",
+              borderRadius: "20px",
+            }}
+          >
+            <span style={{ width: "8px", height: "8px", borderRadius: "50%", background: "#10b981" }} />
+            <span style={{ fontSize: "0.75rem", color: "#cbd5e1", fontWeight: 600 }}>
+              {currentUser || "User"}
+            </span>
+            <button
+              onClick={() => {
+                if (window.confirm("Bạn có chắc chắn muốn đăng xuất khỏi ứng dụng?")) {
+                  localStorage.removeItem("login_session_active");
+                  localStorage.removeItem("login_session_user");
+                  localStorage.removeItem("login_session_mac");
+                  localStorage.removeItem("login_deploy_link");
+                  setIsAuthenticated(false);
+                  setCurrentUser(null);
+                }
+              }}
+              title="Đăng xuất"
+              style={{
+                background: "rgba(239, 68, 68, 0.15)",
+                color: "#f87171",
+                border: "1px solid rgba(239, 68, 68, 0.3)",
+                padding: "3px 8px",
+                borderRadius: "12px",
+                fontSize: "0.7rem",
+                fontWeight: 700,
+                cursor: "pointer",
+                transition: "all 0.15s",
+                marginLeft: "4px"
+              }}
+              onMouseEnter={(e) => e.currentTarget.style.background = "rgba(239, 68, 68, 0.3)"}
+              onMouseLeave={(e) => e.currentTarget.style.background = "rgba(239, 68, 68, 0.15)"}
+            >
+              Đăng xuất
+            </button>
+          </div>
         </div>
       </header>
 
@@ -3558,7 +3725,7 @@ export default function Home() {
                       
                       {projectData.pcDirectory ? (
                         <span style={{ fontSize: "0.72rem", color: "#34d399", display: "block", marginTop: "8px" }}>
-                          ✓ Thư mục hợp lệ. Đã tự động khởi tạo các thư mục: <code style={{ color: "#ffffff" }}>/images_shots</code>, <code style={{ color: "#ffffff" }}>/references</code>, <code style={{ color: "#ffffff" }}>/videos</code>.
+                          ✓ Thư mục hợp lệ. Đã tự động khởi tạo các thư mục: <code style={{ color: "#ffffff" }}>/references</code>, <code style={{ color: "#ffffff" }}>/images</code>, <code style={{ color: "#ffffff" }}>/videos</code>.
                         </span>
                       ) : (
                         <span style={{ fontSize: "0.72rem", color: "#f87171", display: "block", marginTop: "8px" }}>
@@ -3982,6 +4149,10 @@ export default function Home() {
                                   id: c.id || `char_${index + 1}`,
                                   "tên nhân vật": c.name,
                                   "propmt": c.turnaround_prompt || "",
+                                  age: c.age || "",
+                                  gender: c.gender || "",
+                                  voice_style: c.voice_style || "",
+                                  personality: c.personality || "",
                                   media_id: c.media_id || "",
                                   audioReferenceMediaIds: c.audioReferenceMediaIds || []
                                 }));
@@ -4034,19 +4205,87 @@ export default function Home() {
                                       </div>
                                     )}
                                   </div>
-                                <div style={{ padding: "16px", display: "flex", flexDirection: "column", gap: "8px" }}>
+                                <div style={{ padding: "16px", display: "flex", flexDirection: "column", gap: "10px" }}>
                                   <h4 style={{ color: "#a78bfa", fontSize: "0.95rem", fontWeight: 700 }}>{char.name}</h4>
-                                  <span style={{ fontSize: "0.7rem", color: "var(--text-muted)" }}>TURNAROUND PROMPT:</span>
-                                  <textarea
-                                    value={char.turnaround_prompt}
-                                    onChange={(e) => {
-                                      const updated = [...projectData.characters];
-                                      updated[idx].turnaround_prompt = e.target.value;
-                                      handleUpdateStepData("character_extractor", updated);
-                                    }}
-                                    className="custom-textarea"
-                                    style={{ minHeight: "65px", fontSize: "0.8rem", padding: "8px" }}
-                                  />
+                                  
+                                  <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: "10px" }}>
+                                    <div>
+                                      <span style={{ fontSize: "0.7rem", color: "var(--text-muted)", display: "block", marginBottom: "4px" }}>GIỚI TÍNH:</span>
+                                      <input
+                                        type="text"
+                                        value={char.gender || ""}
+                                        onChange={(e) => {
+                                          const updated = [...projectData.characters];
+                                          updated[idx].gender = e.target.value;
+                                          handleUpdateStepData("character_extractor", updated);
+                                        }}
+                                        className="custom-input"
+                                        style={{ width: "100%", padding: "6px 8px", fontSize: "0.8rem", background: "rgba(0,0,0,0.3)", color: "#ffffff", border: "1px solid var(--border-color)", borderRadius: "4px" }}
+                                        placeholder="ví dụ: boy, female..."
+                                      />
+                                    </div>
+                                    <div>
+                                      <span style={{ fontSize: "0.7rem", color: "var(--text-muted)", display: "block", marginBottom: "4px" }}>TUỔI:</span>
+                                      <input
+                                        type="text"
+                                        value={char.age || ""}
+                                        onChange={(e) => {
+                                          const updated = [...projectData.characters];
+                                          updated[idx].age = e.target.value;
+                                          handleUpdateStepData("character_extractor", updated);
+                                        }}
+                                        className="custom-input"
+                                        style={{ width: "100%", padding: "6px 8px", fontSize: "0.8rem", background: "rgba(0,0,0,0.3)", color: "#ffffff", border: "1px solid var(--border-color)", borderRadius: "4px" }}
+                                        placeholder="ví dụ: 6, 30s..."
+                                      />
+                                    </div>
+                                  </div>
+
+                                  <div>
+                                    <span style={{ fontSize: "0.7rem", color: "var(--text-muted)", display: "block", marginBottom: "4px" }}>CHẤT GIỌNG CHI TIẾT (VOICE STYLE):</span>
+                                    <input
+                                      type="text"
+                                      value={char.voice_style || ""}
+                                      onChange={(e) => {
+                                        const updated = [...projectData.characters];
+                                        updated[idx].voice_style = e.target.value;
+                                        handleUpdateStepData("character_extractor", updated);
+                                      }}
+                                      className="custom-input"
+                                      style={{ width: "100%", padding: "6px 8px", fontSize: "0.8rem", background: "rgba(0,0,0,0.3)", color: "#ffffff", border: "1px solid var(--border-color)", borderRadius: "4px" }}
+                                      placeholder="ví dụ: excited playful voice, gentle warm voice..."
+                                    />
+                                  </div>
+
+                                  <div>
+                                    <span style={{ fontSize: "0.7rem", color: "var(--text-muted)", display: "block", marginBottom: "4px" }}>TÍNH CÁCH:</span>
+                                    <input
+                                      type="text"
+                                      value={char.personality || ""}
+                                      onChange={(e) => {
+                                        const updated = [...projectData.characters];
+                                        updated[idx].personality = e.target.value;
+                                        handleUpdateStepData("character_extractor", updated);
+                                      }}
+                                      className="custom-input"
+                                      style={{ width: "100%", padding: "6px 8px", fontSize: "0.8rem", background: "rgba(0,0,0,0.3)", color: "#ffffff", border: "1px solid var(--border-color)", borderRadius: "4px" }}
+                                      placeholder="ví dụ: playful, caring, energetic..."
+                                    />
+                                  </div>
+
+                                  <div>
+                                    <span style={{ fontSize: "0.7rem", color: "var(--text-muted)", display: "block", marginBottom: "4px" }}>TURNAROUND PROMPT:</span>
+                                    <textarea
+                                      value={char.turnaround_prompt}
+                                      onChange={(e) => {
+                                        const updated = [...projectData.characters];
+                                        updated[idx].turnaround_prompt = e.target.value;
+                                        handleUpdateStepData("character_extractor", updated);
+                                      }}
+                                      className="custom-textarea"
+                                      style={{ minHeight: "65px", fontSize: "0.8rem", padding: "8px", width: "100%" }}
+                                    />
+                                  </div>
                                 </div>
                               </div>
                             );
@@ -4455,12 +4694,74 @@ export default function Home() {
 
                                         {keyframePrompt ? (
                                           <div style={{ marginTop: "6px", background: "rgba(255,255,255,0.02)", padding: "8px", borderRadius: "4px", border: "1px solid rgba(255,255,255,0.04)" }}>
-                                            <strong style={{ fontSize: "0.7rem", color: "#06b6d4", display: "block", marginBottom: "2px" }}>KEYFRAME IMAGE PROMPT:</strong>
-                                            <p style={{ fontSize: "0.75rem", fontStyle: "italic", margin: 0 }}>{keyframePrompt}</p>
+                                            <strong style={{ fontSize: "0.7rem", color: "#06b6d4", display: "block", marginBottom: "4px" }}>KEYFRAME IMAGE PROMPT (CÓ THỂ SỬA):</strong>
+                                            <textarea
+                                              value={keyframePrompt}
+                                              onChange={(e) => {
+                                                const updatedKeyframes = projectData.keyframes.map((k: any) => 
+                                                  k.shot_id === shot.shot_id 
+                                                    ? { ...k, keyframe_image_prompt: e.target.value } 
+                                                    : k
+                                                );
+                                                handleUpdateStepData("keyframe_generator", updatedKeyframes);
+                                              }}
+                                              style={{
+                                                width: "100%",
+                                                background: "rgba(0,0,0,0.3)",
+                                                border: "1px solid rgba(255,255,255,0.08)",
+                                                color: "var(--text-primary)",
+                                                fontSize: "0.75rem",
+                                                fontFamily: "inherit",
+                                                fontStyle: "italic",
+                                                padding: "6px",
+                                                borderRadius: "4px",
+                                                resize: "vertical",
+                                                minHeight: "45px",
+                                                lineHeight: 1.4,
+                                                outline: "none"
+                                              }}
+                                            />
                                           </div>
                                         ) : (
-                                          <div style={{ marginTop: "6px", background: "rgba(255,255,255,0.01)", padding: "8px", borderRadius: "4px", border: "1px dashed rgba(255,255,255,0.04)" }}>
-                                            <span style={{ fontSize: "0.75rem", color: "var(--text-muted)", fontStyle: "italic" }}>Chưa có keyframe image prompt.</span>
+                                          <div style={{ marginTop: "6px", background: "rgba(255,255,255,0.01)", padding: "8px", borderRadius: "4px", border: "1px dashed rgba(255,255,255,0.04)", display: "flex", flexDirection: "column", gap: "4px" }}>
+                                            <span style={{ fontSize: "0.75rem", color: "var(--text-muted)", fontStyle: "italic" }}>Chưa có keyframe image prompt. Tự động dùng Actions để vẽ hoặc tạo một prompt bên dưới:</span>
+                                            <textarea
+                                              placeholder="Nhập prompt vẽ ảnh keyframe cho shot này..."
+                                              onChange={(e) => {
+                                                // Create a new keyframe object if it doesn't exist
+                                                const existingList = projectData.keyframes || [];
+                                                const exists = existingList.some((k: any) => k.shot_id === shot.shot_id);
+                                                let updatedKeyframes;
+                                                if (exists) {
+                                                  updatedKeyframes = existingList.map((k: any) => 
+                                                    k.shot_id === shot.shot_id 
+                                                      ? { ...k, keyframe_image_prompt: e.target.value } 
+                                                      : k
+                                                  );
+                                                } else {
+                                                  updatedKeyframes = [
+                                                    ...existingList,
+                                                    { shot_id: shot.shot_id, keyframe_image_prompt: e.target.value, url: `mock_${shot.shot_id}` }
+                                                  ];
+                                                }
+                                                handleUpdateStepData("keyframe_generator", updatedKeyframes);
+                                              }}
+                                              style={{
+                                                width: "100%",
+                                                background: "rgba(0,0,0,0.3)",
+                                                border: "1px solid rgba(255,255,255,0.08)",
+                                                color: "var(--text-primary)",
+                                                fontSize: "0.75rem",
+                                                fontFamily: "inherit",
+                                                fontStyle: "italic",
+                                                padding: "6px",
+                                                borderRadius: "4px",
+                                                resize: "vertical",
+                                                minHeight: "45px",
+                                                lineHeight: 1.4,
+                                                outline: "none"
+                                              }}
+                                            />
                                           </div>
                                         )}
 
@@ -4476,13 +4777,14 @@ export default function Home() {
                                     <div style={{ display: "flex", flexWrap: "wrap", gap: "12px" }}>
                                       {refs.map((ref, refIdx) => {
                                         // Resolve asset info from projectData to check url or media_id
-                                        let assetData = null;
+                                        let assetData: any = null;
+                                        const refNameLower = ref.name.toLowerCase().trim();
                                         if (ref.type === "character") {
-                                          assetData = projectData.characters.find(c => c.name.toLowerCase() === ref.name.toLowerCase());
+                                          assetData = projectData.characters.find(c => (c.name || c.canonical_name || c.id || "").toLowerCase().trim() === refNameLower);
                                         } else if (ref.type === "environment") {
-                                          assetData = projectData.environments.find(e => e.setting_name.toLowerCase() === ref.name.toLowerCase());
+                                          assetData = projectData.environments.find(e => (e.setting_name || e.name || e.id || "").toLowerCase().trim() === refNameLower);
                                         } else if (ref.type === "prop") {
-                                          assetData = projectData.props.find(p => p.prop_name.toLowerCase() === ref.name.toLowerCase());
+                                          assetData = projectData.props.find(p => (p.prop_name || p.name || p.id || "").toLowerCase().trim() === refNameLower);
                                         }
 
                                         const hasAssetImg = !!(assetData?.url || assetData?.media_id) || mockGeneratedReferenceImages[ref.key];
@@ -6151,6 +6453,16 @@ export default function Home() {
               onChangeMediaDelaySeconds={(val) => {
                 setMediaDelaySeconds(val);
                 localStorage.setItem("local_media_delay_seconds", val.toString());
+              }}
+              selectedImageAccounts={selectedImageAccounts}
+              onChangeSelectedImageAccounts={(accs) => {
+                setSelectedImageAccounts(accs);
+                localStorage.setItem("local_selected_image_accounts", JSON.stringify(accs));
+              }}
+              selectedUltraAccount={selectedUltraAccount}
+              onChangeSelectedUltraAccount={(acc) => {
+                setSelectedUltraAccount(acc);
+                localStorage.setItem("local_selected_ultra_account", acc);
               }}
             />
 

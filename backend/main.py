@@ -33,6 +33,8 @@ from pipeline import (
 )
 from gemini_client import input_tokens_var, output_tokens_var
 
+import uuid
+
 # AI Kids Animation Studio API Startup Reloaded Final V2
 app = FastAPI(title="AI Kids Animation Studio API")
 
@@ -44,6 +46,18 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+@app.get("/api/system/mac")
+def get_system_mac_address():
+    try:
+        raw_mac = uuid.getnode()
+        mac_str = ':'.join(['{:02x}'.format((raw_mac >> element) & 0xff) for element in range(0, 8*6, 8)][::-1]).upper()
+        if mac_str == "00:00:00:00:00:00":
+            return {"success": False, "mac": "MAC-NOT-FOUND"}
+        return {"success": True, "mac": mac_str}
+    except Exception as err:
+        return {"success": False, "mac": "ERROR-FETCHING-MAC", "error": str(err)}
+
 
 # --- Additional schemas for step-by-step endpoints ---
 
@@ -312,3 +326,7 @@ async def export_zip(req: ExportRequest):
         
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=8000)

@@ -1,5 +1,5 @@
 import json
-from typing import List, Dict, Any, Optional
+from typing import List, Dict, Any, Optional, Tuple
 from pydantic import BaseModel
 from schemas import (
     StoryAnalysisResponse,
@@ -91,7 +91,43 @@ def clean_text_for_safety(text: str) -> str:
     text = re.sub(r'\bhọc\s+sinh\s+mẫu\s+giáo\b', 'học sinh', text, flags=re.IGNORECASE)
     return text
 
-def compile_motion_prompt(shot: Shot) -> str:
+def build_transition_instructions(transition_str: str, actions_str: str = "") -> Tuple[Optional[str], Optional[str]]:
+    """
+    Parses dual-language transition tags (Vietnamese & English) from shot.transition or shot.actions.
+    Returns a tuple of (intro_instruction, outro_instruction).
+    """
+    import re
+    text_to_check = f"{transition_str} {actions_str}".upper()
+    intro_instr = None
+    outro_instr = None
+
+    # Intro detection: [MỞ CẢNH: FADE_IN], [INTRO: FADE_IN], FADE_IN
+    if re.search(r'\[?(?:MỞ CẢNH|INTRO|TRANSITION)\s*:\s*FADE[_\s]*IN\]?|FADE[_\s]*IN', text_to_check):
+        intro_instr = "First 1.0 second (SCENE INTRO): Gradual fade in from black background into the scene setting."
+
+    # Outro detection:
+    if re.search(r'\[?(?:CHUYỂN CẢNH|KẾT CẢNH|OUTRO|TRANSITION)\s*:\s*WALK[_\s]*AWAY(?:[_\s]*FADE)?\]?|WALK[_\s]*AWAY', text_to_check):
+        outro_instr = "Final 1.5 seconds (SCENE OUTRO): Character turns around and walks into background shadows, gradual fade out to black to signal scene end."
+    elif re.search(r'\[?(?:CHUYỂN CẢNH|KẾT CẢNH|OUTRO|TRANSITION)\s*:\s*PULL[_\s]*BACK(?:[_\s]*FADE)?\]?|PULL[_\s]*BACK', text_to_check):
+        outro_instr = "Final 1.5 seconds (SCENE OUTRO): Camera rapidly pulls back to wide shot as character shrinks in distance, gradual fade out."
+    elif re.search(r'\[?(?:CHUYỂN CẢNH|KẾT CẢNH|OUTRO|TRANSITION)\s*:\s*TILT[_\s]*UP(?:[_\s]*FADE)?\]?|TILT[_\s]*UP', text_to_check):
+        outro_instr = "Final 1.5 seconds (SCENE OUTRO): Camera cranes and tilts upward toward the sky/ceiling, gradual fade out."
+    elif re.search(r'\[?(?:CHUYỂN CẢNH|KẾT CẢNH|OUTRO|TRANSITION)\s*:\s*WHIP[_\s]*PAN\]?|WHIP[_\s]*PAN', text_to_check):
+        outro_instr = "Final 1.5 seconds (SCENE OUTRO): Fast whip-pan camera sweep creating motion blur transition."
+    elif re.search(r'\[?(?:CHUYỂN CẢNH|KẾT CẢNH|OUTRO|TRANSITION)\s*:\s*FADE[_\s]*OUT\]?|FADE[_\s]*OUT', text_to_check):
+        outro_instr = "Final 1.5 seconds (SCENE OUTRO): Hold final pose, gradual fade out to black to signal scene end."
+
+    return intro_instr, outro_instr
+
+def compile_motion_prompt(shot: Shot, character_map: Optional[Dict[str, Any]] = None) -> str:
+    # Helper to get asset values safely
+    def _get_asset_val(asset: Any, field_name: str) -> str:
+        if isinstance(asset, dict):
+            val = asset.get(field_name, "")
+        else:
+            val = getattr(asset, field_name, "")
+        return str(val) if val is not None else ""
+
     # 1. SCENE
     scene_desc = shot.environment.strip() if shot.environment else ""
     if shot.lighting:
@@ -106,6 +142,37 @@ def compile_motion_prompt(shot: Shot) -> str:
     # 2. REFERENCE
     reference_str = "Continue from the provided reference image. Do not change characters' appearance or background environment."
     
+    # 2b. CHARACTERS DECLARATION
+    char_lines = []
+    if shot.characters:
+        for c in shot.characters:
+            c_clean = c.strip()
+            c_key = c_clean.lower()
+            if character_map and c_key in character_map:
+                asset = character_map[c_key]
+                age = _get_asset_val(asset, "age").strip()
+                gender = _get_asset_val(asset, "gender").strip()
+                voice = _get_asset_val(asset, "voice_style").strip()
+                personality = _get_asset_val(asset, "personality").strip()
+                
+                details = []
+                if gender:
+                    details.append(gender)
+                if age:
+                    details.append(age)
+                if personality:
+                    details.append(personality)
+                if voice:
+                    details.append(voice)
+                
+                if details:
+                    char_lines.append(f"- {c_clean} ({', '.join(details)})")
+                else:
+                    char_lines.append(f"- {c_clean}")
+            else:
+                char_lines.append(f"- {c_clean}")
+    char_str = "\n".join(char_lines) if char_lines else "None"
+
     # 3. SHOT
     camera_lines = []
     camera_val = shot.camera if shot.camera else ""
@@ -129,6 +196,16 @@ def compile_motion_prompt(shot: Shot) -> str:
                 camera_lines.append(f"{cam_m.capitalize()} camera.")
             else:
                 camera_lines.append(cam_m.capitalize() + ".")
+                
+    # Detect dual-language intro & outro transition instructions
+    intro_instr, outro_instr = build_transition_instructions(
+        shot.transition if shot.transition else "",
+        shot.actions if shot.actions else ""
+    )
+
+    if intro_instr:
+        camera_lines.append(intro_instr)
+        
     camera_str = "\n".join(camera_lines)
     
     # 4. TIMELINE
@@ -137,6 +214,24 @@ def compile_motion_prompt(shot: Shot) -> str:
         t = item.time
         t_clean = t.replace("s", "").strip()
         action_clean = item.action.strip()
+        # Enrich speaker name in timeline
+        if ":" in action_clean:
+            parts_act = action_clean.split(":", 1)
+            speaker_name = parts_act[0].strip()
+            speech_content = parts_act[1].strip()
+            sp_key = speaker_name.lower()
+            if character_map and sp_key in character_map:
+                asset = character_map[sp_key]
+                gender = _get_asset_val(asset, "gender").strip()
+                voice = _get_asset_val(asset, "voice_style").strip()
+                
+                desc_parts = []
+                if gender:
+                    desc_parts.append(gender)
+                if voice:
+                    desc_parts.append(voice)
+                if desc_parts:
+                    action_clean = f"{speaker_name} ({', '.join(desc_parts)}): {speech_content}"
         timeline_lines.append(f"{t_clean} {action_clean}")
     if not timeline_lines:
         timeline_lines.append(f"0-{shot.duration_seconds} {shot.actions.strip() if shot.actions else ''}")
@@ -146,7 +241,24 @@ def compile_motion_prompt(shot: Shot) -> str:
     if shot.dialogue:
         dialogue_lines = []
         for d in shot.dialogue:
-            dialogue_lines.append(f"{d.character}: \"{d.speech}\"")
+            char_name = d.character.strip()
+            char_key = char_name.lower()
+            if character_map and char_key in character_map:
+                asset = character_map[char_key]
+                gender = _get_asset_val(asset, "gender").strip()
+                voice = _get_asset_val(asset, "voice_style").strip()
+                
+                desc_parts = []
+                if gender:
+                    desc_parts.append(gender)
+                if voice:
+                    desc_parts.append(voice)
+                if desc_parts:
+                    dialogue_lines.append(f"{char_name} ({', '.join(desc_parts)}): \"{d.speech}\"")
+                else:
+                    dialogue_lines.append(f"{char_name}: \"{d.speech}\"")
+            else:
+                dialogue_lines.append(f"{char_name}: \"{d.speech}\"")
         dialogue_str = "\n".join(dialogue_lines)
         dialogue_section = (
             f"{dialogue_str}\n"
@@ -167,7 +279,26 @@ def compile_motion_prompt(shot: Shot) -> str:
         actions_lines.append("Characters maintain natural breathing, blinking and subtle body movement.")
     
     if shot.actions:
-        actions_lines.append(shot.actions.strip())
+        import re
+        sanitized_lines = []
+        for line in shot.actions.split('\n'):
+            line_strip = line.strip()
+            # Match "Character: text" (dialogue format)
+            match = re.match(r'^([^:]+):\s*(.*)$', line_strip)
+            if match:
+                char_candidate = match.group(1).strip()
+                # Check if char_candidate is one of the characters in this shot
+                is_char = any(c.lower() == char_candidate.lower() for c in shot.characters)
+                if is_char:
+                    # Check if this character is in the dialogue list
+                    in_dialogue = any(d.character.lower() == char_candidate.lower() for d in shot.dialogue)
+                    if not in_dialogue:
+                        # Skip dialogue-like lines in actions to prevent "nói leo"
+                        print(f"Skipping dialogue-like action to prevent nói leo: {line_strip}", flush=True)
+                        continue
+            sanitized_lines.append(line)
+        if sanitized_lines:
+            actions_lines.append("\n".join(sanitized_lines).strip())
         
     for c in shot.characters:
         speaks = any(d.character.strip().lower() == c.strip().lower() for d in shot.dialogue)
@@ -194,7 +325,10 @@ def compile_motion_prompt(shot: Shot) -> str:
     )
     
     # 8. ENDING
-    ending_str = "Hold final pose silently. Blink and breathe naturally."
+    if outro_instr:
+        ending_str = outro_instr
+    else:
+        ending_str = "Hold final pose silently. Blink and breathe naturally."
     
     # 9. STYLE
     style_str = (
@@ -203,16 +337,24 @@ def compile_motion_prompt(shot: Shot) -> str:
         "No on-screen text."
     )
     
+    # 10. AUDIO INSTRUCTION
+    audio_str = (
+        "Diegetic sound only. Clear lip-synced character voices, natural ambient environment sound and character foley matching scene physical action.\n"
+        "Strictly NO background music (BGM), NO audience laughter, NO laugh track, NO non-diegetic sound effects."
+    )
+    
     parts = [
         f"SCENE:\n{scene_desc}",
         f"REFERENCE:\n{reference_str}",
+        f"CHARACTERS:\n{char_str}",
         f"SHOT:\n{camera_str}",
         f"TIMELINE:\n{timeline_str}",
         f"DIALOGUE:\n{dialogue_section}",
         f"ACTIONS:\n{actions_str}",
         f"SPATIAL RULES:\n{spatial_str}",
         f"ENDING:\n{ending_str}",
-        f"STYLE:\n{style_str}"
+        f"STYLE:\n{style_str}",
+        f"AUDIO:\n{audio_str}"
     ]
     
     full_prompt = "\n\n".join(parts)
@@ -308,6 +450,12 @@ async def run_shot_planner(
     all_environments = json.loads(environments_json) if environments_json else []
     all_props = json.loads(props_json) if props_json else []
     
+    # Build character map
+    character_map = {c["name"].strip().lower(): c for c in all_characters if "name" in c}
+    for c in all_characters:
+        if "canonical_name" in c and c["canonical_name"]:
+            character_map[c["canonical_name"].strip().lower()] = c
+            
     # Chunk scenes to execute in groups of chunk_size for stability
     scene_chunks = [scenes[i:i + chunk_size] for i in range(0, len(scenes), chunk_size)]
     
@@ -323,35 +471,50 @@ async def run_shot_planner(
         "- Track Character Positions & Spatial Layout: If a character walked to a specific location (e.g. 'Lisa walks to the blue table and sits down') at the end of the previous shot, they must start from that exact position/sitting pose in the next shot to maintain geographic and spatial continuity.\n"
         "- Track Environmental Status: If an action modified the environment (e.g. 'opens a door', 'turns off lights', 'drops a notebook on the floor'), this status must persist in the background of subsequent shots until another action changes it.\n"
         "- Ensure that the `keyframe_prompt` (which describes the visual elements for the image generator) matches these continuity constraints. If Emma is holding a cup in the previous shot and has not set it down, her keyframe prompt for the next shot must also mention her holding the cup.\n\n"
-        "CRITICAL SHOT DURATION & SPLITTING RULE:\n"
-        "- MULTIPLE SPEAKERS DIALOGUE SPLITTING RULE (CRITICAL): If a scene contains dialogue/speech from MULTIPLE DIFFERENT SPEAKERS (e.g., 2 or more different characters speaking, such as Lisa speaking and Emma replying), you MUST split this scene into multiple sequential shots so that EACH shot contains the dialogue of ONLY ONE speaker. A single shot must NEVER contain dialogue from more than one character. This is required because the video generator (Veo3) cannot synthesize two different voices/speakers within a single video clip.\n"
-        "- DIALOGUE SHOT PRIORITIZATION & SPEAKING FOCUS (CRITICAL): In any shot that contains dialogue (especially during back-and-forth conversational exchanges / đối đáp), the spoken dialogue must take absolute priority in the shot's planning.\n"
-        "  - The shot's camera framing must focus primarily on the character who is speaking (e.g. shot_type must be Close-up or Medium Shot focusing on the speaking character).\n"
-        "  - The duration of the shot must first satisfy the speaking time of the dialogue. Any actions or reactions from the speaking or listening character must be planned to support or occur immediately before/after the dialogue, without cutting off or rushing the speech.\n"
-        "- CROSS-LOCATION CONVERSATIONS RULE (CRITICAL): If a scene contains a conversation between characters in different physical settings/locations (e.g. Character A is inside the house, Character B is outside in the yard):\n"
-        "  - You MUST split the scene into separate sequential shots, assigning the correct specific environment name to EACH shot depending on who is visible in that shot. Do NOT put both shots in the same environment.\n"
-        "- PHONE CALL & OFF-SCREEN DIALOGUE LIP-SYNC RULE (CRITICAL):\n"
-        "  - When a character (e.g., Character A) is speaking but is OFF-SCREEN (e.g. speaking over the phone, or acting as an off-screen voiceover, while the camera is focusing on Character B listening):\n"
-        "    1. The `characters` list for that shot MUST ONLY contain Character B (the visible character), NOT Character A.\n"
-        "    2. You MUST explicitly state in the `actions` field and `keyframe_prompt` that: 'Character B is listening silently with closed lips, reacting to the voice on the phone.' and 'Character A is off-screen / voiceover.'\n"
-        "    3. This is critical to prevent the video generator (Veo3) from mistakenly moving B's lips to A's speech.\n"
-        "- DYNAMIC SHOT DURATION CALCULATION RULES (CRITICAL):\n"
-        "  1. For short dialogues or simple responses: the shot duration should be planned within 4 to 6 seconds (e.g., 0-1s for action/expression, 1-5s for the character's short line like 'Alo ạ?').\n"
-        "  2. For longer dialogues or more descriptive sentences: maximize the shot duration to the absolute limit of 8 seconds (0-8s) (e.g., 'Nhà con có ai ở nhà không?') to ensure the character has ample time to speak comfortably and show facial expressions without feeling rushed.\n"
-        "  3. For any shot containing dialogue: the duration must be at least: `ceil(character_count / 15) + 2 seconds` of buffer (for natural breathing, gestures, or reaction/performance pauses). A shot containing speech must NEVER be shorter than 4 seconds.\n"
-        "  4. For any shot containing complex physical actions (e.g. walking, sitting down, picking up/setting down a prop, opening doors): allocate at least 4 to 6 seconds for that action to happen naturally in the video.\n"
-        "  5. If a shot contains BOTH a physical action and dialogue, combine their requirements (e.g., if a character walks to a table and then speaks a 3-second line, the shot duration must be at least 4s for walking + 4s for speaking = 8 seconds).\n"
-        "  6. MAXIMUM SHOT DURATION LIMIT (CRITICAL): The duration of any single shot must NEVER exceed 8 seconds (because the video generation model can only produce clips up to 8 seconds). If a dialogue or action requires more than 8 seconds, you MUST split it into multiple sequential shots (each between 4 to 8 seconds) so that no single shot's duration exceeds 8 seconds.\n"
-        "  7. Dynamic Scene Duration Overriding: If the sum of the required durations for the split shots exceeds the original scene's `duration_seconds` (because the storyboard's scene duration was underestimated), you MUST override the duration and increase the shot's `duration_seconds` to satisfy the minimum requirements above. Do NOT squeeze or shorten the shot duration to fit a too-short original scene duration. (It is NOT required that the sum of the split shot durations equals the original scene duration).\n"
-        "- FLEXIBLE SHOT QUANTITY & GRANULAR SPLITTING (CRITICAL): You are encouraged to split a scene into as many sequential shots as logically needed to tell the story clearly and smoothly. There is no maximum limit of shots per scene. For example, if a scene has a character walking, then reacting, then character A speaking, then character B replying, you can split this into 4 separate shots (e.g., Shot 1: Emma walking, Shot 2: Close-up of Emma smiling/reacting, Shot 3: Emma speaking, Shot 4: Lisa replying). Prioritize visual variety, emotional expression, and proper pacing over minimizing the number of shots. Do NOT try to force complex actions and dialogues into only 2 shots.\n"
+        "CRITICAL SHOT DURATION & SPLITTING RULES:\n"
+        "  1. Word-Count Dialogue Rule (Keep vs Split):\n"
+        "     - Count the total number of words in the combined dialogue of a scene.\n"
+        "     - If the total word count is 16 words or fewer, you can keep them in a SINGLE shot (e.g., a Two-Shot showing both characters speaking sequentially, or an Over-the-Shoulder shot).\n"
+        "     - If the total word count exceeds 16 words, you MUST split the scene into separate sequential shots.\n"
+        "  2. Separate Complex Action from Dialogue: Never mix complex physical tasks (e.g., folding laundry, cleaning, walking a long path, returning to a table) with active speaking segments in the same shot. If a character must perform a complex action and then speak:\n"
+        "     - Split it into Shot A (Action Only, no dialogue) focusing on the physical task.\n"
+        "     - Split it into Shot B (Dialogue Only) focusing on the speech, facial expressions, and natural hand/head gestures.\n"
+        "  3. Cross-Location Splitting (Mandatory): If a conversation happens between characters in different physical settings/locations (e.g., Mom inside the house and Alex outside in the yard):\n"
+        "     - You MUST split them into separate sequential shots, assigning the correct specific environment name to EACH shot depending on who is visible. Do NOT put them in the same shot.\n"
+        "  4. Natural Performance Buffers (Pacing): Never start a shot with immediate speech or end it immediately after the speech. Always allocate 0.5s to 1s at the beginning of a shot for the character to react/prepare, and 0.5s to 1s at the end to hold their pose, blink, and breathe naturally. This prevents stiff \"clip joining\" effects.\n"
+        "  5. Vary Shot Composition to Avoid \"Talking Heads\": Instead of boring, mechanical cuts between isolated Close-ups of characters speaking (A speaks -> cut to B speaks), use professional cinematography:\n"
+        "     - Over-the-Shoulder (OTS) Shots: Frame the speaking character focusing on their face/gestures, while showing the shoulder or back of the head of the listening character in the foreground. This connects them spatially.\n"
+        "     - Two-Shots (Medium / Medium Wide): Show both characters in the same frame. One speaks and gestures, while the other reacts dynamically (nodding, smiling, blinking).\n"
+        "     - Reaction / Cutaway Shots: Focus on the listener's emotional response (Close-up) while the speaker's voice is heard off-screen (as off-screen dialogue) if it adds to the scene's emotional weight.\n"
+        "  6. Cinematic Camera Director Speed & Tone Mapping Rules (CRITICAL):\n"
+        "     - Match Camera Movement & Speed to the Scene's Emotional Tone:\n"
+        "       * Calm / Peaceful / Emotional / Tender scenes: Use slow, smooth, gentle camera movements (e.g. 'Slow Push-in', 'Slow Arc/Orbit', 'Smooth Dolly In').\n"
+        "       * Dramatic / Tense / Action / Shock scenes: Use fast, dynamic, rapid camera movements (e.g. 'Fast Push-in', 'Rapid Tracking', 'Handheld Shaky Cam', 'Snap Zoom').\n"
+        "       * Energetic / Comedic scenes: Use lively tracking, dynamic pan, whip pan, medium pacing.\n"
+        "     - Continuous 1-Shot Multi-Stage Camera Choreography (for 2-person dialogue shots up to 8s):\n"
+        "       * Do NOT leave the camera completely static during dialogue shots. Map continuous camera movements across the timeline.\n"
+        "       * Example: '0s-3.5s: Slow Push-in on Emma speaking while John listens silently with closed lips; 3.5s-5s: Smooth Pan Right shifting focus to John; 5s-8s: Gentle Zoom-in on John as he responds while Emma listens with closed lips.'\n"
+        "       * Explicit Lip-Sync & Listening Rule: State clearly in timeline/actions that the speaking character opens mouth and speaks while the non-speaking character stays silent with closed lips listening to prevent overlapping lip movement (\"nói leo\").\n"
+        "  7. Phone Call & Off-Screen Dialogue Lip-Sync Rule:\n"
+        "     - When a character is speaking but is OFF-SCREEN (e.g., speaking over the phone, or acting as an off-screen voiceover, while the camera focuses on another character listening):\n"
+        "       - The `characters` list for that shot MUST ONLY contain the visible character.\n"
+        "       - You MUST explicitly state in the `actions` field and `keyframe_prompt` that: '[Visible Character] is listening silently with closed lips, reacting to the voice.' and '[Off-screen Character] is off-screen / voiceover.' to prevent lip-sync errors.\n"
+        "  8. Dynamic Shot Duration Calculation Rules:\n"
+        "     - For any shot containing dialogue: the duration must be at least: `ceil(character_count / 15) + 2 seconds` of buffer (for natural breathing, gestures, or reaction/performance pauses). A shot containing speech must NEVER be shorter than 4 seconds.\n"
+        "     - For any shot containing physical actions: allocate at least 4 to 6 seconds for that action to happen naturally.\n"
+        "     - MAXIMUM SHOT DURATION LIMIT: The duration of any single shot must NEVER exceed 8 seconds. If dialogue or action requires more than 8 seconds, you MUST split it into multiple sequential shots (each between 4 to 8 seconds).\n"
+        "     - Dynamic Scene Duration Overriding: If the sum of the required durations for the split shots exceeds the original scene's `duration_seconds`, you MUST override and increase the shot's `duration_seconds` to satisfy the minimum requirements.\n"
+        "  9. Flexible Shot Quantity & Granular Splitting: Split scenes into as many sequential shots as logically needed to tell the story clearly, focusing on proper pacing, visual variety, and separating dialogue from action.\n"
         "- BÓC TÁCH HÀNH ĐỘNG, LỜI THOẠI, VÀ DIỄN TẢ (CRITICAL):\n"
         "  - You MUST clearly separate the physical action (e.g. walking, moving props), the spoken dialogue, and the character's expression/performance/reactions (e.g., smiling, crying, looking surprised, listening intently).\n"
         "  - The physical action and dialogue must be mapped chronologically to the `timeline` field.\n"
         "  - Character expressions, reaction styles, and performance details must be clearly described in the `actions` field and reflected in the `keyframe_prompt` (e.g., 'Lisa looks up at Emma with a warm, welcoming smile') to ensure the generator synthesizes proper facial expressions and emotional context.\n"
+        "  - The `actions` field MUST ONLY describe physical movements, positioning, poses, expressions, and emotions. You MUST NEVER write dialogue lines, spoken words, or speech (e.g. do not write 'CharacterName: \"Speech\"' or 'CharacterName: Speech') in the `actions` field. Keep the `actions` field purely visual.\n"
         "- When splitting a scene into multiple shots, you must distribute the scene's dialogue, actions, expressions, and timeline sequentially and logically across the split shots. Ensure that no dialogue or action overlaps or is repeated. If a shot contains a character's dialogue, only include that specific character's speech in that shot's dialogue list.\n"
-        "  * Concrete Splitting Example: If a scene is 10s long (Bối cảnh: Cafeteria) and has Description: 'Lisa returns to the table. Emma smiles.' and Dialogue: [Emma: 'Great job!', Lisa: 'Now my hands are clean.']. You should split it into 2 shots:\n"
-        "    - Shot A (5s): Focuses on Emma speaking 'Great job!' (e.g. camera framing focusing on Emma, Dialogue list only contains Emma: 'Great job!').\n"
-        "    - Shot B (5s): Focuses on Lisa replying 'Now my hands are clean.' (e.g. camera framing focusing on Lisa, Dialogue list only contains Lisa: 'Now my hands are clean.').\n\n"
+        "  * Concrete Splitting Example: If a scene has Description: 'Lisa returns to the table. Emma smiles.' and Dialogue: [Emma: 'Great job!', Lisa: 'Now my hands are clean.']. Since 'Lisa returns to the table' is a complex action, and the total words of the dialogue is short (8 words), you should split it into 3 shots:\n"
+        "    - Shot A (4s): Action Shot. Focuses on Lisa returning to the table and stopping beside it, while Emma sits and smiles (No dialogue list).\n"
+        "    - Shot B (4s): Dialogue Shot. Focuses on Emma speaking 'Great job!' in a Medium Close-up (Dialogue list only contains Emma: 'Great job!').\n"
+        "    - Shot C (4s): Dialogue Shot. Focuses on Lisa replying 'Now my hands are clean.' in a Medium Close-up (Dialogue list only contains Lisa: 'Now my hands are clean.').\n\n"
         "Your additions for each shot:\n"
         "1. Camera and framing parameters. You must apply these strict Camera Rule mappings to determine camera_movement and shot_type:\n"
         "   - Focus on Dialogue -> shot_type must be 'Medium Shot'\n"
@@ -361,7 +524,8 @@ async def run_shot_planner(
         "   - Focus on Action (active movements) -> shot_type must be 'Medium Wide'\n"
         "   - Focus on a specific Object -> shot_type must be 'Insert Shot'\n"
         "   - Focus on Reaction -> shot_type must be 'Close-up'\n"
-        "   Define `camera` as a combination (e.g. 'Medium Shot, Static'). Specify composition, lighting, transition.\n\n"
+        "   Define `camera` as a combination (e.g. 'Medium Shot, Static'). Specify composition, lighting, transition.\n"
+        "   - Transition Parameter: Preserve any intro/outro transition tags present in the storyboard (e.g. '[MỞ CẢNH: FADE_IN]', '[INTRO: FADE_IN]', '[CHUYỂN CẢNH: PULL_BACK]', '[OUTRO: PULL_BACK]', '[CHUYỂN CẢNH: FADE_OUT]', '[OUTRO: FADE_OUT]', '[CHUYỂN CẢNH: TILT_UP]', '[OUTRO: TILT_UP]', '[CHUYỂN CẢNH: WALK_AWAY]', '[OUTRO: WALK_AWAY]'). Populate `transition` with the exact tag or transition name.\n\n"
         "2. Keyframe Prompt (Image Prompt):\n"
         "   - Write a detailed text-to-image prompt to generate a single static keyframe reference image.\n"
         "   - DO NOT repeat or describe the character's appearance, features, hairstyle, clothing, outfit, or other visual details (e.g. do not say 'female, brown hair, wearing a striped t-shirt...'). Doing so is extremely incorrect.\n"
@@ -493,8 +657,8 @@ async def run_shot_planner(
         chunk_environments_json = json.dumps(cleaned_environments, ensure_ascii=False)
         chunk_props_json = json.dumps(cleaned_props, ensure_ascii=False)
         
-        # Get the sliding window of last 12 shots for continuity context
-        recent_shots = all_shots[-12:] if len(all_shots) > 12 else all_shots
+        # Get the sliding window of last 6 shots for continuity context (excluding heavy keyframe_prompt text to optimize speed)
+        recent_shots = all_shots[-6:] if len(all_shots) > 6 else all_shots
         previous_shots_str = ""
         if recent_shots:
             simplified_previous = []
@@ -506,10 +670,9 @@ async def run_shot_planner(
                     "environment": s.environment,
                     "props": s.props,
                     "actions": s.actions,
-                    "dialogue": [{"character": d.character, "speech": d.speech} for d in s.dialogue] if s.dialogue else [],
-                    "keyframe_prompt": s.keyframe_prompt
+                    "dialogue": [{"character": d.character, "speech": d.speech} for d in s.dialogue] if s.dialogue else []
                 })
-            previous_shots_str = json.dumps(simplified_previous, ensure_ascii=False, indent=2)
+            previous_shots_str = json.dumps(simplified_previous, ensure_ascii=False)
         else:
             previous_shots_str = "None (This is the start of the storyboard)"
 
@@ -537,7 +700,7 @@ async def run_shot_planner(
             shot.shot_id = f"Shot{global_shot_counter:03d}"
             global_shot_counter += 1
             # Compile the motion prompt string using the helper
-            shot.motion_prompt = compile_motion_prompt(shot)
+            shot.motion_prompt = compile_motion_prompt(shot, character_map)
             
         all_shots.extend(chunk_data.shots)
         
@@ -557,11 +720,18 @@ async def run_keyframe_prompt_generator(
     shots = json.loads(shots_json)
     
     # Check if all shots already have keyframe_prompt (pre-computed by Shot Prompt Generator)
-    if shots and all(bool(s.get("keyframe_prompt")) for s in shots):
-        keyframes = [
-            ShotKeyframePrompt(shot_id=s["shot_id"], prompt=s["keyframe_prompt"])
-            for s in shots
-        ]
+    has_all_keyframes = True
+    keyframes = []
+    for s in shots:
+        prompt_val = s.get("keyframe_prompt") if isinstance(s, dict) else getattr(s, "keyframe_prompt", "")
+        shot_id_val = s.get("shot_id") if isinstance(s, dict) else getattr(s, "shot_id", "")
+        if prompt_val:
+            keyframes.append(ShotKeyframePrompt(shot_id=shot_id_val, prompt=prompt_val))
+        else:
+            has_all_keyframes = False
+            break
+
+    if shots and has_all_keyframes:
         return KeyframePromptResponse(keyframes=keyframes)
     
     # Group shots by scene number first to keep context isolated, then split if scene shots exceed chunk_size
@@ -740,7 +910,14 @@ async def run_motion_prompt_generator(
     custom_instructions: Optional[str] = None
 ) -> MotionPromptResponse:
     shots = json.loads(shots_json)
+    all_characters = json.loads(characters_json) if characters_json else []
     
+    # Build character map
+    character_map = {c["name"].strip().lower(): c for c in all_characters if "name" in c}
+    for c in all_characters:
+        if "canonical_name" in c and c["canonical_name"]:
+            character_map[c["canonical_name"].strip().lower()] = c
+
     # Compile motion prompts directly from shot details if custom_instructions is not provided
     has_all_prompts = True
     motion_prompts = []
@@ -749,12 +926,11 @@ async def run_motion_prompt_generator(
         for s in shots:
             try:
                 # Try compiling from shot details (no Gemini API calls, extremely fast)
-                shot_obj = Shot.model_validate(s)
-                if shot_obj.motion_prompt and shot_obj.motion_prompt.strip():
-                    compiled = shot_obj.motion_prompt
-                else:
-                    compiled = compile_motion_prompt(shot_obj)
-                motion_prompts.append(ShotMotionPrompt(shot_id=s["shot_id"], prompt=compiled))
+                # Always re-compile programmatically to ensure character voice styles, age, gender, and new structure are injected
+                shot_obj = Shot.model_validate(s) if isinstance(s, dict) else s
+                compiled = compile_motion_prompt(shot_obj, character_map)
+                shot_id_val = s.get("shot_id") if isinstance(s, dict) else getattr(s, "shot_id", "")
+                motion_prompts.append(ShotMotionPrompt(shot_id=shot_id_val, prompt=compiled))
             except Exception as e:
                 logger.warning(f"Failed to validate shot for programmatic compilation: {e}. Falling back to Gemini.")
                 has_all_prompts = False
@@ -797,21 +973,25 @@ async def run_motion_prompt_generator(
         "[Brief setting name and environment/lighting details. Include 'matching the reference image' for consistency.]\n\n"
         "REFERENCE:\n"
         "Continue from the provided reference image. Do not change characters' appearance or background environment.\n\n"
+        "CHARACTERS:\n"
+        "[List of characters visible in the shot, including their gender, age, personality, and voice style description in parentheses, e.g.:\n"
+        "- Emma (female, 30s, caring, warm gentle voice)\n"
+        "- Lisa (girl, 6, curious, cheerful young voice). If there are no characters, write 'None'.]\n\n"
         "SHOT:\n"
         "[Camera framing and movement, e.g. 'Medium shot. Static camera.']\n\n"
         "TIMELINE:\n"
-        "[Simple chronological breakdown of actions in seconds, without 's' suffixes, e.g.:\n"
+        "[Simple chronological breakdown of actions in seconds, without 's' suffixes. For dialogue lines, use speaker name and their voice attributes in parentheses, e.g.:\n"
         "0-3 Emma notices Lisa.\n"
-        "3-6 Emma: Lisa, did you wash your hands?\n"
-        "6-8 Lisa: Oh! I forgot.]\n\n"
+        "3-6 Emma (female, warm gentle voice): Lisa, did you wash your hands?\n"
+        "6-8 Lisa (girl, cheerful young voice): Oh! I forgot.]\n\n"
         "DIALOGUE:\n"
-        "[Dialogue lines, e.g. Emma: \"Lisa, did you wash your hands?\". Below the dialogue, append exactly:\n"
+        "[Dialogue lines, formatted as: CharacterName (gender, voice style description): \"speech text\". E.g., Emma (female, warm gentle voice): \"Lisa, did you wash your hands?\". Below the dialogue, append exactly:\n"
         "Dialogue must match exactly.\n"
         "No additional speech.\n"
         "Remain silent after the final line.\n"
         "If there is no dialogue, write 'None'.]\n\n"
         "ACTIONS:\n"
-        "[Simplified character movements. Always start with: 'Both characters maintain natural breathing, blinking and subtle body movement.' (or single character equivalent). Followed by the shot action, and character behaviors, e.g. 'Emma: Looks toward Lisa and speaks.' / 'Lisa: Turns toward Emma and replies.']\n\n"
+        "[Simplified character movements. Always start with: 'Both characters maintain natural breathing, blinking and subtle body movement.' (or single character equivalent). Followed by the shot action, and character behaviors. The ACTIONS section must only describe physical movements, poses, expressions, and gestures. You MUST NEVER write dialogue lines, spoken words, or speech (e.g. do not write 'CharacterName: \"Speech\"' or 'CharacterName: Speech') in the ACTIONS field. Keep ACTIONS purely visual. E.g. 'Emma: Looks toward Lisa and gestures.' / 'Lisa: Turns toward Emma and nods.']\n\n"
         "SPATIAL RULES:\n"
         "Characters move only through clear walkable space.\n"
         "Walk along existing aisles.\n"
@@ -829,7 +1009,7 @@ async def run_motion_prompt_generator(
         "CRITICAL LIMITS:\n"
         "- Total word count must be between 80 and 150 words. Do not repeat descriptions or write unnecessary details.\n"
         "- Do not use any Negative Prompt section.\n"
-        "- SAFETY RULE: Do NOT use any age-identifying words like 'child', 'children', 'boy', 'girl', 'kid', 'kids', 'young boy', 'young girl', 'schoolboy', 'schoolgirl' or similar child-related terms in the motion prompts. Instead, ONLY refer to characters by their specific names (e.g. 'Lisa', 'Tom') or generic pronouns (e.g. 'they', 'he', 'she')."
+        "- SAFETY RULE: Do NOT use any age-identifying words like 'child', 'children', 'kid', 'kids', 'young boy', 'young girl', 'schoolboy', 'schoolgirl' or similar child-related terms in the motion prompts. Instead, ONLY refer to characters by their specific names (e.g. 'Lisa', 'Tom') or generic pronouns (e.g. 'they', 'he', 'she'). Note: 'boy' or 'girl' is allowed when describing voice/character gender characteristics, but avoid child/kids terms."
     )
     
     for chunk in shot_chunks:

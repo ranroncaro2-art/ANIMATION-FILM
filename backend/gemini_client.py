@@ -28,23 +28,25 @@ class PromptBlocked(Exception):
             msg += " Please simplify the storyboard or rewrite/remove unsafe or sensitive content (e.g. references to weapons, violence, injury, abuse, or highly sensitive child actions)."
         super().__init__(msg)
 
-async def enforce_rate_limit(rpm_limit: int):
+async def enforce_rate_limit(rpm_limit: int = 5, num_keys: int = 1):
     """
-    Blocks execution if the time since the last request is less than (60 / rpm_limit) seconds.
+    Blocks execution if the time since the last request is less than (60 / effective_rpm) seconds.
     This guarantees that requests are spaced out to conform to the Requests Per Minute (RPM) quota.
+    When multiple API keys are provided, rate limits are distributed across keys.
     """
     global last_request_time
     if rpm_limit <= 0:
         return
         
-    delay_between_requests = 60.0 / rpm_limit
+    effective_rpm = rpm_limit * max(1, num_keys)
+    delay_between_requests = 60.0 / effective_rpm
     
     async with request_lock:
         now = time.time()
         elapsed = now - last_request_time
         if elapsed < delay_between_requests:
             sleep_time = delay_between_requests - elapsed
-            logger.info(f"Rate limiter: Sleeping for {sleep_time:.2f}s to respect the limit of {rpm_limit} RPM...")
+            logger.info(f"Rate limiter: Sleeping for {sleep_time:.2f}s to respect the limit of {effective_rpm} RPM...")
             await asyncio.sleep(sleep_time)
         # Record the time immediately before returning to proceed with the request
         last_request_time = time.time()
@@ -192,8 +194,8 @@ async def generate_gemini_content(
             
             for retry in range(max_retries + 1):
                 try:
-                    # Enforce rate limits (Requests Per Minute)
-                    await enforce_rate_limit(rpm_limit)
+                    # Enforce rate limits (Requests Per Minute), scaling with available API keys
+                    await enforce_rate_limit(rpm_limit, len(api_keys))
                     
                     if retry > 0:
                         logger.info(f"Attempting API request (Retry {retry}/{max_retries}) using key index {index} ({masked_key}) with model '{current_model}'...")

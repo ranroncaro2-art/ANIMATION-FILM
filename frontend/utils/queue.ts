@@ -45,6 +45,26 @@ class BackgroundQueueManager {
   private systemLogs: SystemLog[] = [];
   private logListeners: Set<LogListener> = new Set();
   private dbWriteQueue: Promise<any> = Promise.resolve();
+  private imageAccountRRIndex: number = 0;
+
+  private async uploadImageToGoogle(imagePathOrUrl: string, accountId: string): Promise<string | null> {
+    try {
+      const res = await fetch("/api/upload-image", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ imagePath: imagePathOrUrl, accountId })
+      });
+      if (res.ok) {
+        const data = await res.json();
+        if (data.success && data.media_id) {
+          return data.media_id;
+        }
+      }
+    } catch (err) {
+      console.error("Error auto-uploading image to Google via upload-image API:", err);
+    }
+    return null;
+  }
 
   private async safeUpdateProject(projectId: string, updater: (project: SavedProject) => SavedProject | Promise<SavedProject>) {
     this.dbWriteQueue = this.dbWriteQueue.then(async () => {
@@ -1188,21 +1208,48 @@ class BackgroundQueueManager {
   }
 
   private async executeImageTask(task: MediaTask) {
+    let chosenAccount = "default_account";
+    const selectedImageAccounts: string[] = task.params?.selectedImageAccounts || [];
+    if (selectedImageAccounts.length > 0) {
+      chosenAccount = selectedImageAccounts[this.imageAccountRRIndex % selectedImageAccounts.length];
+      this.imageAccountRRIndex++;
+    } else if (task.params?.accountId) {
+      chosenAccount = task.params.accountId;
+    }
+
+    // Auto Upload referenced local images to Google if needed
+    let mediaIds = task.params?.mediaIds || [];
+    if (task.type === "shot_image" && task.params?.referencedAssetPaths && task.params.referencedAssetPaths.length > 0) {
+      const freshMediaIds: string[] = [];
+      for (const assetPath of task.params.referencedAssetPaths) {
+        if (assetPath && (assetPath.startsWith("/api/media") || assetPath.includes(":\\") || assetPath.includes("/"))) {
+          this.addLog(`[Auto Upload] Tải ảnh tham chiếu lên Google qua TK ${chosenAccount}...`, "info", task.projectId);
+          const newMediaId = await this.uploadImageToGoogle(assetPath, chosenAccount);
+          if (newMediaId) {
+            freshMediaIds.push(newMediaId);
+          }
+        }
+      }
+      if (freshMediaIds.length > 0) {
+        mediaIds = freshMediaIds;
+      }
+    }
+
     const payload: any = {
       prompt: task.prompt,
       count: task.params?.imageCount || 1,
       aspect_ratio: task.params?.imageAspectRatio || "IMAGE_ASPECT_RATIO_LANDSCAPE",
       model: task.params?.imageModel || "GEM_PIX_2",
-      for_video: true
+      for_video: true,
+      account_id: chosenAccount
     };
 
-    if (task.params?.mediaIds && task.params.mediaIds.length > 0) {
-      payload.media_ids = task.params.mediaIds;
-      payload.account_id = task.params.accountId || "default_account";
+    if (mediaIds && mediaIds.length > 0) {
+      payload.media_ids = mediaIds;
     }
 
     if (task.type === "shot_image") {
-      const logMsg = `[API Vẽ ảnh Shot] Tham số gửi đi: Prompt: "${payload.prompt}" | Model: ${payload.model} | Aspect Ratio: ${payload.aspect_ratio} | Count: ${payload.count} | Media IDs tham chiếu: ${JSON.stringify(payload.media_ids || [])}`;
+      const logMsg = `[API Vẽ ảnh Shot] Prompt: "${payload.prompt}" | Model: ${payload.model} | Aspect: ${payload.aspect_ratio} | Count: ${payload.count} | TK: ${payload.account_id} | Media IDs: ${JSON.stringify(payload.media_ids || [])}`;
       console.log(logMsg, payload);
       this.addLog(logMsg, "info", task.projectId);
     }
@@ -1231,7 +1278,7 @@ class BackgroundQueueManager {
     const result = {
       url: data.images[0].url,
       media_id: data.images[0].media_id,
-      account_id: data.account_id || "default_account"
+      account_id: data.account_id || chosenAccount
     };
 
     if (task.params?.pcDirectory) {
@@ -1243,8 +1290,8 @@ class BackgroundQueueManager {
       } else if (task.type === "shot_image") {
         const parts = task.targetId.split("_");
         const shotId = parts[parts.length - 1];
-        subFolder = "images_shots";
-        filename = `${shotId}.png`;
+        subFolder = "images";
+        filename = `shots_${shotId}.png`;
       }
 
       try {
@@ -1316,13 +1363,46 @@ class BackgroundQueueManager {
       return copy;
     });
 
+    this.addLog(`[Tạo Ảnh Thành Công] Target: ${task.targetId} | Dự án: ${task.projectName} | TK API: ${result.account_id}`, "success", task.projectId);
+
     if (pData) {
       this.notify(task.projectId, this.getTaskState(task.projectId), pData, stepsCopy);
     }
   }
 
   private async executeVideoTask(task: MediaTask) {
-    const isI2V = task.params?.mediaIds && task.params.mediaIds.length > 0;
+    let chosenAccount = "default_account";
+    if (task.params?.selectedUltraAccount) {
+      chosenAccount = task.params.selectedUltraAccount;
+    } else if (task.params?.accountId) {
+      chosenAccount = task.params.accountId;
+    }
+
+    let mediaIds = task.params?.mediaIds;
+    const keyframeUrl = task.params?.keyframeUrl;
+
+    // If I2V but media_id is missing or keyframe is a local file path, auto-upload keyframe to Google using Ultra account
+    if ((!mediaIds || mediaIds.length === 0 || !mediaIds[0] || mediaIds[0].startsWith("mock_")) && keyframeUrl) {
+      this.addLog(`[Auto Upload] Tải ảnh khung hình (keyframe) lên Google qua TK Ultra ${chosenAccount}...`, "info", task.projectId);
+      const newMediaId = await this.uploadImageToGoogle(keyframeUrl, chosenAccount);
+      if (newMediaId) {
+        mediaIds = [newMediaId];
+        // Save new media_id back to projectData keyframe
+        const parts = task.targetId.split("_");
+        const shotId = parts[parts.length - 1];
+        await this.safeUpdateProject(task.projectId, (project) => {
+          const copy = { ...project };
+          if (copy.projectData && copy.projectData.keyframes) {
+            copy.projectData.keyframes = copy.projectData.keyframes.map((k: any) =>
+              k.shot_id === shotId ? { ...k, media_id: newMediaId, account_id: chosenAccount } : k
+            );
+          }
+          return copy;
+        });
+      }
+    }
+
+    const isI2V = mediaIds && mediaIds.length > 0;
 
     const mapT2VModel = (uiModel: string): string => {
       if (!uiModel) return "veo_3_1_t2v_lite_low_priority";
@@ -1341,12 +1421,12 @@ class BackgroundQueueManager {
       duration_seconds: task.params?.duration_seconds || 5,
       fps: 30,
       count: task.params?.videoCount || 1,
+      account_id: chosenAccount
     };
 
     if (isI2V) {
       payload.model = "veo_3_1_r2v_lite_low_priority";
-      payload.media_ids = task.params.mediaIds;
-      payload.account_id = task.params.accountId || "default_account";
+      payload.media_ids = mediaIds;
     } else {
       payload.model = mapT2VModel(task.params?.videoModel);
     }
@@ -1355,7 +1435,7 @@ class BackgroundQueueManager {
       payload.audioReferenceMediaIds = task.params.audioReferenceMediaIds;
     }
 
-    const logMsg = `[API Veo 3 Video] Tham số gửi đi: Prompt: "${payload.prompt}" | Model: ${payload.model} | Aspect Ratio: ${payload.aspect_ratio} | Duration: ${payload.duration_seconds}s | Fps: ${payload.fps} | Count: ${payload.count} | Media IDs tham chiếu: ${JSON.stringify(payload.media_ids || [])} | Audio Media IDs: ${JSON.stringify(payload.audioReferenceMediaIds || [])}`;
+    const logMsg = `[API Veo 3 Video] Prompt: "${payload.prompt}" | Model: ${payload.model} | Aspect: ${payload.aspect_ratio} | Duration: ${payload.duration_seconds}s | TK Ultra: ${payload.account_id} | Media IDs: ${JSON.stringify(payload.media_ids || [])}`;
     console.log(logMsg, payload);
     this.addLog(logMsg, "info", task.projectId);
 
@@ -1425,12 +1505,12 @@ class BackgroundQueueManager {
 
       if (motionIndex !== -1) {
         pData.motion_prompts = pData.motion_prompts.map((m: any, idx: number) =>
-          idx === motionIndex ? { ...m, video_url: videoUrl } : m
+          idx === motionIndex ? { ...m, video_url: videoUrl, account_id: chosenAccount } : m
         );
       } else {
         pData.motion_prompts = [
           ...(pData.motion_prompts || []),
-          { shot_id: shotId, motion_description: task.prompt, video_url: videoUrl }
+          { shot_id: shotId, motion_description: task.prompt, video_url: videoUrl, account_id: chosenAccount }
         ];
       }
 
@@ -1439,6 +1519,8 @@ class BackgroundQueueManager {
       stepsCopy = copy.steps;
       return copy;
     });
+
+    this.addLog(`[Tạo Video Thành Công] Target: ${task.targetId} | Dự án: ${task.projectName} | TK Ultra: ${chosenAccount}`, "success", task.projectId);
 
     if (pData) {
       this.notify(task.projectId, this.getTaskState(task.projectId), pData, stepsCopy);

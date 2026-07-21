@@ -1,12 +1,14 @@
 {
   "name": "frontend",
-  "version": "0.1.0",
+  "version": "1.0.1",
   "private": true,
+  "main": "main.js",
   "scripts": {
     "dev": "next dev -p 3001",
     "build": "next build",
     "start": "next start -p 3001",
-    "lint": "eslint"
+    "lint": "eslint",
+    "electron:build": "npm run build && electron-builder"
   },
   "dependencies": {
     "next": "16.2.10",
@@ -17,6 +19,8 @@
     "@types/node": "^20",
     "@types/react": "^19",
     "@types/react-dom": "^19",
+    "electron": "^43.1.1",
+    "electron-builder": "^26.15.3",
     "eslint": "^9",
     "eslint-config-next": "16.2.10",
     "typescript": "^5"

@@ -29,7 +29,7 @@ if ($result -eq [System.Windows.Forms.DialogResult]::OK) {
     }
 
     // Auto create subdirectories
-    const subdirs = ["images_shots", "references", "videos"];
+    const subdirs = ["references", "images", "videos"];
     for (const subdir of subdirs) {
       const dirPath = path.join(selectedPath, subdir);
       if (!fs.existsSync(dirPath)) {

@@ -33,6 +33,11 @@ interface ApiKeyInputProps {
   onChangeVideoConcurrency: (val: number) => void;
   mediaDelaySeconds: number;
   onChangeMediaDelaySeconds: (val: number) => void;
+
+  selectedImageAccounts?: string[];
+  onChangeSelectedImageAccounts?: (accounts: string[]) => void;
+  selectedUltraAccount?: string;
+  onChangeSelectedUltraAccount?: (account: string) => void;
 }
 
 export default function ApiKeyInput({
@@ -63,10 +68,40 @@ export default function ApiKeyInput({
   onChangeVideoConcurrency,
   mediaDelaySeconds,
   onChangeMediaDelaySeconds,
+
+  selectedImageAccounts = [],
+  onChangeSelectedImageAccounts,
+  selectedUltraAccount = "",
+  onChangeSelectedUltraAccount,
 }: ApiKeyInputProps) {
   const [rawText, setRawText] = useState("");
   const [isSaved, setIsSaved] = useState(false);
   const [activeSettingsTab, setActiveSettingsTab] = useState<"gemini" | "image" | "video">("gemini");
+  
+  const [fetchedAccounts, setFetchedAccounts] = useState<any[]>([]);
+  const [isLoadingAccounts, setIsLoadingAccounts] = useState<boolean>(false);
+
+  const loadAccounts = async () => {
+    setIsLoadingAccounts(true);
+    try {
+      const localApiUrl = typeof window !== "undefined" ? `http://${window.location.hostname}:5000` : "http://127.0.0.1:5000";
+      const res = await fetch(`${localApiUrl}/api/accounts`);
+      if (res.ok) {
+        const data = await res.json();
+        if (data.success && Array.isArray(data.accounts)) {
+          setFetchedAccounts(data.accounts);
+        }
+      }
+    } catch (err) {
+      console.error("Error fetching accounts:", err);
+    } finally {
+      setIsLoadingAccounts(false);
+    }
+  };
+
+  useEffect(() => {
+    loadAccounts();
+  }, []);
 
   useEffect(() => {
     // Initialize text with existing keys
@@ -337,6 +372,66 @@ export default function ApiKeyInput({
               </div>
             </div>
 
+            {/* Multi-Account Selection Panel */}
+            <div style={{ display: "flex", flexDirection: "column", gap: "8px", background: "rgba(0,0,0,0.25)", padding: "12px", borderRadius: "8px", border: "1px solid rgba(6,182,212,0.2)" }}>
+              <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+                <label style={{ fontSize: "0.8rem", fontWeight: 700, color: "#06b6d4", display: "flex", alignItems: "center", gap: "6px" }}>
+                  👤 Chọn tài khoản tạo ảnh (Đa tài khoản luân phiên chống hết Quota)
+                </label>
+                <button
+                  type="button"
+                  onClick={loadAccounts}
+                  style={{ background: "transparent", border: "none", color: "#a78bfa", fontSize: "0.75rem", cursor: "pointer", fontWeight: 600 }}
+                >
+                  🔄 Tải lại TK
+                </button>
+              </div>
+              {fetchedAccounts.length === 0 ? (
+                <span style={{ fontSize: "0.75rem", color: "var(--text-muted)" }}>
+                  {isLoadingAccounts ? "Đang kết nối tải tài khoản..." : "Không tìm thấy danh sách TK local (dùng default_account)"}
+                </span>
+              ) : (
+                <div style={{ display: "flex", flexWrap: "wrap", gap: "8px", marginTop: "4px" }}>
+                  {fetchedAccounts.map((acc: any) => {
+                    const isChecked = selectedImageAccounts.includes(acc.id);
+                    return (
+                      <label
+                        key={acc.id}
+                        style={{
+                          display: "flex",
+                          alignItems: "center",
+                          gap: "6px",
+                          fontSize: "0.8rem",
+                          cursor: "pointer",
+                          background: isChecked ? "rgba(6,182,212,0.18)" : "rgba(255,255,255,0.04)",
+                          padding: "5px 10px",
+                          borderRadius: "6px",
+                          border: isChecked ? "1px solid #06b6d4" : "1px solid rgba(255,255,255,0.1)",
+                          userSelect: "none"
+                        }}
+                      >
+                        <input
+                          type="checkbox"
+                          checked={isChecked}
+                          onChange={(e) => {
+                            if (!onChangeSelectedImageAccounts) return;
+                            if (e.target.checked) {
+                              onChangeSelectedImageAccounts([...selectedImageAccounts, acc.id]);
+                            } else {
+                              onChangeSelectedImageAccounts(selectedImageAccounts.filter((id) => id !== acc.id));
+                            }
+                          }}
+                        />
+                        <span style={{ fontWeight: 600, color: acc.alive ? "#ffffff" : "#f87171" }}>
+                          {acc.id} <span style={{ fontSize: "0.7rem", opacity: 0.8 }}>({acc.acc_type || "image"})</span> {acc.alive ? "✓" : "❌"}
+                        </span>
+                      </label>
+                    );
+                  })}
+                </div>
+              )}
+            </div>
+
             {/* Model & Parallel Threads */}
             <div style={{ display: "flex", gap: "12px" }}>
               <div style={{ display: "flex", flexDirection: "column", gap: "6px", flex: 1 }}>
@@ -447,6 +542,43 @@ export default function ApiKeyInput({
                   <option value="VIDEO_ASPECT_RATIO_SQUARE">1:1 Vuông</option>
                 </select>
               </div>
+            </div>
+
+            {/* Ultra Account Selection Panel */}
+            <div style={{ display: "flex", flexDirection: "column", gap: "8px", background: "rgba(0,0,0,0.25)", padding: "12px", borderRadius: "8px", border: "1px solid rgba(245,158,11,0.2)" }}>
+              <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+                <label style={{ fontSize: "0.8rem", fontWeight: 700, color: "#f59e0b", display: "flex", alignItems: "center", gap: "6px" }}>
+                  👑 Tài khoản Ultra tạo Video (Chỉ định đúng TK Ultra trên máy chủ)
+                </label>
+                <button
+                  type="button"
+                  onClick={loadAccounts}
+                  style={{ background: "transparent", border: "none", color: "#a78bfa", fontSize: "0.75rem", cursor: "pointer", fontWeight: 600 }}
+                >
+                  🔄 Tải lại TK
+                </button>
+              </div>
+              <select
+                value={selectedUltraAccount}
+                onChange={(e) => onChangeSelectedUltraAccount?.(e.target.value)}
+                style={{
+                  background: "var(--bg-secondary)",
+                  color: "#ffffff",
+                  border: "1px solid var(--border-color)",
+                  borderRadius: "var(--border-radius-sm)",
+                  padding: "8px 12px",
+                  fontSize: "0.85rem",
+                  outline: "none",
+                  cursor: "pointer",
+                }}
+              >
+                <option value="">-- Mặc định (Tự động chọn TK sẵn có) --</option>
+                {fetchedAccounts.map((acc: any) => (
+                  <option key={acc.id} value={acc.id}>
+                    {acc.id} ({acc.acc_type || "video"}) {acc.alive ? "✓ Sẵn sàng" : "❌ Lỗi/Hết token"}
+                  </option>
+                ))}
+              </select>
             </div>
 
             {/* Model & Parallel Threads */}

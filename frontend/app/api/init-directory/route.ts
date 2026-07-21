@@ -14,7 +14,7 @@ export async function POST(req: NextRequest) {
     const cleanPath = selectedPath.trim();
     
     // Auto create subdirectories
-    const subdirs = ["images_shots", "references", "videos"];
+    const subdirs = ["references", "images", "videos"];
     for (const subdir of subdirs) {
       const dirPath = path.join(cleanPath, subdir);
       if (!fs.existsSync(dirPath)) {
