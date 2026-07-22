@@ -57,30 +57,32 @@ def main():
     else:
         print("[WARNING] node.exe not found at standard path! Please check Node.js installation.")
         
-    # 4. Copy Frontend Next.js build & node_modules
-    print("[4/6] Copying Next.js production web app...")
+    # 4. Copy Frontend Next.js Standalone build
+    print("[4/6] Copying Next.js standalone production web app...")
     frontend_src = os.path.join(root_dir, "frontend")
     frontend_dest = os.path.join(app_dir, "frontend")
     os.makedirs(frontend_dest, exist_ok=True)
     
-    # Build Next.js if not built
+    # Build Next.js
     subprocess.run("npm run build", shell=True, cwd=frontend_src, check=True)
     
-    folders_to_copy = [".next", "node_modules", "public"]
-    files_to_copy = ["package.json", "next.config.ts"]
-    
-    for folder in folders_to_copy:
-        src_path = os.path.join(frontend_src, folder)
-        dest_path = os.path.join(frontend_dest, folder)
-        if os.path.exists(src_path):
-            print(f"Copying {folder}...")
-            shutil.copytree(src_path, dest_path, dirs_exist_ok=True)
-            
-    for file in files_to_copy:
-        src_path = os.path.join(frontend_src, file)
-        dest_path = os.path.join(frontend_dest, file)
-        if os.path.exists(src_path):
-            shutil.copy2(src_path, dest_path)
+    standalone_src = os.path.join(frontend_src, ".next", "standalone")
+    if os.path.exists(standalone_src):
+        print("Copying Next.js standalone server payload...")
+        shutil.copytree(standalone_src, frontend_dest, dirs_exist_ok=True)
+        
+    # Copy static & public assets into standalone directory structure
+    static_src = os.path.join(frontend_src, ".next", "static")
+    static_dest = os.path.join(frontend_dest, ".next", "static")
+    if os.path.exists(static_src):
+        print("Copying .next/static assets...")
+        shutil.copytree(static_src, static_dest, dirs_exist_ok=True)
+        
+    public_src = os.path.join(frontend_src, "public")
+    public_dest = os.path.join(frontend_dest, "public")
+    if os.path.exists(public_src):
+        print("Copying public assets...")
+        shutil.copytree(public_src, public_dest, dirs_exist_ok=True)
             
     # 5. Compile C# Native Windows Launcher
     print("[5/6] Compiling C# Native Windows Launcher EXE...")
@@ -122,7 +124,7 @@ namespace AIKidsStudio
             }
 
             string frontendDir = Path.Combine(appDir, "frontend");
-            string nextScript = Path.Combine(frontendDir, "node_modules", "next", "dist", "bin", "next");
+            string serverJs = Path.Combine(frontendDir, "server.js");
 
             try
             {
@@ -163,18 +165,19 @@ namespace AIKidsStudio
                     Log("ERROR: Backend executable or main.py not found!");
                 }
 
-                // 2. Start Frontend Server quietly
-                if (Directory.Exists(frontendDir))
+                // 2. Start Frontend Server quietly (Standalone Next.js)
+                if (File.Exists(serverJs))
                 {
-                    Log("Starting Frontend process: " + nodeExe + " " + nextScript);
+                    Log("Starting Standalone Frontend process: " + nodeExe + " " + serverJs);
                     ProcessStartInfo frontendInfo = new ProcessStartInfo
                     {
                         FileName = nodeExe,
-                        Arguments = string.Format("\"{0}\" start -p 3001", nextScript),
+                        Arguments = string.Format("\"{0}\"", serverJs),
                         WorkingDirectory = frontendDir,
                         CreateNoWindow = true,
                         UseShellExecute = false
                     };
+                    frontendInfo.EnvironmentVariables["PORT"] = "3001";
                     frontendInfo.EnvironmentVariables["NODE_ENV"] = "production";
                     frontendProcess = Process.Start(frontendInfo);
                 }
