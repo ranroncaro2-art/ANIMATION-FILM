@@ -1131,7 +1131,7 @@ export default function Home() {
       queueManager.resumeTask(activeProjectId);
       setIsPaused(false);
       if (activeStep) {
-        runSingleStep(activeStep);
+        handleRunStep(activeStep);
       } else {
         runCombo1();
       }
