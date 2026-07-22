@@ -26,6 +26,7 @@ export interface ProjectTaskState {
   activeStep: StepKey | null;
   isRunningAll: boolean;
   error?: string;
+  isPaused?: boolean;
 }
 
 export interface SystemLog {
