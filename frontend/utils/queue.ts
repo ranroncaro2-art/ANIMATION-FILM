@@ -1084,7 +1084,7 @@ class BackgroundQueueManager {
       localStorage.setItem("global_output_tokens", (globalOut + outTokens).toString());
     }
 
-    switch (stepKey) {
+    switch (stepKey as StepKey) {
       case "story_analyzer":
         updatedData.scenes = (responseData.scenes || []).map((scene: any) => ({
           scene_id: scene.scene_number,
