@@ -1,7 +1,11 @@
 from pydantic import BaseModel, Field
-from typing import List, Optional
+from typing import List, Optional, Dict, Any
 
 # --- Shared & Base Schemas ---
+
+class StateItem(BaseModel):
+    key: str = Field(description="Name of state variable, e.g. alex_location, map, explorer_badge")
+    value: str = Field(description="Current status or value, e.g. maze center, held in hand, missing")
 
 class DialogueItem(BaseModel):
     character: str = Field(description="The name of the character speaking.")
@@ -17,6 +21,8 @@ class SceneAnalysis(BaseModel):
     props: List[str] = Field(description="List of physical objects/props used in this scene.")
     action: str = Field(description="Description of the visual actions and events in this scene.")
     dialogue: List[DialogueItem] = Field(description="Chronological dialogue exchange in this scene.")
+    state_before: List[StateItem] = Field(default_factory=list, description="State items before scene starts.")
+    state_after: List[StateItem] = Field(default_factory=list, description="State items after scene finishes.")
 
 class StoryAnalysisResponse(BaseModel):
     scenes: List[SceneAnalysis] = Field(description="List of analyzed scenes in chronological order.")
@@ -70,6 +76,13 @@ class PropAsset(BaseModel):
 class PropExtractorResponse(BaseModel):
     props: List[PropAsset] = Field(description="List of all unique props extracted from the storyboard with reference prompts.")
 
+class AssetsResponse(BaseModel):
+    characters: List[CharacterAsset] = Field(description="Unique list of characters with details and turnaround prompts.")
+    environments: List[EnvironmentAsset] = Field(description="Unique list of locations with reference prompts.")
+    props: List[PropAsset] = Field(description="Unique list of prop objects with reference prompts.")
+    input_tokens: Optional[int] = 0
+    output_tokens: Optional[int] = 0
+
 # --- Step 6: Shot Planner ---
 
 class TimelineItem(BaseModel):
@@ -98,8 +111,8 @@ class Shot(BaseModel):
     camera: str = Field(description="Camera framing and movement description combined, e.g. 'Medium Shot, Static'.")
     timeline: List[TimelineItem] = Field(description="Action timeline breakdown in seconds.")
     motion: MotionDetails = Field(description="Motion details containing primary, secondary, and motion level.")
-    keyframe_prompt: str = Field(description="Detailed image prompt for text-to-image reference. Only describe characters, outfit, environment, props, framing, lighting. No motion, no speech, no timeline.")
-    motion_prompt: str = Field(default="", description="Detailed video motion prompt constructed directly from keyframe prompt and shot data.")
+    keyframe_prompt: str = Field(description="Detailed image prompt for text-to-image reference image. IMPORTANT: DO NOT re-describe character visual appearance, outfits, hair, age, or child terms. ONLY refer to characters by their exact names (e.g. 'Emma', 'Stranger'). Focus prompt on character action/pose, specific environment name, active props, framing, and lighting. Pixar-quality stylized 3D, no motion blur, no text.")
+    motion_prompt: str = Field(default="", description="Detailed video motion prompt constructed directly from shot data. Under CHARACTERS section, list ONLY character names without any descriptions.")
 
 class ShotPlannerResponse(BaseModel):
     shots: List[Shot] = Field(description="List of planned shots for the episode.")
@@ -128,24 +141,99 @@ class MotionPromptResponse(BaseModel):
     input_tokens: Optional[int] = 0
     output_tokens: Optional[int] = 0
 
-class AssetsResponse(BaseModel):
-    characters: List[CharacterAsset] = Field(description="Unique list of characters with details and turnaround prompts.")
-    environments: List[EnvironmentAsset] = Field(description="Unique list of locations with reference prompts.")
-    props: List[PropAsset] = Field(description="Unique list of prop objects with reference prompts.")
-    input_tokens: Optional[int] = 0
-    output_tokens: Optional[int] = 0
-
 # --- Step 9: Veo Compliance Checker ---
 
 class ComplianceCheckResult(BaseModel):
     is_compliant: bool = Field(description="True if the prompt passes all checklist items, False otherwise.")
     errors: List[str] = Field(description="List of specific checklist items that failed.")
 
-# --- API Request/Response schemas ---
+# --- API Profile & Quota Schemas ---
+
+class ApiKeyProfilePayload(BaseModel):
+    id: str = Field(description="Unique profile identifier, e.g., 'proj_a_key_1'")
+    label: str = Field(description="Human readable label, e.g., 'Project A - Key 1'")
+    apiKey: str = Field(description="Raw Gemini API key")
+    quotaGroupId: str = Field(default="default", description="Shared ID for keys belonging to the same project/quota")
+    enabledModels: List[str] = Field(default_factory=lambda: ["gemini-2.5-flash", "gemini-3.5-flash"], description="Supported models")
+    enabled: bool = Field(default=True, description="Whether this key profile is enabled")
+    rpm: int = Field(default=5, description="Requests per minute limit")
+    tpm: int = Field(default=250000, description="Tokens per minute limit")
+    rpd: int = Field(default=20, description="Requests per day limit")
+    maxInFlight: int = Field(default=1, description="Max concurrent in-flight requests")
+
+class QuotaStateResponse(BaseModel):
+    groupId: str
+    model: str
+    requestsLastMinute: int
+    inputTokensLastMinute: int
+    requestsToday: int
+    cooldownSeconds: float
+    inFlight: int
+    invalidKeys: List[str]
+    lastError: Optional[str] = None
+
+# --- Pipeline & Job API Request/Response Schemas ---
+
+class StandardizedShotData(BaseModel):
+    scene_number: int = Field(description="The sequential number of the scene/shot.")
+    duration_seconds: int = Field(default=5, description="Duration in seconds.")
+    setting: str = Field(default="", description="Location or background environment.")
+    characters: List[str] = Field(default_factory=list, description="Characters appearing in this shot.")
+    props: List[str] = Field(default_factory=list, description="Props used in this shot.")
+    shot_type: str = Field(default="", description="Shot type & angle (e.g. Medium Close-up, Low Angle).")
+    lighting: str = Field(default="", description="Lighting style (e.g. Cinematic Rim Light, Night).")
+    visual: str = Field(default="", description="Visual description of the static frame.")
+    character_motion: str = Field(default="", description="Action & movement of characters.")
+    camera_motion: str = Field(default="", description="Movement of camera lens (Pan, Zoom, Tilt).")
+    dialogue: List[DialogueItem] = Field(default_factory=list, description="Dialogue spoken in this shot.")
+    sound_fx: str = Field(default="", description="Sound effects.")
+    opening_transition: str = Field(default="", description="Transition entering scene.")
+    closing_transition: str = Field(default="", description="Transition exiting scene.")
+    assembled_image_prompt: str = Field(default="", description="Final assembled prompt for image generation.")
+    assembled_video_prompt: str = Field(default="", description="Final assembled prompt for video motion.")
+
+class ArtStylePreset(BaseModel):
+    id: str = Field(description="Preset identifier, e.g. '3d_pixar'")
+    name: str = Field(description="Human readable name, e.g. '3D Pixar Animation'")
+    prompt_prefix: str = Field(description="Style prefix appended to prompts.")
+    prompt_suffix: str = Field(default="", description="Quality/style suffix appended to prompts.")
 
 class PipelineRequest(BaseModel):
     storyboard: str = Field(description="The raw text storyboard input.")
-    api_keys: List[str] = Field(description="List of Gemini API keys for processing.")
+    style_preset_id: str = Field(default="3d_pixar", description="Selected art style preset ID.")
+    api_keys: List[str] = Field(default_factory=list, description="List of Gemini API keys.")
+    profiles: Optional[List[ApiKeyProfilePayload]] = Field(default=None, description="Structured API profiles")
+    scenes: Optional[List[SceneAnalysis]] = Field(default=None, description="Previously analyzed scenes supplied by the legacy frontend.")
+    characters: Optional[List[CharacterAsset]] = Field(default=None, description="Previously extracted character assets.")
+    environments: Optional[List[EnvironmentAsset]] = Field(default=None, description="Previously extracted environment assets.")
+    props: Optional[List[PropAsset]] = Field(default=None, description="Previously extracted prop assets.")
+    shots: Optional[List[Shot]] = Field(default=None, description="Previously planned shots.")
+    keyframes: Optional[List[ShotKeyframePrompt]] = Field(default=None, description="Existing keyframe prompts.")
+    custom_instructions: Optional[str] = Field(default=None, description="Optional instructions for prompt refinement.")
     model: str = Field(default="gemini-2.5-flash", description="The Gemini model to use.")
     rpm_limit: int = Field(default=5, description="Requests per minute rate limit.")
     chunk_size: int = Field(default=3, description="Chunk size for list splitting.")
+    quality_preset: str = Field(default="balanced", description="Dynamic token chunking preset: quality, balanced, fast")
+
+class JobCreateRequest(BaseModel):
+    storyboard: str = Field(description="The raw text storyboard input.")
+    style_preset_id: str = Field(default="3d_pixar", description="Selected art style preset ID.")
+    profile_ids: Optional[List[str]] = Field(default=None, description="Profile IDs to use for this job. If omitted, uses all enabled profiles.")
+    profiles: Optional[List[ApiKeyProfilePayload]] = Field(default=None, description="Inline profile configurations.")
+    mode: str = Field(default="fast", description="Workflow mode: 'fast' or 'quality'")
+    quality_preset: str = Field(default="balanced", description="Chunking preset: 'quality' (18K-22K tokens), 'balanced' (22K-28K), 'fast' (28K-35K)")
+
+class JobStatusResponse(BaseModel):
+    id: str
+    status: str
+    mode: str
+    quality_preset: str
+    progress: float
+    total_steps: int
+    completed_steps: int
+    eta_seconds: float
+    created_at: str
+    updated_at: str
+    error: Optional[str] = None
+    checkpoint: Optional[Dict[str, Any]] = None
+

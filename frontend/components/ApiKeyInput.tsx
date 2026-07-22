@@ -240,6 +240,35 @@ export default function ApiKeyInput({
               </select>
             </div>
 
+            <div style={{ display: "flex", flexDirection: "column", gap: "6px" }}>
+              <label style={{ fontSize: "0.8rem", fontWeight: 600, color: "var(--text-primary)" }}>
+                Chế độ Preset (Quality Preset)
+              </label>
+              <select
+                value={chunkSize <= 2 ? "quality" : chunkSize >= 7 ? "fast" : "balanced"}
+                onChange={(e) => {
+                  const val = e.target.value;
+                  if (val === "quality") onChangeChunkSize(2);
+                  else if (val === "fast") onChangeChunkSize(8);
+                  else onChangeChunkSize(5);
+                }}
+                style={{
+                  background: "var(--bg-secondary)",
+                  color: "#ffffff",
+                  border: "1px solid var(--border-color)",
+                  borderRadius: "var(--border-radius-sm)",
+                  padding: "6px 10px",
+                  fontSize: "0.85rem",
+                  outline: "none",
+                  cursor: "pointer",
+                }}
+              >
+                <option value="balanced">Balanced (Cân bằng - Khuyên dùng)</option>
+                <option value="fast">Fast (Tốc độ nhanh - Tối ưu kịch bản dài 100+ Scene)</option>
+                <option value="quality">Quality (Chất lượng cao - Tối ưu kịch bản ngắn)</option>
+              </select>
+            </div>
+
             <div style={{ display: "flex", gap: "12px" }}>
               <div style={{ display: "flex", flexDirection: "column", gap: "6px", flex: 1 }}>
                 <label style={{ fontSize: "0.8rem", fontWeight: 600, color: "var(--text-primary)", display: "flex", alignItems: "center", gap: "4px" }}>

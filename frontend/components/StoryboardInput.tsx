@@ -9,43 +9,47 @@ interface StoryboardInputProps {
   disabled?: boolean;
 }
 
-const SAMPLE_STORYBOARD = `Scene 1 (6s)
+const SAMPLE_STORYBOARD = `[MỞ CẢNH: Dissolve in]
+Scene 1
+Duration: 5s
+Setting: Deep dark forest at night, glowing mushrooms
+Characters: Goku, Vegeta
+Props: Dragon Ball 4-star
 
-Lisa đang đứng trước cổng trường.
-Cô bé mỉm cười và vẫy tay.
+[IMAGE DATA]
+Shot Type: Medium Close-up, Low Angle
+Lighting: Bioluminescent green rim light, dark moody night
+Visual: Goku standing with arms crossed looking intensely at Vegeta, dragon ball glowing on the ground.
 
-Lisa:
-"Hello everyone! My name is Lisa."
+[MOTION DATA]
+Character Motion: Goku turns his head slowly to the left with a confident smirk.
+Camera Motion: Camera slow pan right and subtle dolly zoom in.
 
-------------------------------------------------
-
-Scene 2 (8s)
-
-Tom chạy tới.
-
-Tom:
-"Hi Lisa!"
-
-Lisa:
-"Let's go to school!"
-
-------------------------------------------------
-
-Scene 3 (5s)
-
-Hai bạn cùng đi vào trường.
+[AUDIO DATA]
+Dialogue: Goku: "Chúng ta không thể dừng lại ở đây được!"
+Sound FX: Wind blowing through trees, crystal hum.
+[KẾT CẢNH: Cut to next scene]
 
 ------------------------------------------------
 
-Scene 4 (8s)
+Scene 2
+Duration: 4s
+Setting: Deep dark forest at night
+Characters: Vegeta
+Props: None
 
-Lisa nhìn thấy một bạn nhỏ đánh rơi hộp cơm.
+[IMAGE DATA]
+Shot Type: Close-up, High Angle
+Lighting: Dramatic side lighting
+Visual: Vegeta clenching his fist, energy aura beginning to flicker.
 
-Lisa:
-"You dropped your lunch box."
+[MOTION DATA]
+Character Motion: Vegeta powers up with golden energy aura surrounding his body.
+Camera Motion: Camera quick zoom in.
 
-Boy:
-"Thank you!"`;
+[AUDIO DATA]
+Dialogue: Vegeta: "Hãy xem sức mạnh thực sự của ta đây!"
+Sound FX: Energy charging up sound.`;
 
 export default function StoryboardInput({
   storyboard,

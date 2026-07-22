@@ -32,6 +32,25 @@ function startBackendServer() {
     });
   } else {
     console.log('[Electron Warning] Backend executable not found at:', backendExe);
+    const backendPy = path.join(appPath, '..', 'backend', 'main.py');
+    const venvPython = path.join(appPath, '..', 'backend', 'venv', 'Scripts', 'python.exe');
+    const pythonBin = fs.existsSync(venvPython) ? venvPython : 'python';
+
+    if (fs.existsSync(backendPy)) {
+      console.log('[Electron] Fallback: Starting Backend via Python:', pythonBin, backendPy);
+      backendProcess = spawn(pythonBin, [backendPy], {
+        cwd: path.dirname(backendPy),
+        shell: false
+      });
+
+      backendProcess.stdout?.on('data', (data) => {
+        console.log(`[Backend Server]: ${data.toString().trim()}`);
+      });
+
+      backendProcess.stderr?.on('data', (data) => {
+        console.error(`[Backend Error]: ${data.toString().trim()}`);
+      });
+    }
   }
 }
 

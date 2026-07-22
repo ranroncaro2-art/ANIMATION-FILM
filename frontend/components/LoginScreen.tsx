@@ -42,7 +42,21 @@ export default function LoginScreen({ onLoginSuccess }: LoginScreenProps) {
 
     const fetchMac = async () => {
       try {
-        // 1. Try Electron API if available
+        // 1. Try Next.js Local Server API (Always available when running Next.js, gets real hardware MAC)
+        try {
+          const resNext = await fetch('/api/system/mac');
+          if (resNext.ok) {
+            const dataNext = await resNext.json();
+            if (dataNext.mac && dataNext.mac !== 'MAC-NOT-FOUND' && dataNext.mac !== 'ERROR-FETCHING-MAC') {
+              setMacAddress(dataNext.mac);
+              return;
+            }
+          }
+        } catch (e) {
+          console.warn('Next API /api/system/mac call failed, trying next methods:', e);
+        }
+
+        // 2. Try Electron API if available
         if (typeof window !== 'undefined' && (window as any).electronAPI?.getMacAddress) {
           const mac = await (window as any).electronAPI.getMacAddress();
           if (mac && mac !== 'MAC-NOT-FOUND') {
@@ -51,7 +65,7 @@ export default function LoginScreen({ onLoginSuccess }: LoginScreenProps) {
           }
         }
 
-        // 2. Fallback to Python Backend API if available
+        // 3. Fallback to Python Backend API if available
         const backendHost = typeof window !== 'undefined' ? window.location.hostname : '127.0.0.1';
         const res = await fetch(`http://${backendHost}:8000/api/system/mac`);
         if (res.ok) {
@@ -62,11 +76,11 @@ export default function LoginScreen({ onLoginSuccess }: LoginScreenProps) {
           }
         }
 
-        // 3. Fallback
-        setMacAddress('DEV-MOCK-MAC-ADDRESS');
+        // 4. Failed all methods
+        setMacAddress('ERROR-FETCHING-MAC');
       } catch (err) {
         console.error('Failed to get MAC address:', err);
-        setMacAddress('DEV-MOCK-MAC-ADDRESS');
+        setMacAddress('ERROR-FETCHING-MAC');
       }
     };
 
@@ -191,7 +205,7 @@ export default function LoginScreen({ onLoginSuccess }: LoginScreenProps) {
             </svg>
           </div>
           <h2 style={styles.titleGradient}>
-            TOOL ANIME KIDS PRO
+            TOOL ANIMATION FILM PRO
           </h2>
           <p style={styles.subtitle}>
             Hệ thống xác thực & kích hoạt thiết bị

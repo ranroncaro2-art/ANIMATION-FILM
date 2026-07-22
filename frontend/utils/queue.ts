@@ -38,6 +38,18 @@ export interface SystemLog {
 type TaskListener = (projectId: string, state: ProjectTaskState, projectData?: any, steps?: any) => void;
 type LogListener = (logs: SystemLog[]) => void;
 
+const STEP_LABELS: Record<string, string> = {
+  story_analyzer: "Phân tích kịch bản thô & chia nhỏ cấu trúc từng Scene (Story Analyzer)",
+  character_extractor: "Bóc tách nhân vật, trang phục & Turnaround Prompts (Character Extractor)",
+  environment_extractor: "Bóc tách bối cảnh, địa điểm & không gian 3D Pixar (Environment Extractor)",
+  prop_extractor: "Bóc tách đạo cụ & vật thể trong từng cảnh (Prop Extractor)",
+  shot_planner: "Lập kế hoạch phân cảnh, góc quay camera & Shot Prompts (Shot Planner)",
+  keyframe_generator: "Tạo Prompt ảnh tham chiếu Keyframe (Keyframe Generator)",
+  motion_generator: "Tạo Veo 3 Video Motion Prompts cho từng shot (Motion Generator)",
+};
+
+const getStepText = (key: string) => STEP_LABELS[key] || key;
+
 class BackgroundQueueManager {
   private tasks: Map<string, ProjectTaskState> = new Map();
   private listeners: Set<TaskListener> = new Set();
@@ -139,12 +151,47 @@ class BackgroundQueueManager {
     return this.systemLogs;
   }
 
+  private pausedProjects: Set<string> = new Set();
+
+  isTaskPaused(projectId: string): boolean {
+    return this.pausedProjects.has(projectId);
+  }
+
+  pauseTask(projectId: string) {
+    this.pausedProjects.add(projectId);
+    const state = this.getTaskState(projectId);
+    const updatedState: ProjectTaskState = {
+      ...state,
+      status: "paused",
+      isPaused: true,
+    };
+    this.tasks.set(projectId, updatedState);
+    this.notify(projectId, updatedState);
+    this.addLog(`[Hệ thống] ⏸ Đã tạm dừng quá trình xử lý kịch bản. Nhấn "Tạo tiếp" để tiếp tục bất kỳ lúc nào.`, "info", projectId);
+  }
+
+  resumeTask(projectId: string) {
+    this.pausedProjects.delete(projectId);
+    const state = this.getTaskState(projectId);
+    const updatedState: ProjectTaskState = {
+      ...state,
+      status: "running",
+      isPaused: false,
+    };
+    this.tasks.set(projectId, updatedState);
+    this.notify(projectId, updatedState);
+    this.addLog(`[Hệ thống] ▶ Đang tiếp tục xử lý kịch bản từ các phân cảnh chưa hoàn thành...`, "running", projectId);
+  }
+
   getTaskState(projectId: string): ProjectTaskState {
-    return this.tasks.get(projectId) || {
+    const state = this.tasks.get(projectId);
+    if (state) return state;
+    return {
       projectId,
-      status: "idle",
+      status: this.isTaskPaused(projectId) ? "paused" : "idle",
       activeStep: null,
       isRunningAll: false,
+      isPaused: this.isTaskPaused(projectId),
     };
   }
 
@@ -182,7 +229,11 @@ class BackgroundQueueManager {
     };
     this.tasks.set(projectId, taskState);
     this.notify(projectId, taskState);
-    this.addLog(`Bắt đầu chạy bước "${stepKey}"...`, "running", projectId);
+    if (stepKey === "story_analyzer") {
+      this.addLog(`[Bộ Lọc Local] ⚡ Đang phân tích kịch bản qua Bộ Lọc Thủ Công (0 Tokens)...`, "running", projectId);
+    } else {
+      this.addLog(`[Gemini AI] ⏳ Đang phân tích: ${getStepText(stepKey)}...`, "running", projectId);
+    }
 
     const promise = this.executeStepApi(params)
       .then(async (updatedData) => {
@@ -201,7 +252,11 @@ class BackgroundQueueManager {
           model: params.selectedModel,
         };
         await saveProject(savedProj);
-        this.addLog(`Bước "${stepKey}" hoàn thành thành công!`, "success", projectId);
+        if (stepKey === "story_analyzer") {
+          this.addLog(`[Bộ Lọc Local] ⚡ Hoàn thành bóc tách Scene qua Bộ Lọc Thủ Công (0 Tokens consumed)!`, "success", projectId);
+        } else {
+          this.addLog(`[Gemini AI] ✅ Hoàn thành: ${getStepText(stepKey)}!`, "success", projectId);
+        }
 
         const finalState: ProjectTaskState = {
           projectId,
@@ -288,7 +343,11 @@ class BackgroundQueueManager {
         });
         currentSteps = currentSteps.map(s => s.key === stepKey ? { ...s, status: "running" as const } : s);
         this.notify(projectId, this.getTaskState(projectId), currentData, currentSteps);
-        this.addLog(`Combo 1: Đang chạy bước "${stepKey}"...`, "running", projectId);
+        if (stepKey === "story_analyzer") {
+          this.addLog(`[Bộ Lọc Local] ⚡ Đang phân tích kịch bản qua Bộ Lọc Thủ Công (0 Tokens)...`, "running", projectId);
+        } else {
+          this.addLog(`[Gemini AI] ⏳ Đang phân tích: ${getStepText(stepKey)}...`, "running", projectId);
+        }
 
         const updatedData = await this.executeStepApi({
           ...params,
@@ -307,7 +366,11 @@ class BackgroundQueueManager {
         } else {
           currentSteps = currentSteps.map(s => s.key === stepKey ? { ...s, status: "success" as const } : s);
         }
-        this.addLog(`Combo 1: Bước "${stepKey}" hoàn thành thành công!`, "success", projectId);
+        if (stepKey === "story_analyzer") {
+          this.addLog(`[Bộ Lọc Local] ⚡ Hoàn thành bóc tách Scene qua Bộ Lọc Thủ Công (0 Tokens consumed)!`, "success", projectId);
+        } else {
+          this.addLog(`[Gemini AI] ✅ Hoàn thành: ${getStepText(stepKey)}!`, "success", projectId);
+        }
 
         // Save progress to IndexedDB
         const savedProj: SavedProject = {
@@ -413,7 +476,11 @@ class BackgroundQueueManager {
         });
         currentSteps = currentSteps.map(s => s.key === stepKey ? { ...s, status: "running" as const } : s);
         this.notify(projectId, this.getTaskState(projectId), currentData, currentSteps);
-        this.addLog(`Combo 2: Đang chạy bước "${stepKey}"...`, "running", projectId);
+        if (stepKey === "story_analyzer") {
+          this.addLog(`[Bộ Lọc Local] ⚡ Đang phân tích kịch bản qua Bộ Lọc Thủ Công (0 Tokens)...`, "running", projectId);
+        } else {
+          this.addLog(`[Gemini AI] ⏳ Đang phân tích: ${getStepText(stepKey)}...`, "running", projectId);
+        }
 
         const updatedData = await this.executeStepApi({
           ...params,
@@ -424,7 +491,11 @@ class BackgroundQueueManager {
 
         currentData = updatedData;
         currentSteps = currentSteps.map(s => s.key === stepKey ? { ...s, status: "success" as const } : s);
-        this.addLog(`Combo 2: Bước "${stepKey}" hoàn thành thành công!`, "success", projectId);
+        if (stepKey === "story_analyzer") {
+          this.addLog(`[Bộ Lọc Local] ⚡ Hoàn thành bóc tách Scene qua Bộ Lọc Thủ Công (0 Tokens consumed)!`, "success", projectId);
+        } else {
+          this.addLog(`[Gemini AI] ✅ Hoàn thành: ${getStepText(stepKey)}!`, "success", projectId);
+        }
 
         // Save progress to IndexedDB
         const savedProj: SavedProject = {
@@ -545,7 +616,11 @@ class BackgroundQueueManager {
         });
         currentSteps = currentSteps.map(s => s.key === stepKey ? { ...s, status: "running" as const } : s);
         this.notify(projectId, this.getTaskState(projectId), currentData, currentSteps);
-        this.addLog(`Combo 3: Đang chạy bước "${stepKey}"...`, "running", projectId);
+        if (stepKey === "story_analyzer") {
+          this.addLog(`[Bộ Lọc Local] ⚡ Đang phân tích kịch bản qua Bộ Lọc Thủ Công (0 Tokens)...`, "running", projectId);
+        } else {
+          this.addLog(`[Gemini AI] ⏳ Đang phân tích: ${getStepText(stepKey)}...`, "running", projectId);
+        }
 
         const updatedData = await this.executeStepApi({
           ...params,
@@ -556,7 +631,11 @@ class BackgroundQueueManager {
 
         currentData = updatedData;
         currentSteps = currentSteps.map(s => s.key === stepKey ? { ...s, status: "success" as const } : s);
-        this.addLog(`Combo 3: Bước "${stepKey}" hoàn thành thành công!`, "success", projectId);
+        if (stepKey === "story_analyzer") {
+          this.addLog(`[Bộ Lọc Local] ⚡ Hoàn thành bóc tách Scene qua Bộ Lọc Thủ Công (0 Tokens consumed)!`, "success", projectId);
+        } else {
+          this.addLog(`[Gemini AI] ✅ Hoàn thành: ${getStepText(stepKey)}!`, "success", projectId);
+        }
 
         // Save progress to IndexedDB
         const savedProj: SavedProject = {
@@ -829,6 +908,142 @@ class BackgroundQueueManager {
         break;
     }
 
+    if (stepKey === "shot_planner") {
+      const streamUrl = `${BACKEND_URL}/api/stream-plan-shots`;
+      const response = await fetch(streamUrl, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(bodyPayload),
+      });
+
+      if (!response.ok) {
+        const errorData = await response.json().catch(() => ({ detail: `Request failed with status ${response.status}` }));
+        let errorMsg = errorData.detail || `Request failed with status ${response.status}`;
+        throw new Error(errorMsg);
+      }
+
+      const reader = response.body?.getReader();
+      const decoder = new TextDecoder();
+      let buffer = "";
+      let accumulatedShots: any[] = [];
+      let currentDataState = { ...projectData };
+
+      if (reader) {
+        while (true) {
+          if (this.isTaskPaused(params.projectId)) {
+            try { reader.cancel(); } catch (e) {}
+            break;
+          }
+          const { done, value } = await reader.read();
+          if (done) break;
+          buffer += decoder.decode(value, { stream: true });
+          const lines = buffer.split("\n");
+          buffer = lines.pop() || "";
+
+          for (const line of lines) {
+            if (!line.trim()) continue;
+            try {
+              const chunk = JSON.parse(line.trim());
+              if (chunk.type === "init") {
+                if (chunk.is_regex) {
+                  this.addLog(`[Regex Engine] ⚡ Trích xuất thủ công ${chunk.total_scenes} Shots từ Storyboard (0 Gemini AI calls)...`, "success", params.projectId);
+                } else {
+                  this.addLog(`[Gemini AI] ⏳ Khởi chạy phân tích: Chia thành ${chunk.total_batches} Batches (${chunk.total_scenes} Scenes)...`, "running", params.projectId);
+                }
+              } else if (chunk.type === "batch_complete") {
+                const inTokens = chunk.input_tokens || 0;
+                const outTokens = chunk.output_tokens || 0;
+
+                const newBatchShots = (chunk.shots || []).map((shot: any) => ({
+                  shot_id: shot.shot_id,
+                  scene_id: shot.scene_number || shot.scene_id,
+                  scene_number: shot.scene_number || shot.scene_id,
+                  duration_seconds: shot.duration_seconds,
+                  actions: shot.actions || shot.action || "",
+                  characters: shot.characters || [],
+                  environment: shot.environment || "",
+                  props: shot.props || [],
+                  dialogue: shot.dialogue ? shot.dialogue.map((d: any) => ({
+                    character: d.character,
+                    text: d.speech
+                  })) : [],
+                  camera_movement: shot.camera_movement || "",
+                  framing: shot.shot_type || shot.framing || "",
+                  transition: shot.transition || "",
+                  composition: shot.composition || "",
+                  lighting: shot.lighting || "",
+                  keyframe_prompt: shot.keyframe_prompt || "",
+                  motion_prompt: shot.motion_prompt || ""
+                }));
+
+                // Append new shots avoiding duplicate scene/shot IDs
+                accumulatedShots.push(...newBatchShots);
+                // Sort shots by scene number
+                accumulatedShots.sort((a: any, b: any) => (a.scene_number || 0) - (b.scene_number || 0));
+                accumulatedShots.forEach((s: any, idx: number) => {
+                  s.shot_id = `Shot${String(idx + 1).padStart(3, '0')}`;
+                });
+
+                const existingKf = currentDataState.keyframes || [];
+                const realKeyframes = accumulatedShots.map((shot: any) => {
+                  const existing = existingKf.find((k: any) => k.shot_id === shot.shot_id);
+                  return {
+                    shot_id: shot.shot_id,
+                    keyframe_image_prompt: shot.keyframe_prompt || shot.actions || "",
+                    url: existing?.url || "",
+                    media_id: existing?.media_id || "",
+                    account_id: existing?.account_id || ""
+                  };
+                });
+
+                const existingMp = currentDataState.motion_prompts || [];
+                const realMotions = accumulatedShots.map((shot: any) => {
+                  const existing = existingMp.find((m: any) => m.shot_id === shot.shot_id);
+                  return {
+                    shot_id: shot.shot_id,
+                    motion_description: shot.motion_prompt || shot.camera_movement || "",
+                    video_url: existing?.video_url || ""
+                  };
+                });
+
+                currentDataState = {
+                  ...currentDataState,
+                  shots: [...accumulatedShots],
+                  keyframes: realKeyframes,
+                  motion_prompts: realMotions,
+                  input_tokens: (projectData.input_tokens || 0) + inTokens,
+                  output_tokens: (projectData.output_tokens || 0) + outTokens,
+                };
+
+                // Notify UI to render new shots immediately!
+                const taskState = this.getTaskState(params.projectId);
+                this.notify(params.projectId, taskState, currentDataState, params.steps);
+                this.addLog(`[Gemini AI] 🚀 Batch ${chunk.batch_index + 1}/${chunk.total_batches} (${chunk.scene_range}) hoàn thành -> Đã cập nhật ngay ${accumulatedShots.length} Shots lên màn hình!`, "success", params.projectId);
+
+                // Save checkpoint to IndexedDB
+                saveProject({
+                  id: params.projectId,
+                  name: params.projectName,
+                  updatedAt: new Date().toISOString(),
+                  storyboard: params.storyboard,
+                  projectData: currentDataState,
+                  steps: params.steps,
+                  model: params.selectedModel,
+                });
+              } else if (chunk.type === "error") {
+                throw new Error(chunk.message);
+              }
+            } catch (e: any) {
+              if (e.message && !e.message.includes("Unexpected end of JSON")) {
+                throw e;
+              }
+            }
+          }
+        }
+      }
+      return currentDataState;
+    }
+
     const response = await fetch(url, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
@@ -883,8 +1098,61 @@ class BackgroundQueueManager {
           })) : []
         }));
 
-        // Automatically initialize shots from scenes if shots is currently empty
-        if (!projectData.shots || projectData.shots.length === 0) {
+        // Automatically initialize shots, keyframes, and motion prompts from standardized format
+        try {
+          const assembleRes = await fetch(`${BACKEND_URL}/api/assemble-storyboard`, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ storyboard, style_preset_id: "3d_pixar" })
+          });
+          if (assembleRes.ok) {
+            const stdShots = await assembleRes.json();
+            if (stdShots && stdShots.length > 0) {
+              updatedData.shots = stdShots.map((s: any, idx: number) => {
+                const shotId = `Shot${String(idx + 1).padStart(3, '0')}`;
+                return {
+                  shot_id: shotId,
+                  scene_id: s.scene_number,
+                  scene_number: s.scene_number,
+                  duration_seconds: s.duration_seconds || 5,
+                  actions: s.visual || s.character_motion || "",
+                  characters: s.characters || [],
+                  environment: s.setting || "",
+                  props: s.props || [],
+                  dialogue: s.dialogue ? s.dialogue.map((d: any) => ({ character: d.character, speech: d.speech || d.text })) : [],
+                  camera_movement: s.camera_motion || "Static",
+                  framing: s.shot_type || "Medium Shot",
+                  transition: s.closing_transition || s.opening_transition || "Cut",
+                  composition: "Rule of Thirds",
+                  lighting: s.lighting || "Warm lighting",
+                  camera: `${s.shot_type || 'Medium Shot'}, ${s.camera_motion || 'Static'}`,
+                  timeline: [{ time: `0-${s.duration_seconds || 5}`, action: s.character_motion || s.visual || "Action" }],
+                  motion: { primary_motion: s.character_motion || "Action", secondary_motion: ["Blink", "Breathing"], motion_level: "Low" },
+                  keyframe_prompt: s.assembled_image_prompt,
+                  motion_prompt: s.assembled_video_prompt
+                };
+              });
+
+              updatedData.keyframes = updatedData.shots.map((shot: any) => ({
+                shot_id: shot.shot_id,
+                keyframe_image_prompt: shot.keyframe_prompt,
+                url: "",
+                media_id: "",
+                account_id: ""
+              }));
+
+              updatedData.motion_prompts = updatedData.shots.map((shot: any) => ({
+                shot_id: shot.shot_id,
+                motion_description: shot.motion_prompt,
+                video_url: ""
+              }));
+            }
+          }
+        } catch (err) {
+          console.warn("Assemble storyboard fallback in queue:", err);
+        }
+
+        if (!updatedData.shots || updatedData.shots.length === 0) {
           updatedData.shots = updatedData.scenes.map((scene: any, idx: number) => {
             const shotId = `Shot${String(idx + 1).padStart(3, '0')}`;
             return {

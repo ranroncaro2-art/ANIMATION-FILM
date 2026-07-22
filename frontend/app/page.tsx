@@ -432,7 +432,7 @@ export default function Home() {
   const [storyboard, setStoryboard] = useState("");
   const [customMotionInstructions, setCustomMotionInstructions] = useState("");
   const [apiKeys, setApiKeys] = useState<string[]>([]);
-  const [selectedModel, setSelectedModel] = useState("gemini-2.5-flash");
+  const [selectedModel, setSelectedModel] = useState("gemini-3.5-flash");
   const [rpmLimit, setRpmLimit] = useState(5);
   const [chunkSize, setChunkSize] = useState(5);
   
@@ -1081,6 +1081,8 @@ export default function Home() {
     }
   };
 
+  const [isPaused, setIsPaused] = useState<boolean>(false);
+
   // Subscribe to Background Queue Manager updates
   useEffect(() => {
     const unsubscribe = queueManager.subscribe((projId, taskState, updatedData, updatedSteps) => {
@@ -1093,9 +1095,13 @@ export default function Home() {
           setSteps(updatedSteps);
         }
 
+        setIsPaused(taskState.status === "paused" || !!taskState.isPaused);
+
         if (taskState.status === "running") {
           setActiveStep(taskState.activeStep);
           setIsRunningAll(taskState.isRunningAll);
+        } else if (taskState.status === "paused") {
+          // Paused state: keep UI controls active
         } else {
           setActiveStep(null);
           setIsRunningAll(false);
@@ -1112,6 +1118,25 @@ export default function Home() {
 
     return () => unsubscribe();
   }, [activeProjectId]);
+
+  const handlePauseProcess = () => {
+    if (activeProjectId) {
+      queueManager.pauseTask(activeProjectId);
+      setIsPaused(true);
+    }
+  };
+
+  const handleResumeProcess = () => {
+    if (activeProjectId) {
+      queueManager.resumeTask(activeProjectId);
+      setIsPaused(false);
+      if (activeStep) {
+        runSingleStep(activeStep);
+      } else {
+        runCombo1();
+      }
+    }
+  };
 
   const handleSaveNamedProject = async () => {
     showProjectNameModal(
@@ -2939,9 +2964,9 @@ export default function Home() {
   }, []);
 
 
-  // Scan shot to match referenced assets precisely
+  // Scan shot to match referenced assets precisely by Asset ID or exact full name
   const getReferencedAssetsForShot = (shot: any) => {
-    const refs: { name: string; type: 'character' | 'environment' | 'prop'; key: string; url?: string }[] = [];
+    const refs: { id: string; name: string; type: 'character' | 'environment' | 'prop'; key: string; url?: string }[] = [];
     const actionsLower = (shot.actions || "").toLowerCase().trim();
     const shotEnvLower = (shot.environment || shot.setting || "").toLowerCase().trim();
     const shotChars = (shot.characters || []).map((c: any) => String(c).toLowerCase().trim());
@@ -2951,65 +2976,78 @@ export default function Home() {
     const parentScene = projectData.scenes.find((s: any) => Number(s.scene_id) === Number(shot.scene_number || shot.scene_id));
     const sceneLocationLower = parentScene ? (parentScene.location || parentScene.setting || "").toLowerCase().trim() : "";
 
-    // 1. Characters matching:
-    projectData.characters.forEach(char => {
-      const charName = (char.name || char.canonical_name || "").trim();
-      if (!charName) return;
+    // 1. Characters matching by exact Asset ID or exact full name
+    (projectData.characters || []).forEach((char: any) => {
+      const charId = (char.id || "").trim();
+      const charIdLower = charId.toLowerCase();
+      const charName = (char.name || char.canonical_name || charId).trim();
+      if (!charName && !charId) return;
       const charNameLower = charName.toLowerCase();
       
-      const inShotChars = shotChars.some((c: string) => c === charNameLower || c.includes(charNameLower) || charNameLower.includes(c));
-      const inActions = actionsLower.length > 0 && new RegExp(`\\b${charNameLower.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\b`, 'i').test(actionsLower);
+      const isIdMatch = charIdLower && shotChars.some((c: string) => c === charIdLower);
+      const isNameMatch = charNameLower && shotChars.some((c: string) => c === charNameLower);
+      const inActions = charNameLower.length > 2 && new RegExp(`\\b${charNameLower.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\b`, 'i').test(actionsLower);
 
-      if (inShotChars || inActions) {
-        if (!refs.some(r => r.name.toLowerCase() === charNameLower)) {
-          refs.push({ name: charName, type: 'character', key: `char_${charName}`, url: char.url });
+      if (isIdMatch || isNameMatch || inActions) {
+        if (!refs.some(r => r.id === (charId || `char_${charName}`) || r.name.toLowerCase() === charNameLower)) {
+          refs.push({ id: charId || `char_${charName}`, name: charName, type: 'character', key: `char_${charId || charName}`, url: char.url });
         }
       }
     });
 
-    // 2. Environment matching: find the single best matching environment asset for this specific shot
+    // 2. Environment matching: Every shot MUST have a referenced environment!
     let matchedEnv: any = null;
     if (shotEnvLower) {
-      matchedEnv = projectData.environments.find(env => {
+      matchedEnv = (projectData.environments || []).find((env: any) => {
+        const envId = (env.id || "").toLowerCase().trim();
         const envName = (env.setting_name || env.name || "").toLowerCase().trim();
-        return envName && (envName === shotEnvLower || shotEnvLower.includes(envName) || envName.includes(shotEnvLower));
+        return (envId && envId === shotEnvLower) || (envName && envName === shotEnvLower);
       });
     }
     
     if (!matchedEnv && sceneLocationLower) {
-      matchedEnv = projectData.environments.find(env => {
+      matchedEnv = (projectData.environments || []).find((env: any) => {
+        const envId = (env.id || "").toLowerCase().trim();
         const envName = (env.setting_name || env.name || "").toLowerCase().trim();
-        return envName && (envName === sceneLocationLower || sceneLocationLower.includes(envName) || envName.includes(sceneLocationLower));
+        return (envId && envId === sceneLocationLower) || (envName && envName === sceneLocationLower);
       });
     }
 
     if (!matchedEnv && shotEnvLower) {
-      matchedEnv = projectData.environments.find(env => {
+      matchedEnv = (projectData.environments || []).find((env: any) => {
         const envName = (env.setting_name || env.name || "").toLowerCase().trim();
-        const words = envName.split(/\s+/).filter((w: string) => w.length > 3);
-        return words.length > 0 && words.every((w: string) => shotEnvLower.includes(w));
+        return envName && (shotEnvLower.includes(envName) || envName.includes(shotEnvLower));
       });
     }
 
+    // Fallback: Every shot MUST have a referenced environment. Pick 1st environment if no direct match
+    if (!matchedEnv && projectData.environments && projectData.environments.length > 0) {
+      matchedEnv = projectData.environments[0];
+    }
+
     if (matchedEnv) {
-      const envName = matchedEnv.setting_name || matchedEnv.name;
-      if (!refs.some(r => r.name.toLowerCase() === envName.toLowerCase())) {
-        refs.push({ name: envName, type: 'environment', key: `env_${envName}`, url: matchedEnv.url });
+      const envId = matchedEnv.id || "";
+      const envName = matchedEnv.setting_name || matchedEnv.name || envId;
+      if (!refs.some(r => r.type === 'environment')) {
+        refs.push({ id: envId || `env_${envName}`, name: envName, type: 'environment', key: `env_${envId || envName}`, url: matchedEnv.url });
       }
     }
 
-    // 3. Props matching:
-    projectData.props.forEach(prop => {
-      const propName = (prop.prop_name || prop.name || "").trim();
-      if (!propName) return;
+    // 3. Props matching by exact Asset ID or exact full prop name
+    (projectData.props || []).forEach((prop: any) => {
+      const propId = (prop.id || "").trim();
+      const propIdLower = propId.toLowerCase();
+      const propName = (prop.prop_name || prop.name || propId).trim();
+      if (!propName && !propId) return;
       const propNameLower = propName.toLowerCase();
 
-      const inShotProps = shotProps.some((p: string) => p === propNameLower || p.includes(propNameLower) || propNameLower.includes(p));
-      const inActions = actionsLower.length > 0 && new RegExp(`\\b${propNameLower.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\b`, 'i').test(actionsLower);
+      const isIdMatch = propIdLower && shotProps.some((p: string) => p === propIdLower);
+      const isNameMatch = propNameLower && shotProps.some((p: string) => p === propNameLower);
+      const inActionsExact = propNameLower.length > 2 && new RegExp(`\\b${propNameLower.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\b`, 'i').test(actionsLower);
 
-      if (inShotProps || inActions) {
-        if (!refs.some(r => r.name.toLowerCase() === propNameLower)) {
-          refs.push({ name: propName, type: 'prop', key: `prop_${propName}`, url: prop.url });
+      if (isIdMatch || isNameMatch || inActionsExact) {
+        if (!refs.some(r => r.id === (propId || `prop_${propName}`) || r.name.toLowerCase() === propNameLower)) {
+          refs.push({ id: propId || `prop_${propName}`, name: propName, type: 'prop', key: `prop_${propId || propName}`, url: prop.url });
         }
       }
     });
@@ -3259,7 +3297,7 @@ export default function Home() {
               </svg>
             </div>
             <h1 style={{ fontSize: "1.1rem", fontWeight: 800, letterSpacing: "0.03em", color: "#ffffff" }}>
-              TOOL MANGA ANIME PRO
+              TOOL ANIMATION FILM PRO
             </h1>
           </div>
 
@@ -3733,6 +3771,94 @@ export default function Home() {
                         </span>
                       )}
                     </div>
+
+                    {/* Process Control Bar (Pause & Resume) */}
+                    {(activeStep !== null || isRunningAll || isPaused) && (
+                      <div style={{
+                        marginBottom: "16px",
+                        padding: "12px 20px",
+                        background: isPaused 
+                          ? "linear-gradient(135deg, rgba(245, 158, 11, 0.2), rgba(217, 119, 6, 0.25))"
+                          : "linear-gradient(135deg, rgba(139, 92, 246, 0.2), rgba(6, 182, 212, 0.2))",
+                        border: isPaused 
+                          ? "1px solid rgba(245, 158, 11, 0.5)"
+                          : "1px solid rgba(139, 92, 246, 0.5)",
+                        borderRadius: "10px",
+                        display: "flex",
+                        alignItems: "center",
+                        justifyContent: "space-between",
+                        gap: "16px",
+                        backdropFilter: "blur(10px)",
+                        boxShadow: "0 8px 25px rgba(0, 0, 0, 0.3)"
+                      }}>
+                        <div style={{ display: "flex", alignItems: "center", gap: "10px" }}>
+                          <span className={isPaused ? "" : "pulse-dot"} style={{
+                            display: "inline-block",
+                            width: "12px",
+                            height: "12px",
+                            borderRadius: "50%",
+                            background: isPaused ? "#f59e0b" : "#38bdf8"
+                          }} />
+                          <div>
+                            <div style={{ fontSize: "0.85rem", fontWeight: 700, color: "#ffffff" }}>
+                              {isPaused ? "⏸ ĐÃ TẠM DỪNG TIẾN TRÌNH" : "⚡ ĐANG XỬ LÝ KỊCH BẢN PHIM..."}
+                            </div>
+                            <div style={{ fontSize: "0.72rem", color: "var(--text-secondary)" }}>
+                              {isPaused 
+                                ? "Tất cả tác vụ gọi Gemini API đã tạm ngưng. Nhấn \"Tạo tiếp\" để tiếp tục từ vị trí hiện tại."
+                                : `Đang xử lý bước: ${activeStep ? (activeStep === "story_analyzer" ? "Phân tích kịch bản" : activeStep === "character_extractor" ? "Bóc tách nhân vật & bối cảnh" : activeStep === "shot_planner" ? "Lập kế hoạch phân cảnh" : activeStep) : "Tự động toàn bộ"}`
+                              }
+                            </div>
+                          </div>
+                        </div>
+
+                        <div style={{ display: "flex", gap: "10px" }}>
+                          {!isPaused ? (
+                            <button
+                              onClick={handlePauseProcess}
+                              style={{
+                                background: "linear-gradient(135deg, #f59e0b, #d97706)",
+                                color: "#ffffff",
+                                border: "none",
+                                borderRadius: "6px",
+                                padding: "8px 18px",
+                                fontSize: "0.85rem",
+                                fontWeight: 700,
+                                cursor: "pointer",
+                                display: "flex",
+                                alignItems: "center",
+                                gap: "6px",
+                                boxShadow: "0 4px 12px rgba(245, 158, 11, 0.3)",
+                                transition: "all 0.2s"
+                              }}
+                            >
+                              ⏸ Tạm dừng
+                            </button>
+                          ) : (
+                            <button
+                              onClick={handleResumeProcess}
+                              style={{
+                                background: "linear-gradient(135deg, #10b981, #059669)",
+                                color: "#ffffff",
+                                border: "none",
+                                borderRadius: "6px",
+                                padding: "8px 18px",
+                                fontSize: "0.85rem",
+                                fontWeight: 700,
+                                cursor: "pointer",
+                                display: "flex",
+                                alignItems: "center",
+                                gap: "6px",
+                                boxShadow: "0 4px 12px rgba(16, 185, 129, 0.3)",
+                                transition: "all 0.2s"
+                              }}
+                            >
+                              ▶ Tạo tiếp
+                            </button>
+                          )}
+                        </div>
+                      </div>
+                    )}
 
                     {/* Combos Grid */}
                     <div className="combo-grid">
@@ -4688,82 +4814,49 @@ export default function Home() {
                                           </span>
                                         </div>
 
-                                        <p style={{ fontSize: "0.8rem", color: "var(--text-secondary)", lineHeight: 1.4 }}>
-                                          <strong>Hành động:</strong> {shot.actions}
-                                        </p>
-
-                                        {keyframePrompt ? (
-                                          <div style={{ marginTop: "6px", background: "rgba(255,255,255,0.02)", padding: "8px", borderRadius: "4px", border: "1px solid rgba(255,255,255,0.04)" }}>
-                                            <strong style={{ fontSize: "0.7rem", color: "#06b6d4", display: "block", marginBottom: "4px" }}>KEYFRAME IMAGE PROMPT (CÓ THỂ SỬA):</strong>
-                                            <textarea
-                                              value={keyframePrompt}
-                                              onChange={(e) => {
-                                                const updatedKeyframes = projectData.keyframes.map((k: any) => 
+                                        <div style={{ marginTop: "6px", background: "rgba(255,255,255,0.02)", padding: "8px", borderRadius: "4px", border: "1px solid rgba(255,255,255,0.04)" }}>
+                                          <strong style={{ fontSize: "0.75rem", color: "#06b6d4", display: "block", marginBottom: "4px" }}>PROMPT MÔ TẢ CẢNH [IMAGE DATA]:</strong>
+                                          <textarea
+                                            value={keyframePrompt || shot.keyframe_prompt || shot.actions || ""}
+                                            onChange={(e) => {
+                                              const existingList = projectData.keyframes || [];
+                                              const exists = existingList.some((k: any) => k.shot_id === shot.shot_id);
+                                              let updatedKeyframes;
+                                              if (exists) {
+                                                updatedKeyframes = existingList.map((k: any) => 
                                                   k.shot_id === shot.shot_id 
                                                     ? { ...k, keyframe_image_prompt: e.target.value } 
                                                     : k
                                                 );
-                                                handleUpdateStepData("keyframe_generator", updatedKeyframes);
-                                              }}
-                                              style={{
-                                                width: "100%",
-                                                background: "rgba(0,0,0,0.3)",
-                                                border: "1px solid rgba(255,255,255,0.08)",
-                                                color: "var(--text-primary)",
-                                                fontSize: "0.75rem",
-                                                fontFamily: "inherit",
-                                                fontStyle: "italic",
-                                                padding: "6px",
-                                                borderRadius: "4px",
-                                                resize: "vertical",
-                                                minHeight: "45px",
-                                                lineHeight: 1.4,
-                                                outline: "none"
-                                              }}
-                                            />
-                                          </div>
-                                        ) : (
-                                          <div style={{ marginTop: "6px", background: "rgba(255,255,255,0.01)", padding: "8px", borderRadius: "4px", border: "1px dashed rgba(255,255,255,0.04)", display: "flex", flexDirection: "column", gap: "4px" }}>
-                                            <span style={{ fontSize: "0.75rem", color: "var(--text-muted)", fontStyle: "italic" }}>Chưa có keyframe image prompt. Tự động dùng Actions để vẽ hoặc tạo một prompt bên dưới:</span>
-                                            <textarea
-                                              placeholder="Nhập prompt vẽ ảnh keyframe cho shot này..."
-                                              onChange={(e) => {
-                                                // Create a new keyframe object if it doesn't exist
-                                                const existingList = projectData.keyframes || [];
-                                                const exists = existingList.some((k: any) => k.shot_id === shot.shot_id);
-                                                let updatedKeyframes;
-                                                if (exists) {
-                                                  updatedKeyframes = existingList.map((k: any) => 
-                                                    k.shot_id === shot.shot_id 
-                                                      ? { ...k, keyframe_image_prompt: e.target.value } 
-                                                      : k
-                                                  );
-                                                } else {
-                                                  updatedKeyframes = [
-                                                    ...existingList,
-                                                    { shot_id: shot.shot_id, keyframe_image_prompt: e.target.value, url: `mock_${shot.shot_id}` }
-                                                  ];
-                                                }
-                                                handleUpdateStepData("keyframe_generator", updatedKeyframes);
-                                              }}
-                                              style={{
-                                                width: "100%",
-                                                background: "rgba(0,0,0,0.3)",
-                                                border: "1px solid rgba(255,255,255,0.08)",
-                                                color: "var(--text-primary)",
-                                                fontSize: "0.75rem",
-                                                fontFamily: "inherit",
-                                                fontStyle: "italic",
-                                                padding: "6px",
-                                                borderRadius: "4px",
-                                                resize: "vertical",
-                                                minHeight: "45px",
-                                                lineHeight: 1.4,
-                                                outline: "none"
-                                              }}
-                                            />
-                                          </div>
-                                        )}
+                                              } else {
+                                                updatedKeyframes = [
+                                                  ...existingList,
+                                                  { shot_id: shot.shot_id, keyframe_image_prompt: e.target.value, url: `mock_${shot.shot_id}` }
+                                                ];
+                                              }
+                                              handleUpdateStepData("keyframe_generator", updatedKeyframes);
+                                            }}
+                                            style={{
+                                              width: "100%",
+                                              background: "rgba(0,0,0,0.3)",
+                                              border: "1px solid rgba(255,255,255,0.08)",
+                                              color: "var(--text-primary)",
+                                              fontSize: "0.8rem",
+                                              fontFamily: "inherit",
+                                              padding: "6px 8px",
+                                              borderRadius: "4px",
+                                              resize: "vertical",
+                                              minHeight: "55px",
+                                              lineHeight: 1.4,
+                                              outline: "none"
+                                            }}
+                                          />
+                                        </div>
+
+                                        <p style={{ fontSize: "0.8rem", color: "var(--text-secondary)", lineHeight: 1.4 }}>
+                                          <strong>Hành động:</strong> {shot.actions}
+                                        </p>
+
 
                               {/* Referenced Assets previews on segment */}
                               {(() => {
@@ -4888,21 +4981,29 @@ export default function Home() {
                                               </span>
                                             </div>
                                             
-                                            {/* Label */}
-                                            <span
-                                              style={{
-                                                fontSize: "0.72rem",
-                                                color: "#ffffff",
-                                                fontWeight: 600,
-                                                textAlign: "center",
-                                                overflow: "hidden",
-                                                textOverflow: "ellipsis",
-                                                whiteSpace: "nowrap"
-                                              }}
-                                              title={ref.name}
-                                            >
-                                              {ref.name}
-                                            </span>
+                                            {/* Label with ID */}
+                                            <div style={{ display: "flex", flexDirection: "column", alignItems: "center", width: "100%" }}>
+                                              <span
+                                                style={{
+                                                  fontSize: "0.72rem",
+                                                  color: "#ffffff",
+                                                  fontWeight: 600,
+                                                  textAlign: "center",
+                                                  overflow: "hidden",
+                                                  textOverflow: "ellipsis",
+                                                  whiteSpace: "nowrap",
+                                                  maxWidth: "100%"
+                                                }}
+                                                title={ref.name}
+                                              >
+                                                {ref.name}
+                                              </span>
+                                              {ref.id && (
+                                                <span style={{ fontSize: "0.58rem", color: "var(--accent-purple)", opacity: 0.85, fontWeight: 700 }}>
+                                                  [{ref.id}]
+                                                </span>
+                                              )}
+                                            </div>
                                           </div>
                                         );
                                       })}

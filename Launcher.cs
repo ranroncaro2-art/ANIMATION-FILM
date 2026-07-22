@@ -38,11 +38,27 @@ namespace AIKidsStudio
                 KillProcessByName("backend");
 
                 // 1. Start Backend FastAPI Server quietly
+                string backendPy = Path.Combine(appDir, "backend", "main.py");
+                string venvPython = Path.Combine(appDir, "backend", "venv", "Scripts", "python.exe");
+
                 if (File.Exists(backendExe))
                 {
                     ProcessStartInfo backendInfo = new ProcessStartInfo
                     {
                         FileName = backendExe,
+                        WorkingDirectory = Path.Combine(appDir, "backend"),
+                        CreateNoWindow = true,
+                        UseShellExecute = false
+                    };
+                    backendProcess = Process.Start(backendInfo);
+                }
+                else if (File.Exists(backendPy))
+                {
+                    string pythonBin = File.Exists(venvPython) ? venvPython : "python";
+                    ProcessStartInfo backendInfo = new ProcessStartInfo
+                    {
+                        FileName = pythonBin,
+                        Arguments = string.Format("\"{0}\"", backendPy),
                         WorkingDirectory = Path.Combine(appDir, "backend"),
                         CreateNoWindow = true,
                         UseShellExecute = false

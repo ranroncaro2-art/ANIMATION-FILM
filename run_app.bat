@@ -1,7 +1,7 @@
 @echo off
-title AI Kids Animation Studio Launcher
+title TOOL ANIMATION FILM PRO Launcher
 echo ===================================================
-echo     AI Kids Animation Studio - Startup Script
+echo     TOOL ANIMATION FILM PRO - Startup Script
 echo ===================================================
 echo.
 

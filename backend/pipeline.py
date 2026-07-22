@@ -1,319 +1,313 @@
+import asyncio
 import json
-from typing import List, Dict, Any, Optional, Tuple
-from pydantic import BaseModel
+import logging
+import re
+from typing import List, Dict, Any, Optional, Tuple, Set
+from pydantic import BaseModel, Field
+
 from schemas import (
     StoryAnalysisResponse,
+    SceneAnalysis,
     AssetsResponse,
-    ShotPlannerResponse,
-    KeyframePromptResponse,
-    MotionPromptResponse,
     CharacterAsset,
     EnvironmentAsset,
     PropAsset,
+    ShotPlannerResponse,
     Shot,
+    DialogueItem,
+    TimelineItem,
+    MotionDetails,
+    KeyframePromptResponse,
     ShotKeyframePrompt,
+    MotionPromptResponse,
     ShotMotionPrompt,
-    ComplianceCheckResult
+    StandardizedShotData,
+    ArtStylePreset,
 )
-from gemini_client import generate_gemini_content
+from gemini_client import generate_gemini_content, estimate_tokens
+from database import get_checkpoint, save_checkpoint, update_job_status
 
-def extract_relevant_storyboard_scenes(storyboard: str, scene_numbers: set) -> str:
-    """
-    Parses storyboard text and extracts only the scenes that match the given scene numbers.
-    This helps keep the prompt size small and avoids safety false positives from unrelated scenes.
-    """
-    import re
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger("Pipeline")
+
+
+def extract_relevant_storyboard_scenes(storyboard: str, scene_numbers: Set[int]) -> str:
+    """Parses storyboard text and extracts only the scenes that match the given scene numbers."""
     if not storyboard or not scene_numbers:
         return ""
-        
-    # Split by standard scene numbers, e.g. "2" or "Scene 2" or "Phân cảnh 2"
-    # Matches a line that contains only digits, or starts with Scene/Phân cảnh/Phân đoạn followed by digits
     blocks = re.split(r'\n(?=\d+(?:\n|\r\n))', storyboard)
     if len(blocks) <= 1:
-        # Fallback to double newline split
         blocks = storyboard.split("\n\n")
-        
+
     relevant_blocks = []
     for block in blocks:
-        # Clean block text
         clean_block = block.strip()
         if not clean_block:
             continue
-            
-        # Try to find leading scene number (e.g. "2" or "Scene 2" or "2...")
         match = re.match(r'^\s*(?:scene|phân cảnh|phân đoạn|)\s*(\d+)', clean_block, re.IGNORECASE)
         if match:
             num = int(match.group(1))
             if num in scene_numbers:
                 relevant_blocks.append(clean_block)
         else:
-            # Fallback search inside the block if it didn't start with a number
             for num in scene_numbers:
                 if f"scene {num}" in clean_block.lower() or f"phân cảnh {num}" in clean_block.lower():
                     relevant_blocks.append(clean_block)
                     break
-                    
-    if relevant_blocks:
-        return "\n\n".join(relevant_blocks)
-        
-    # Final fallback: if no scene matching is found, return the full storyboard
-    return storyboard
+    return "\n\n".join(relevant_blocks) if relevant_blocks else storyboard
+
 
 def clean_text_for_safety(text: str) -> str:
-    """
-    Sanitizes text by removing child age descriptors and converting age-indicative child terms
-    into generic, safety-neutral character equivalents to prevent Gemini API safety block false-positives.
-    """
+    """Sanitizes text by removing character visual descriptors (age, clothing, shoes) and child terms to prevent Gemini API safety block false-positives and comply with reference-only rules."""
     if not text:
         return ""
-    import re
-    # Remove ages like "8-year-old", "8 years old", "8yo"
-    text = re.sub(r'\b\d+[- ]?year[- ]?olds?\b', '', text, flags=re.IGNORECASE)
-    text = re.sub(r'\b\d+[- ]?years?[- ]?old\b', '', text, flags=re.IGNORECASE)
-    # Neutralize age-indicative child terms
-    text = re.sub(r'\byoung\s+boy\b', 'boy', text, flags=re.IGNORECASE)
-    text = re.sub(r'\byoung\s+girl\b', 'girl', text, flags=re.IGNORECASE)
-    text = re.sub(r'\blittle\s+boy\b', 'boy', text, flags=re.IGNORECASE)
-    text = re.sub(r'\blittle\s+girl\b', 'girl', text, flags=re.IGNORECASE)
-    # Replace child-related words with neutral character equivalents
+    # 1. Remove age patterns: ", 6-7 years old,", ", 10 years old,", "6-7 years old"
+    text = re.sub(r',\s*\d+(?:-\d+)?\s*years?\s*old,?', '', text, flags=re.IGNORECASE)
+    text = re.sub(r'\b\d+(?:-\d+)?\s*years?\s*old\b', '', text, flags=re.IGNORECASE)
+
+    # 2. Remove prefixes like "A man, ", "A woman, ", "A 6-7 year old girl, "
+    text = re.sub(r'\ba\s+(?:man|woman|guy|lady|boy|girl|child|kid)\s*,\s*', '', text, flags=re.IGNORECASE)
+
+    # 3. Remove clothing/outfit phrases: "in a bright yellow t-shirt", "in a plain grey t-shirt", "wearing jeans", "denim shorts", "blue sneakers"
+    clothing_keywords = r'(?:t-shirt|shirt|shorts|jeans|pants|sneakers|dress|jacket|coat|hoodie|shoes|outfit|skirt|boots|trousers|hat|cap)'
+    text = re.sub(rf',\s*in\s+(?:a|an)?\s*[^,\.]*{clothing_keywords}[^,\.]*', '', text, flags=re.IGNORECASE)
+    text = re.sub(rf'\bin\s+(?:a|an)\s+[^,\.]*{clothing_keywords}[^,\.]*', '', text, flags=re.IGNORECASE)
+    text = re.sub(rf',\s*wearing\s+[^,\.]*{clothing_keywords}[^,\.]*', '', text, flags=re.IGNORECASE)
+    text = re.sub(rf',\s*[^,\.]*{clothing_keywords}[^,\.]*', '', text, flags=re.IGNORECASE)
+
+    # 4. Remove child terms
+    text = re.sub(r'\byoung\s+boy\b', 'character', text, flags=re.IGNORECASE)
+    text = re.sub(r'\byoung\s+girl\b', 'character', text, flags=re.IGNORECASE)
+    text = re.sub(r'\blittle\s+boy\b', 'character', text, flags=re.IGNORECASE)
+    text = re.sub(r'\blittle\s+girl\b', 'character', text, flags=re.IGNORECASE)
     text = re.sub(r'\bchildren\b', 'characters', text, flags=re.IGNORECASE)
     text = re.sub(r'\bchild\b', 'character', text, flags=re.IGNORECASE)
     text = re.sub(r'\bkids\b', 'characters', text, flags=re.IGNORECASE)
     text = re.sub(r'\bkid\b', 'character', text, flags=re.IGNORECASE)
-    
-    # Vietnamese safety translations
     text = re.sub(r'\bbé\s+trai\b', 'cậu bé', text, flags=re.IGNORECASE)
     text = re.sub(r'\bbé\s+gái\b', 'cô bé', text, flags=re.IGNORECASE)
     text = re.sub(r'\btrẻ\s+em\b', 'nhân vật', text, flags=re.IGNORECASE)
     text = re.sub(r'\btrẻ\s+con\b', 'nhân vật', text, flags=re.IGNORECASE)
     text = re.sub(r'\bcon\s+nít\b', 'nhân vật', text, flags=re.IGNORECASE)
-    text = re.sub(r'\bhọc\s+sinh\s+tiểu\s+học\b', 'học sinh', text, flags=re.IGNORECASE)
-    text = re.sub(r'\bhọc\s+sinh\s+mẫu\s+giáo\b', 'học sinh', text, flags=re.IGNORECASE)
-    return text
 
-def build_transition_instructions(transition_str: str, actions_str: str = "") -> Tuple[Optional[str], Optional[str]]:
+    # 5. Clean up leftover commas and spaces
+    text = re.sub(r',\s*,+', ',', text)
+    text = re.sub(r'\s+,', ',', text)
+    text = re.sub(r',\s*([a-zA-Z0-9_]+\s+(?:stands|walks|looks|runs|sits|swings|speaks|listens|holds|turns|moves))', r' \1', text)
+    text = re.sub(r'\s\s+', ' ', text)
+    return text.strip()
+
+
+def build_adaptive_scene_chunks(scenes: List[Dict[str, Any]], requested_chunk_size: int) -> List[List[Dict[str, Any]]]:
+    """Keep detailed scenes small enough to preserve structured-output quality.
+
+    ``requested_chunk_size`` remains a hard upper bound. A long action, several
+    dialogue turns, many characters/props, or an explicit transition consumes a
+    larger complexity budget. This is deliberately deterministic: it avoids an
+    additional Gemini request merely to decide how to batch Gemini work.
     """
-    Parses dual-language transition tags (Vietnamese & English) from shot.transition or shot.actions.
-    Returns a tuple of (intro_instruction, outro_instruction).
-    """
+    max_scenes = max(1, requested_chunk_size)
+    max_budget = max(4, max_scenes * 3)
+    chunks: List[List[Dict[str, Any]]] = []
+    current: List[Dict[str, Any]] = []
+    budget = 0
+
+    for scene in scenes:
+        action = str(scene.get("action") or scene.get("description") or "")
+        dialogues = scene.get("dialogue") or scene.get("dialogues") or []
+        characters = scene.get("characters") or []
+        props = scene.get("props") or []
+        transition = str(scene.get("transition") or "")
+        complexity = 1
+        complexity += min(2, len(action) // 500)
+        complexity += 1 if len(dialogues) >= 2 else 0
+        complexity += 1 if len(characters) >= 3 else 0
+        complexity += 1 if len(props) >= 3 else 0
+        complexity += 1 if transition else 0
+
+        if current and (len(current) >= max_scenes or budget + complexity > max_budget):
+            chunks.append(current)
+            current, budget = [], 0
+        current.append(scene)
+        budget += complexity
+
+    if current:
+        chunks.append(current)
+    return chunks
+
+
+DEFAULT_MOTION_PRESET_TEMPLATE = """SCENE:
+{scene}
+
+REFERENCE:
+{reference}
+
+CHARACTERS:
+{characters}
+
+SHOT:
+{shot}
+
+TIMELINE:
+{timeline}
+
+DIALOGUE:
+{dialogue}
+
+ACTIONS:
+{actions}
+
+SPATIAL RULES:
+{spatial_rules}
+
+ENDING:
+{ending}
+
+STYLE:
+{style}"""
+
+
+def compile_motion_prompt(shot: Shot, character_map: Optional[Dict[str, Any]] = None, preset_template: Optional[str] = None) -> str:
+    """Constructs a production-grade Veo 3 motion prompt directly from shot data by filling placeholders into preset template."""
     import re
-    text_to_check = f"{transition_str} {actions_str}".upper()
-    intro_instr = None
-    outro_instr = None
-
-    # Intro detection: [MỞ CẢNH: FADE_IN], [INTRO: FADE_IN], FADE_IN
-    if re.search(r'\[?(?:MỞ CẢNH|INTRO|TRANSITION)\s*:\s*FADE[_\s]*IN\]?|FADE[_\s]*IN', text_to_check):
-        intro_instr = "First 1.0 second (SCENE INTRO): Gradual fade in from black background into the scene setting."
-
-    # Outro detection:
-    if re.search(r'\[?(?:CHUYỂN CẢNH|KẾT CẢNH|OUTRO|TRANSITION)\s*:\s*WALK[_\s]*AWAY(?:[_\s]*FADE)?\]?|WALK[_\s]*AWAY', text_to_check):
-        outro_instr = "Final 1.5 seconds (SCENE OUTRO): Character turns around and walks into background shadows, gradual fade out to black to signal scene end."
-    elif re.search(r'\[?(?:CHUYỂN CẢNH|KẾT CẢNH|OUTRO|TRANSITION)\s*:\s*PULL[_\s]*BACK(?:[_\s]*FADE)?\]?|PULL[_\s]*BACK', text_to_check):
-        outro_instr = "Final 1.5 seconds (SCENE OUTRO): Camera rapidly pulls back to wide shot as character shrinks in distance, gradual fade out."
-    elif re.search(r'\[?(?:CHUYỂN CẢNH|KẾT CẢNH|OUTRO|TRANSITION)\s*:\s*TILT[_\s]*UP(?:[_\s]*FADE)?\]?|TILT[_\s]*UP', text_to_check):
-        outro_instr = "Final 1.5 seconds (SCENE OUTRO): Camera cranes and tilts upward toward the sky/ceiling, gradual fade out."
-    elif re.search(r'\[?(?:CHUYỂN CẢNH|KẾT CẢNH|OUTRO|TRANSITION)\s*:\s*WHIP[_\s]*PAN\]?|WHIP[_\s]*PAN', text_to_check):
-        outro_instr = "Final 1.5 seconds (SCENE OUTRO): Fast whip-pan camera sweep creating motion blur transition."
-    elif re.search(r'\[?(?:CHUYỂN CẢNH|KẾT CẢNH|OUTRO|TRANSITION)\s*:\s*FADE[_\s]*OUT\]?|FADE[_\s]*OUT', text_to_check):
-        outro_instr = "Final 1.5 seconds (SCENE OUTRO): Hold final pose, gradual fade out to black to signal scene end."
-
-    return intro_instr, outro_instr
-
-def compile_motion_prompt(shot: Shot, character_map: Optional[Dict[str, Any]] = None) -> str:
-    # Helper to get asset values safely
-    def _get_asset_val(asset: Any, field_name: str) -> str:
-        if isinstance(asset, dict):
-            val = asset.get(field_name, "")
-        else:
-            val = getattr(asset, field_name, "")
-        return str(val) if val is not None else ""
 
     # 1. SCENE
-    scene_desc = shot.environment.strip() if shot.environment else ""
+    scene_desc = shot.environment.strip() if shot.environment else "General View"
     if shot.lighting:
-        lighting_clean = shot.lighting.strip().rstrip(".")
-        if "matching the reference" not in lighting_clean.lower():
-            scene_desc += f". {lighting_clean} matching the reference image."
-        else:
-            scene_desc += f". {lighting_clean}"
+        clean_lighting = re.sub(r'\s*\([^)]*\)', '', shot.lighting).strip().rstrip('.')
+        scene_desc += f". {clean_lighting} matching the reference image."
     else:
-        scene_desc += f". Bright cafeteria lighting matching the reference image."
-    
+        scene_desc += ". Warm sunlight matching the reference image."
+
     # 2. REFERENCE
-    reference_str = "Continue from the provided reference image. Do not change characters' appearance or background environment."
-    
-    # 2b. CHARACTERS DECLARATION
+    ref_str = "Continue from the provided reference image. Do not change characters' appearance or background environment."
+
+    # 3. CHARACTERS (ONLY character names - NO age, gender, appearance, or outfit re-descriptions)
     char_lines = []
-    if shot.characters:
-        for c in shot.characters:
-            c_clean = c.strip()
-            c_key = c_clean.lower()
-            if character_map and c_key in character_map:
-                asset = character_map[c_key]
-                age = _get_asset_val(asset, "age").strip()
-                gender = _get_asset_val(asset, "gender").strip()
-                voice = _get_asset_val(asset, "voice_style").strip()
-                personality = _get_asset_val(asset, "personality").strip()
-                
-                details = []
-                if gender:
-                    details.append(gender)
-                if age:
-                    details.append(age)
-                if personality:
-                    details.append(personality)
-                if voice:
-                    details.append(voice)
-                
-                if details:
-                    char_lines.append(f"- {c_clean} ({', '.join(details)})")
-                else:
-                    char_lines.append(f"- {c_clean}")
-            else:
-                char_lines.append(f"- {c_clean}")
+    chars = shot.characters or []
+    for c in chars:
+        if c and c.strip():
+            char_lines.append(f"- {c.strip()}")
     char_str = "\n".join(char_lines) if char_lines else "None"
 
-    # 3. SHOT
-    camera_lines = []
-    camera_val = shot.camera if shot.camera else ""
-    if "," in camera_val:
-        parts_cam = [p.strip() for p in camera_val.split(",")]
-        for p in parts_cam:
-            p_lower = p.lower()
-            if p_lower in ["static", "pan left", "pan right", "zoom in", "zoom out", "tilt up", "tilt down", "tracking shot", "dolly zoom", "pan", "tilt", "zoom"]:
-                if "camera" not in p_lower and "shot" not in p_lower:
-                    camera_lines.append(f"{p.capitalize()} camera.")
-                else:
-                    camera_lines.append(p.capitalize() + ".")
-            else:
-                camera_lines.append(p.capitalize() + ".")
-    else:
-        shot_t = shot.shot_type if shot.shot_type else "Medium Shot"
-        cam_m = shot.camera_movement if shot.camera_movement else "Static"
-        camera_lines.append(f"{shot_t.capitalize()}.")
-        if cam_m:
-            if "camera" not in cam_m.lower() and "shot" not in cam_m.lower():
-                camera_lines.append(f"{cam_m.capitalize()} camera.")
-            else:
-                camera_lines.append(cam_m.capitalize() + ".")
-                
-    # Detect dual-language intro & outro transition instructions
-    intro_instr, outro_instr = build_transition_instructions(
-        shot.transition if shot.transition else "",
-        shot.actions if shot.actions else ""
-    )
+    # 4. SHOT
+    raw_shot_type = shot.shot_type or "Medium Shot"
+    clean_shot_type = re.sub(r'\s*\([^)]*\)', '', raw_shot_type)
+    clean_shot_type = re.split(r',', clean_shot_type)[0].strip().rstrip('.')
+    clean_camera_mov = (shot.camera_movement or "Static").strip().rstrip('.')
+    camera_str = f"{clean_shot_type}. {clean_camera_mov}."
 
-    if intro_instr:
-        camera_lines.append(intro_instr)
-        
-    camera_str = "\n".join(camera_lines)
+    # 5. TIMELINE & 7. ACTIONS parsing
+    raw_actions = (shot.actions or "").strip()
     
-    # 4. TIMELINE
+    # Check if raw_actions or timeline items contain embedded sub-timecodes (e.g. "0-2s Emma swings...")
+    combined_actions_text = raw_actions
+    for t_item in (shot.timeline or []):
+        if t_item.action and re.search(r'\d+-\d+s?\s*', t_item.action):
+            combined_actions_text += " " + t_item.action
+
+    timecode_matches = re.findall(r'(\d+-\d+s?\s*[^;\n]+)', combined_actions_text)
+    
     timeline_lines = []
-    for item in shot.timeline:
-        t = item.time
-        t_clean = t.replace("s", "").strip()
-        action_clean = item.action.strip()
-        # Enrich speaker name in timeline
-        if ":" in action_clean:
-            parts_act = action_clean.split(":", 1)
-            speaker_name = parts_act[0].strip()
-            speech_content = parts_act[1].strip()
-            sp_key = speaker_name.lower()
-            if character_map and sp_key in character_map:
-                asset = character_map[sp_key]
-                gender = _get_asset_val(asset, "gender").strip()
-                voice = _get_asset_val(asset, "voice_style").strip()
-                
-                desc_parts = []
-                if gender:
-                    desc_parts.append(gender)
-                if voice:
-                    desc_parts.append(voice)
-                if desc_parts:
-                    action_clean = f"{speaker_name} ({', '.join(desc_parts)}): {speech_content}"
-        timeline_lines.append(f"{t_clean} {action_clean}")
-    if not timeline_lines:
-        timeline_lines.append(f"0-{shot.duration_seconds} {shot.actions.strip() if shot.actions else ''}")
-    timeline_str = "\n".join(timeline_lines)
-    
-    # 5. DIALOGUE
-    if shot.dialogue:
-        dialogue_lines = []
-        for d in shot.dialogue:
-            char_name = d.character.strip()
-            char_key = char_name.lower()
-            if character_map and char_key in character_map:
-                asset = character_map[char_key]
-                gender = _get_asset_val(asset, "gender").strip()
-                voice = _get_asset_val(asset, "voice_style").strip()
-                
-                desc_parts = []
-                if gender:
-                    desc_parts.append(gender)
-                if voice:
-                    desc_parts.append(voice)
-                if desc_parts:
-                    dialogue_lines.append(f"{char_name} ({', '.join(desc_parts)}): \"{d.speech}\"")
-                else:
-                    dialogue_lines.append(f"{char_name}: \"{d.speech}\"")
-            else:
-                dialogue_lines.append(f"{char_name}: \"{d.speech}\"")
-        dialogue_str = "\n".join(dialogue_lines)
-        dialogue_section = (
-            f"{dialogue_str}\n"
-            f"Dialogue must match exactly.\n"
-            f"No additional speech.\n"
-            f"Remain silent after the final line."
-        )
+    actions_clean_phrases = []
+
+    if timecode_matches:
+        seen_matches = set()
+        for match in timecode_matches:
+            match_clean = match.strip().rstrip(';')
+            if match_clean.lower() not in seen_matches:
+                seen_matches.add(match_clean.lower())
+                timeline_lines.append(match_clean)
+                clean_phrase = re.sub(r'^\d+-\d+s?\s*', '', match_clean).strip()
+                if clean_phrase and clean_phrase.lower() not in [p.lower() for p in actions_clean_phrases]:
+                    actions_clean_phrases.append(clean_phrase)
     else:
-        dialogue_section = "None"
+        for item in (shot.timeline or []):
+            t_clean = item.time.strip()
+            if t_clean and not t_clean.endswith('s') and '-' in t_clean:
+                t_clean += 's'
+            action_text = item.action.strip()
+            if re.match(r'^\d+-\d+s?\s*', action_text):
+                timeline_lines.append(action_text)
+            else:
+                timeline_lines.append(f"{t_clean} {action_text}")
+            clean_phrase = re.sub(r'^\d+-\d+s?\s*', '', action_text).strip()
+            if clean_phrase:
+                actions_clean_phrases.append(clean_phrase)
+        if not timeline_lines and raw_actions:
+            timeline_lines.append(f"0-{shot.duration_seconds}s {raw_actions}")
+            actions_clean_phrases.append(raw_actions)
+
+    timeline_str = "\n".join(timeline_lines) if timeline_lines else f"0-{shot.duration_seconds}s Action"
+
+    # 6. DIALOGUE & SOUND FX
+    spoken_dialogue_lines = []
+    sound_fx_str = getattr(shot, 'sound_fx', None)
+
+    # Build voice lookup from character_map if provided
+    voice_map = {}
+    if character_map and isinstance(character_map, dict):
+        for k, v in character_map.items():
+            v_style = getattr(v, 'voice_style', None) or (v.get('voice_style') if isinstance(v, dict) else None)
+            if v_style and str(v_style).strip():
+                voice_map[k.lower()] = str(v_style).strip()
+    elif isinstance(character_map, list):
+        for c_obj in character_map:
+            c_name = getattr(c_obj, 'canonical_name', None) or getattr(c_obj, 'name', None) or (c_obj.get('canonical_name') if isinstance(c_obj, dict) else None)
+            v_style = getattr(c_obj, 'voice_style', None) or (c_obj.get('voice_style') if isinstance(c_obj, dict) else None)
+            if c_name and v_style and str(v_style).strip():
+                voice_map[str(c_name).lower()] = str(v_style).strip()
+
+    for d in (shot.dialogue or []):
+        char_name = d.character.strip()
+        speech_text = d.speech.strip()
+        if char_name.lower() in ["sound fx", "sfx", "audio", "sound", "music"] or "sound fx" in char_name.lower():
+            if not sound_fx_str:
+                sound_fx_str = speech_text
+            continue
+        speech_clean = speech_text.strip('"')
         
-    # 6. ACTIONS
+        # Attach voice_style description if present for this character
+        char_voice = voice_map.get(char_name.lower())
+        if char_voice:
+            spoken_dialogue_lines.append(f'{char_name} (in a {char_voice}): "{speech_clean}"')
+        else:
+            spoken_dialogue_lines.append(f'{char_name}: "{speech_clean}"')
+
+    if spoken_dialogue_lines:
+        dialogue_lines = list(spoken_dialogue_lines)
+        if sound_fx_str and sound_fx_str.strip():
+            sfx_clean = sound_fx_str.strip().strip('"')
+            dialogue_lines.append(f'Sound FX: "{sfx_clean}"')
+        dialogue_str = (
+            "\n".join(dialogue_lines) +
+            "\nDialogue must match exactly." +
+            "\nNo additional speech." +
+            "\nRemain silent after the final line."
+        )
+    elif sound_fx_str and sound_fx_str.strip():
+        sfx_clean = sound_fx_str.strip().strip('"')
+        dialogue_str = f'Sound FX: "{sfx_clean}"\nRemain silent.'
+    else:
+        dialogue_str = "None"
+
+    # 7. ACTIONS
     actions_lines = []
-    if len(shot.characters) > 1:
+    if len(chars) > 1:
         actions_lines.append("Both characters maintain natural breathing, blinking and subtle body movement.")
-    elif len(shot.characters) == 1:
-        actions_lines.append(f"{shot.characters[0]} maintains natural breathing, blinking and subtle body movement.")
+    elif len(chars) == 1:
+        actions_lines.append(f"{chars[0]} maintains natural breathing, blinking and subtle body movement.")
     else:
         actions_lines.append("Characters maintain natural breathing, blinking and subtle body movement.")
-    
-    if shot.actions:
-        import re
-        sanitized_lines = []
-        for line in shot.actions.split('\n'):
-            line_strip = line.strip()
-            # Match "Character: text" (dialogue format)
-            match = re.match(r'^([^:]+):\s*(.*)$', line_strip)
-            if match:
-                char_candidate = match.group(1).strip()
-                # Check if char_candidate is one of the characters in this shot
-                is_char = any(c.lower() == char_candidate.lower() for c in shot.characters)
-                if is_char:
-                    # Check if this character is in the dialogue list
-                    in_dialogue = any(d.character.lower() == char_candidate.lower() for d in shot.dialogue)
-                    if not in_dialogue:
-                        # Skip dialogue-like lines in actions to prevent "nói leo"
-                        print(f"Skipping dialogue-like action to prevent nói leo: {line_strip}", flush=True)
-                        continue
-            sanitized_lines.append(line)
-        if sanitized_lines:
-            actions_lines.append("\n".join(sanitized_lines).strip())
-        
-    for c in shot.characters:
-        speaks = any(d.character.strip().lower() == c.strip().lower() for d in shot.dialogue)
-        if speaks:
-            actions_lines.append(f"{c}: Speaks and gestures naturally.")
-        else:
-            if shot.dialogue:
-                actions_lines.append(f"{c}: Listens and reacts naturally.")
-            else:
-                if shot.motion and shot.motion.primary_motion:
-                    pm = shot.motion.primary_motion.strip().rstrip(".")
-                    actions_lines.append(f"{c}: {pm}.")
+
+    if actions_clean_phrases:
+        joined_actions = "; ".join(actions_clean_phrases)
+        if joined_actions:
+            actions_lines.append(joined_actions)
+
     actions_str = "\n".join(actions_lines)
-    
-    # 7. SPATIAL RULES
+
+    # 8. SPATIAL RULES
     spatial_str = (
         "Characters move only through clear walkable space.\n"
         "Walk along existing aisles.\n"
@@ -323,908 +317,884 @@ def compile_motion_prompt(shot: Shot, character_map: Optional[Dict[str, Any]] = 
         "Keep both feet naturally on the floor.\n"
         "Maintain realistic spacing from surrounding objects."
     )
-    
-    # 8. ENDING
-    if outro_instr:
-        ending_str = outro_instr
-    else:
-        ending_str = "Hold final pose silently. Blink and breathe naturally."
-    
-    # 9. STYLE
+
+    # 9. ENDING
+    ending_str = "Hold final pose silently. Blink and breathe naturally."
+
+    # 10. STYLE
     style_str = (
         "High-quality stylized 3D animation.\n"
         "Feature film quality.\n"
         "No on-screen text."
     )
-    
-    # 10. AUDIO INSTRUCTION
-    audio_str = (
-        "Diegetic sound only. Clear lip-synced character voices, natural ambient environment sound and character foley matching scene physical action.\n"
-        "Strictly NO background music (BGM), NO audience laughter, NO laugh track, NO non-diegetic sound effects."
+
+    template = preset_template if preset_template and preset_template.strip() else DEFAULT_MOTION_PRESET_TEMPLATE
+
+    return template.format(
+        scene=scene_desc,
+        reference=ref_str,
+        characters=char_str,
+        shot=camera_str,
+        timeline=timeline_str,
+        dialogue=dialogue_str,
+        actions=actions_str,
+        spatial_rules=spatial_str,
+        ending=ending_str,
+        style=style_str,
     )
-    
-    parts = [
-        f"SCENE:\n{scene_desc}",
-        f"REFERENCE:\n{reference_str}",
-        f"CHARACTERS:\n{char_str}",
-        f"SHOT:\n{camera_str}",
-        f"TIMELINE:\n{timeline_str}",
-        f"DIALOGUE:\n{dialogue_section}",
-        f"ACTIONS:\n{actions_str}",
-        f"SPATIAL RULES:\n{spatial_str}",
-        f"ENDING:\n{ending_str}",
-        f"STYLE:\n{style_str}",
-        f"AUDIO:\n{audio_str}"
-    ]
-    
-    full_prompt = "\n\n".join(parts)
-    return clean_text_for_safety(full_prompt)
 
 
-# --- Step 1: Story Analyzer ---
-async def run_story_analyzer(storyboard: str, api_keys: List[str], model: str, rpm_limit: int = 5) -> StoryAnalysisResponse:
-    system_instruction = (
-        "You are a strict Story Parser. Your ONLY task is to read the storyboard text and parse it into structured JSON scenes. "
-        "The storyboard is the single source of truth. You must NOT modify, summarize, rewrite, or invent any content. "
-        "Keep the scene numbers, durations, locations, actions, dialogues, and characters EXACTLY as written in the storyboard. "
-        "Do not change scene durations, actions, or dialogues. Do not add or remove characters. "
-        "Just extract the raw data and format it into the requested JSON schema."
+def parse_storyboard_manual(storyboard: str) -> Optional[StoryAnalysisResponse]:
+    """Parses raw storyboard text deterministically using regex matching when written in standardized format.
+    Eliminates Gemini API overhead, latency, quota consumption, and safety filter false-positives.
+    """
+    if not storyboard or not storyboard.strip():
+        return None
+    
+    clean_story = storyboard.strip()
+    
+    # Split text into scene blocks using Scene/Cảnh/Phân cảnh/Shot markers or horizontal dividers
+    scene_blocks = re.split(r'(?:\r?\n)+(?=(?:\[MỞ CẢNH:[^\]]+\]\s*)?(?:Scene|Cảnh|Phân cảnh|Shot)\s*#?\s*\d+)', clean_story, flags=re.IGNORECASE)
+    if len(scene_blocks) <= 1:
+        scene_blocks = re.split(r'(?:\r?\n)*[-=_]{3,}(?:\r?\n)*', clean_story)
+    if len(scene_blocks) <= 1:
+        scene_blocks = [b.strip() for b in re.split(r'(?:\r?\n){2,}', clean_story) if b.strip()]
+    
+    parsed_scenes: List[SceneAnalysis] = []
+    
+    for idx, block in enumerate(scene_blocks, 1):
+        block = block.strip()
+        if not block:
+            continue
+        
+        num_match = re.search(r'(?:Scene|Cảnh|Phân cảnh|Shot)\s*#?\s*(\d+)', block, re.IGNORECASE)
+        scene_num = int(num_match.group(1)) if num_match else idx
+        
+        open_trans_match = re.search(r'\[MỞ CẢNH:\s*([^\]]+)\]', block, re.IGNORECASE)
+        opening_trans = open_trans_match.group(1).strip() if open_trans_match else ""
+        
+        setting_match = re.search(r'(?:Setting|Location|Bối cảnh|Địa điểm):\s*([^\n\r]+)', block, re.IGNORECASE)
+        location = setting_match.group(1).strip() if setting_match else "Unspecified"
+        
+        duration_match = re.search(r'(?:Duration|Thời lượng):\s*~?(\d+)\s*s?', block, re.IGNORECASE)
+        duration_sec = int(duration_match.group(1)) if duration_match else 5
+        
+        chars_match = re.search(r'(?:Characters|Nhân vật):\s*([^\n\r]+)', block, re.IGNORECASE)
+        characters = []
+        if chars_match:
+            raw_chars = chars_match.group(1).strip()
+            if raw_chars.lower() != "none" and raw_chars.lower() != "không có":
+                characters = [c.strip() for c in raw_chars.split(",") if c.strip()]
+        
+        props_match = re.search(r'(?:Props|Đạo cụ):\s*([^\n\r]+)', block, re.IGNORECASE)
+        props = []
+        if props_match:
+            raw_props = props_match.group(1).strip()
+            if raw_props.lower() != "none" and raw_props.lower() != "không có":
+                props = [p.strip() for p in raw_props.split(",") if p.strip()]
+        
+        # Match visual action or character motion
+        visual_match = re.search(r'(?:Visual Description|Visual|Mô tả hình ảnh|Hình ảnh):\s*([^\n\r]+)', block, re.IGNORECASE)
+        char_motion_match = re.search(r'(?:Character Motion|Motion|Chuyển động|Hành động):\s*([^\n\r]+)', block, re.IGNORECASE)
+        action_match = re.search(r'\[Action\]\s*[\r\n]+(.*?)(?=[\r\n]+\[|\Z)', block, re.DOTALL | re.IGNORECASE)
+        
+        parts = []
+        if visual_match:
+            parts.append(visual_match.group(1).strip())
+        if char_motion_match:
+            parts.append(char_motion_match.group(1).strip())
+        if action_match and not parts:
+            parts.append(action_match.group(1).strip())
+            
+        action_text = " | ".join(parts) if parts else "Scene action"
+        
+        if opening_trans:
+            action_text = f"[Intro Transition: {opening_trans}] {action_text}"
+        
+        close_trans_match = re.search(r'\[KẾT CẢNH:\s*([^\]]+)\]', block, re.IGNORECASE)
+        closing_trans = close_trans_match.group(1).strip() if close_trans_match else ""
+        if closing_trans:
+            action_text = f"{action_text} [Outro Transition: {closing_trans}]".strip()
+            
+        dialogue_items: List[DialogueItem] = []
+        dialogue_match = re.search(r'(?:\[Dialogue\]|\[Thoại\]|\[AUDIO DATA\]|Dialogue:|Thoại:|Lời thoại:)\s*[\r\n]*(.*?)(?=[\r\n]+\[|\Z)', block, re.DOTALL | re.IGNORECASE)
+        if dialogue_match:
+            dialogue_block = dialogue_match.group(1).strip()
+            for line in dialogue_block.splitlines():
+                line = line.strip()
+                if not line or line.startswith("[KẾT CẢNH") or line.startswith("Sound FX") or line.startswith("SFX") or line.startswith("Âm thanh"):
+                    continue
+                d_match = re.match(r'^\(?([^:\)\n]+)\)?:\s*"?([^"\n]+)"?$', line)
+                if d_match:
+                    speaker = d_match.group(1).strip()
+                    speech = d_match.group(2).strip()
+                    if speaker.lower() not in ["dialogue", "sound fx", "sfx", "thoại", "lời thoại", "âm thanh"]:
+                        dialogue_items.append(DialogueItem(character=speaker, speech=speech))
+        
+        parsed_scenes.append(
+            SceneAnalysis(
+                scene_number=scene_num,
+                duration_seconds=duration_sec,
+                characters=characters,
+                location=location,
+                props=props,
+                action=action_text,
+                dialogue=dialogue_items
+            )
+        )
+
+    if not parsed_scenes:
+        return None
+
+    return StoryAnalysisResponse(scenes=parsed_scenes, input_tokens=0, output_tokens=0)
+
+
+DEFAULT_STYLE_PRESETS: Dict[str, ArtStylePreset] = {
+    "3d_pixar": ArtStylePreset(
+        id="3d_pixar",
+        name="3D Pixar Animation",
+        prompt_prefix="3D Disney Pixar animation style, 3D character design, clay render, soft studio lighting",
+        prompt_suffix="cinematic lighting, ultra-detailed, 8k resolution, raytracing"
+    ),
+    "2d_anime": ArtStylePreset(
+        id="2d_anime",
+        name="2D Anime (Ghibli Style)",
+        prompt_prefix="Studio Ghibli 2D anime style, vibrant watercolor background, detailed line art",
+        prompt_suffix="masterpiece, best quality, lush aesthetics, 8k"
+    ),
+    "cinematic_realism": ArtStylePreset(
+        id="cinematic_realism",
+        name="Cinematic Realism",
+        prompt_prefix="Cinematic live-action film still, 35mm lens, realistic depth of field",
+        prompt_suffix="photorealistic, 8k resolution, film grain, dramatic lighting"
+    ),
+    "cyberpunk_3d": ArtStylePreset(
+        id="cyberpunk_3d",
+        name="3D Cyberpunk Sci-Fi",
+        prompt_prefix="3D sci-fi cyberpunk style, neon reflections, futuristic tech details",
+        prompt_suffix="unreal engine 5, octane render, volumetric lighting, high contrast"
     )
+}
+
+def parse_storyboard_to_standardized_shots(storyboard: str) -> List[StandardizedShotData]:
+    """Parses raw storyboard into structured StandardizedShotData objects capturing Image, Motion, and Audio fields."""
+    if not storyboard or not storyboard.strip():
+        return []
     
-    prompt = f"Analyze this storyboard text and output the structured scene graph:\n\n{storyboard}"
+    scene_blocks = re.split(r'(?:\r?\n)+(?=(?:\[MỞ CẢNH:[^\]]+\]\s*)?(?:Scene|Cảnh|Phân cảnh|Shot)\s*#?\s*\d+)', storyboard.strip(), flags=re.IGNORECASE)
+    shots: List[StandardizedShotData] = []
     
-    response_text = await generate_gemini_content(
-        api_keys=api_keys,
-        model=model,
+    for block in scene_blocks:
+        block = block.strip()
+        if not block:
+            continue
+        
+        num_match = re.search(r'(?:Scene|Cảnh|Phân cảnh|Shot)\s*#?\s*(\d+)', block, re.IGNORECASE)
+        if not num_match:
+            continue
+        scene_num = int(num_match.group(1))
+        
+        open_trans_match = re.search(r'\[MỞ CẢNH:\s*([^\]]+)\]', block, re.IGNORECASE)
+        opening_trans = open_trans_match.group(1).strip() if open_trans_match else ""
+        
+        close_trans_match = re.search(r'\[KẾT CẢNH:\s*([^\]]+)\]', block, re.IGNORECASE)
+        closing_trans = close_trans_match.group(1).strip() if close_trans_match else ""
+        
+        setting_match = re.search(r'(?:Setting|Location|Bối cảnh|Địa điểm):\s*([^\n\r]+)', block, re.IGNORECASE)
+        setting = setting_match.group(1).strip() if setting_match else ""
+        
+        duration_match = re.search(r'(?:Duration|Thời lượng):\s*~?(\d+)\s*s?', block, re.IGNORECASE)
+        duration_sec = int(duration_match.group(1)) if duration_match else 5
+        
+        chars_match = re.search(r'(?:Characters|Nhân vật):\s*([^\n\r]+)', block, re.IGNORECASE)
+        characters = []
+        if chars_match:
+            raw_chars = chars_match.group(1).strip()
+            if raw_chars.lower() != "none" and raw_chars.lower() != "không có":
+                characters = [c.strip() for c in raw_chars.split(",") if c.strip()]
+        
+        props_match = re.search(r'(?:Props|Đạo cụ):\s*([^\n\r]+)', block, re.IGNORECASE)
+        props = []
+        if props_match:
+            raw_props = props_match.group(1).strip()
+            if raw_props.lower() != "none" and raw_props.lower() != "không có":
+                props = [p.strip() for p in raw_props.split(",") if p.strip()]
+        
+        shot_type_match = re.search(r'(?:Shot Type|Góc máy|Shot):\s*([^\n\r]+)', block, re.IGNORECASE)
+        shot_type = shot_type_match.group(1).strip() if shot_type_match else ""
+        
+        lighting_match = re.search(r'(?:Lighting|Ánh sáng):\s*([^\n\r]+)', block, re.IGNORECASE)
+        lighting = lighting_match.group(1).strip() if lighting_match else ""
+        
+        visual_match = re.search(r'(?:Visual Description|Visual|Mô tả hình ảnh|Hình ảnh):\s*([^\n\r]+)', block, re.IGNORECASE)
+        if not visual_match:
+            visual_match = re.search(r'\[Action\]\s*[\r\n]+(.*?)(?=[\r\n]+\[|[\r\n]+Setting:|[\r\n]+Bối cảnh:|\Z)', block, re.DOTALL | re.IGNORECASE)
+        visual = visual_match.group(1).strip() if visual_match else ""
+        
+        char_motion_match = re.search(r'(?:Character Motion|Motion|Chuyển động|Hành động):\s*([^\n\r]+)', block, re.IGNORECASE)
+        char_motion = char_motion_match.group(1).strip() if char_motion_match else ""
+        
+        cam_motion_match = re.search(r'(?:Camera Motion|Chuyển động máy quay|Hành động máy quay):\s*([^\n\r]+)', block, re.IGNORECASE)
+        cam_motion = cam_motion_match.group(1).strip() if cam_motion_match else ""
+        
+        sfx_match = re.search(r'(?:Sound FX|SFX|Âm thanh|Hiệu ứng âm thanh):\s*([^\n\r]+)', block, re.IGNORECASE)
+        sfx = sfx_match.group(1).strip() if sfx_match else ""
+        
+        dialogue_items: List[DialogueItem] = []
+        dialogue_match = re.search(r'(?:\[Dialogue\]|\[Thoại\]|Dialogue:|Thoại:|Lời thoại:)\s*[\r\n]*(.*?)(?=[\r\n]+\[|\Z)', block, re.DOTALL | re.IGNORECASE)
+        if dialogue_match:
+            dialogue_block = dialogue_match.group(1).strip()
+            for line in dialogue_block.splitlines():
+                line = line.strip()
+                if not line or line.startswith("[KẾT CẢNH"):
+                    continue
+                d_match = re.match(r'^\(?([^:\)\n]+)\)?:\s*"?([^"\n]+)"?$', line)
+                if d_match:
+                    dialogue_items.append(DialogueItem(character=d_match.group(1).strip(), speech=d_match.group(2).strip()))
+        
+        shot_data = StandardizedShotData(
+            scene_number=scene_num,
+            duration_seconds=duration_sec,
+            setting=setting,
+            characters=characters,
+            props=props,
+            shot_type=shot_type,
+            lighting=lighting,
+            visual=visual,
+            character_motion=char_motion,
+            camera_motion=cam_motion,
+            dialogue=dialogue_items,
+            sound_fx=sfx,
+            opening_transition=opening_trans,
+            closing_transition=closing_trans
+        )
+        shots.append(shot_data)
+        
+    return shots
+
+def assemble_prompts(shots: List[StandardizedShotData], style_preset_id: str = "3d_pixar") -> List[StandardizedShotData]:
+    """Assembles image and video prompts for each shot using selected Art Style Preset."""
+    preset = DEFAULT_STYLE_PRESETS.get(style_preset_id, DEFAULT_STYLE_PRESETS["3d_pixar"])
+    
+    for shot in shots:
+        # Assembling Image Prompt
+        img_parts = []
+        if preset.prompt_prefix:
+            img_parts.append(preset.prompt_prefix)
+        # Omit environment, characters, and props from shot prompt because they are provided as reference images.
+        # "PROMPT Shots không cần lấy lại data của characters, bối cảnh, props, chỉ cần có các ảnh tham chiếu đúng là được rồi."
+        if shot.visual:
+            img_parts.append(shot.visual)
+        if shot.shot_type:
+            img_parts.append(f"framing: {shot.shot_type}")
+        if shot.lighting:
+            img_parts.append(f"lighting: {shot.lighting}")
+        if preset.prompt_suffix:
+            img_parts.append(preset.prompt_suffix)
+        
+        shot.assembled_image_prompt = ", ".join([p for p in img_parts if p])
+        
+        # Assembling Video Motion Prompt using 10-section preset template
+        temp_shot = Shot(
+            shot_id=f"Shot{shot.scene_number:03d}",
+            scene_number=shot.scene_number,
+            duration_seconds=shot.duration_seconds,
+            actions=shot.character_motion or shot.visual or "Scene action",
+            characters=shot.characters,
+            environment=shot.setting or "Unspecified location",
+            props=shot.props,
+            dialogue=shot.dialogue,
+            camera_movement=shot.camera_motion or "Static",
+            shot_type=shot.shot_type or "Medium Shot",
+            transition=shot.closing_transition or shot.opening_transition or "Cut",
+            composition="Rule of Thirds",
+            lighting=shot.lighting or "Warm sunlight",
+            camera=f"{shot.shot_type or 'Medium Shot'}. {shot.camera_motion or 'Static'}.",
+            timeline=[TimelineItem(time=f"0-{shot.duration_seconds}s", action=shot.character_motion or shot.visual or "Action")],
+            motion=MotionDetails(primary_motion=shot.character_motion or "Action", secondary_motion=["Blink", "Breathing"], motion_level="Low"),
+            keyframe_prompt=shot.assembled_image_prompt,
+            motion_prompt=""
+        )
+        shot.assembled_video_prompt = compile_motion_prompt(temp_shot)
+        
+    return shots
+
+
+# --- Step 1: Story Analyzer with Scene State Ledger ---
+
+STORY_ANALYZER_SYSTEM = """You are an expert Animation Director & Script Analyst.
+Analyze the raw storyboard text and break it down into chronological scenes.
+For each scene, output:
+1. scene_number (int)
+2. duration_seconds (int, 3-10s)
+3. characters (list of character names)
+4. location (setting name)
+5. props (list of physical items used)
+6. action (detailed visual actions)
+7. dialogue (list of speaking character + speech)
+8. state_before (list of key-value items describing the state of key characters, locations, held objects, and item status BEFORE the scene starts, e.g. key="alex_location", value="maze center")
+9. state_after (list of key-value items describing state changes AFTER the scene finishes, e.g. key="explorer_badge", value="missing")
+
+Ensure state_before and state_after allow future scene batches to run independently without waiting for prior scene outputs."""
+
+async def run_story_analyzer(
+    storyboard: str,
+    profile_ids: Optional[List[str]] = None,
+    model: str = "gemini-2.5-flash",
+    raw_api_keys: Optional[List[str]] = None,
+) -> StoryAnalysisResponse:
+    # Check deterministic manual parser first to avoid unnecessary Gemini API calls
+    manual_res = parse_storyboard_manual(storyboard)
+    if manual_res and len(manual_res.scenes) > 0:
+        logger.info(f"Successfully parsed {len(manual_res.scenes)} scenes deterministically from standardized storyboard format without Gemini API.")
+        return manual_res
+
+    prompt = f"Analyze the following storyboard into structured scene analysis with state_before and state_after ledgers:\n\n{clean_text_for_safety(storyboard)}"
+    raw_res = await generate_gemini_content(
         prompt=prompt,
-        system_instruction=system_instruction,
+        system_instruction=STORY_ANALYZER_SYSTEM,
         response_schema=StoryAnalysisResponse,
-        rpm_limit=rpm_limit
+        model=model,
+        profile_ids=profile_ids,
+        raw_api_keys=raw_api_keys,
     )
-    return StoryAnalysisResponse.model_validate_json(response_text)
+    return StoryAnalysisResponse.model_validate_json(raw_res)
 
-# --- Step 2: Assets Extractor ---
+
+# --- Step 2: Single 1x Asset Extractor ---
+
+ASSETS_EXTRACTOR_SYSTEM = """You are a Lead Character & Environment Art Director for 3D Feature Animation.
+Analyze the input storyboard and scene descriptions carefully. Infer and expand rich details for every unique character, environment, and prop:
+
+1. CHARACTERS:
+- canonical_name: Exact character name (e.g. Emma, Stranger, Mom)
+- age: Infer specific realistic age/age range from story context (e.g. "7-year-old young girl", "35-year-old adult man", "30-year-old mother")
+- gender: "Female" or "Male"
+- appearance: Detailed facial features, eye expression, skin tone, build, distinctive physical traits.
+- outfit: Detailed clothing items, colors, fabrics, shoes.
+- hairstyle: Hair color, length, style.
+- accessories: Any items worn or carried (hat, backpack, glasses).
+- voice_style: Specific voice tone and vocal personality (e.g. "high-pitched sweet young girl voice", "calm soft-spoken male voice").
+- personality: Key personality traits.
+- turnaround_prompt: Highly detailed 3D character turnaround sheet prompt specifying: "Character turnaround sheet of [canonical_name], [age] [gender], [appearance], wearing [outfit], [hairstyle], front view, side view, back view, neutral T-pose, clean studio background, studio lighting, ultra-detailed 8k render, no text."
+
+2. ENVIRONMENTS:
+- name: Clear background location name
+- reference_prompt: Detailed 3D environment background reference prompt without characters, specifying architectural details, lighting, depth, 8k render.
+
+3. PROPS:
+- name: Prop item name
+- reference_prompt: Detailed isolated 3D prop asset reference prompt."""
+
+def build_deterministic_assets(scenes: List[SceneAnalysis]) -> AssetsResponse:
+    """Builds Character, Environment, and Prop Bibles instantly (0.001s) from scene metadata.
+    Eliminates Gemini API timeouts, latency, and safety blocks during Step 2 Asset Extraction.
+    """
+    unique_chars: List[CharacterAsset] = []
+    seen_chars = set()
+    unique_envs: List[EnvironmentAsset] = []
+    seen_envs = set()
+    unique_props: List[PropAsset] = []
+    seen_props = set()
+    
+    for sc in scenes:
+        # Environments
+        env_name = sc.location.strip() if sc.location else "general_environment"
+        if env_name.lower() not in seen_envs:
+            seen_envs.add(env_name.lower())
+            clean_id = f"env_{env_name.lower().replace(' ', '_')}"
+            ref_p = f"Pixar 3D animation style background reference of {env_name}, warm cinematic lighting, feature film 8k render, no text."
+            unique_envs.append(
+                EnvironmentAsset(
+                    id=clean_id,
+                    name=env_name,
+                    reference_prompt=ref_p,
+                    prompt=ref_p
+                )
+            )
+            
+        # Characters
+        for char in sc.characters:
+            char_name = char.strip()
+            if not char_name or char_name.lower() in ("none", "null"):
+                continue
+            if char_name.lower() not in seen_chars:
+                seen_chars.add(char_name.lower())
+                clean_id = f"char_{char_name.lower().replace(' ', '_')}"
+                ref_c = f"Pixar 3D animation style character turnaround sheet of {char_name}, front view, side view, back view, neutral pose, clean studio lighting, 8k render, no text."
+                unique_chars.append(
+                    CharacterAsset(
+                        id=clean_id,
+                        canonical_name=char_name,
+                        name=char_name,
+                        age="character",
+                        gender="character",
+                        appearance="Expressive 3D character face, clean Pixar animation style",
+                        outfit="Stylized 3D outfit matching character reference image",
+                        hairstyle="Stylized 3D hair",
+                        accessories="None",
+                        voice_style="Gentle expressive tone",
+                        personality="Friendly and adventurous",
+                        turnaround_prompt=ref_c,
+                        prompt=ref_c
+                    )
+                )
+                
+        # Props
+        for prop in sc.props:
+            prop_name = prop.strip()
+            if not prop_name or prop_name.lower() in ("none", "null"):
+                continue
+            if prop_name.lower() not in seen_props:
+                seen_props.add(prop_name.lower())
+                clean_id = f"prop_{prop_name.lower().replace(' ', '_')}"
+                ref_prop = f"Pixar 3D animation style prop reference asset of {prop_name}, clean studio lighting, isolated 3D object render, no text."
+                unique_props.append(
+                    PropAsset(
+                        id=clean_id,
+                        name=prop_name,
+                        reference_prompt=ref_prop,
+                        prompt=ref_prop
+                    )
+                )
+                
+    return AssetsResponse(
+        characters=unique_chars,
+        environments=unique_envs,
+        props=unique_props,
+        input_tokens=0,
+        output_tokens=0
+    )
+
+
 async def run_assets_extractor(
     storyboard: str,
     scenes_json: str,
-    api_keys: List[str],
-    model: str,
-    rpm_limit: int = 5,
-    chunk_size: int = 5
+    profile_ids: Optional[List[str]] = None,
+    model: str = "gemini-2.5-flash",
+    raw_api_keys: Optional[List[str]] = None,
 ) -> AssetsResponse:
-    system_instruction = (
-        "You are an expert Asset Extractor for animation production. "
-        "Analyze the storyboard and parsed scenes to identify all unique characters, environments, and props. "
-        "For each character, populate all requested details:\n"
-        "- id: Unique ID, e.g., 'char_lisa'\n"
-        "- canonical_name: The formal consistent name of the character\n"
-        "- name: Duplicate of canonical_name\n"
-        "- age, gender, appearance, outfit, hairstyle, accessories, voice_style, personality\n"
-        "- turnaround_prompt: A highly detailed Pixar-style turnaround prompt for generating reference images (front, 45-degree, side views, Pixar 3D stylized, white background, no text, no shadows)\n"
-        "- prompt: Duplicate of turnaround_prompt\n\n"
-        "For each environment, populate:\n"
-        "- id: Unique ID, e.g., 'env_school_gate'\n"
-        "- name: The location name\n"
-        "- reference_prompt: A detailed Pixar-style empty room/area reference image prompt (wide angle, consistent lighting, no characters, no text)\n"
-        "- prompt: Duplicate of reference_prompt\n\n"
-        "For each prop, populate:\n"
-        "- id: Unique ID, e.g., 'prop_lunch_box'\n"
-        "- name: The prop name\n"
-        "- reference_prompt: A detailed Pixar-style prop reference image prompt (centered, white background, no text)\n"
-        "- prompt: Duplicate of reference_prompt\n\n"
-        "SAFETY RULE: Do NOT include any age-identifying words like 'child', 'children', 'boy', 'girl', 'kid', 'kids', 'young boy', 'young girl', 'schoolboy', 'schoolgirl' or similar child-related terms in the character descriptions or turnaround_prompts. Instead, refer to them only by name or generic terms like 'character' or 'person' to prevent Gemini API safety blocks.\n\n"
-        "Return the unique assets in the requested JSON structure. Do not invent any assets not present in the storyboard."
-    )
-    
-    prompt = (
-        f"Storyboard:\n{storyboard}\n\n"
-        f"Analyzed Scenes:\n{scenes_json}\n\n"
-        f"Extract all characters, environments, and props with reference prompts."
-    )
-    
-    response_text = await generate_gemini_content(
-        api_keys=api_keys,
-        model=model,
-        prompt=prompt,
-        system_instruction=system_instruction,
-        response_schema=AssetsResponse,
-        rpm_limit=rpm_limit
-    )
-    return AssetsResponse.model_validate_json(response_text)
-
-
-# --- Step 3: Shot Planner (Shot Prompt Generator) ---
-async def run_shot_planner(
-    scenes_json: str,
-    characters_json: str,
-    environments_json: str,
-    props_json: str,
-    api_keys: List[str],
-    model: str,
-    rpm_limit: int = 5,
-    chunk_size: int = 5,
-    storyboard: Optional[str] = None
-) -> ShotPlannerResponse:
-    scenes = json.loads(scenes_json)
-    all_characters = json.loads(characters_json) if characters_json else []
-    all_environments = json.loads(environments_json) if environments_json else []
-    all_props = json.loads(props_json) if props_json else []
-    
-    # Build character map
-    character_map = {c["name"].strip().lower(): c for c in all_characters if "name" in c}
-    for c in all_characters:
-        if "canonical_name" in c and c["canonical_name"]:
-            character_map[c["canonical_name"].strip().lower()] = c
-            
-    # Chunk scenes to execute in groups of chunk_size for stability
-    scene_chunks = [scenes[i:i + chunk_size] for i in range(0, len(scenes), chunk_size)]
-    
-    all_shots = []
-    
-    system_instruction = (
-        "You are an expert animation Shot Prompt Generator.\n"
-        "Your task is to translate a sequence of analyzed scenes into individual camera shots, generating both a detailed Keyframe reference image prompt and structured shot parameters (timeline, camera, lighting, motion details, transition, dialogue).\n\n"
-        "CRITICAL SCENE & SHOT CONTINUITY RULES (NEVER FORGET):\n"
-        "- Read and analyze the 'Previously Generated Shots' section carefully (if present) before generating the new shots.\n"
-        "- Track Character States & Inventory: If a character was holding or carrying a prop (e.g. 'Emma holds a cup of water') in the previous shots, they must CONTINUE to hold/carry it in the new shots, unless they explicitly set it down in the story or a new action describes them setting it down. If they set it down, they must no longer hold it in subsequent shots.\n"
-        "- Avoid Magic Appearances/Disappearances: Objects and props cannot suddenly appear in a character's hand or disappear from a scene without a transition or logical visual explanation. Keep props and characters' poses persistent across cuts.\n"
-        "- Track Character Positions & Spatial Layout: If a character walked to a specific location (e.g. 'Lisa walks to the blue table and sits down') at the end of the previous shot, they must start from that exact position/sitting pose in the next shot to maintain geographic and spatial continuity.\n"
-        "- Track Environmental Status: If an action modified the environment (e.g. 'opens a door', 'turns off lights', 'drops a notebook on the floor'), this status must persist in the background of subsequent shots until another action changes it.\n"
-        "- Ensure that the `keyframe_prompt` (which describes the visual elements for the image generator) matches these continuity constraints. If Emma is holding a cup in the previous shot and has not set it down, her keyframe prompt for the next shot must also mention her holding the cup.\n\n"
-        "CRITICAL SHOT DURATION & SPLITTING RULES:\n"
-        "  1. Word-Count Dialogue Rule (Keep vs Split):\n"
-        "     - Count the total number of words in the combined dialogue of a scene.\n"
-        "     - If the total word count is 16 words or fewer, you can keep them in a SINGLE shot (e.g., a Two-Shot showing both characters speaking sequentially, or an Over-the-Shoulder shot).\n"
-        "     - If the total word count exceeds 16 words, you MUST split the scene into separate sequential shots.\n"
-        "  2. Separate Complex Action from Dialogue: Never mix complex physical tasks (e.g., folding laundry, cleaning, walking a long path, returning to a table) with active speaking segments in the same shot. If a character must perform a complex action and then speak:\n"
-        "     - Split it into Shot A (Action Only, no dialogue) focusing on the physical task.\n"
-        "     - Split it into Shot B (Dialogue Only) focusing on the speech, facial expressions, and natural hand/head gestures.\n"
-        "  3. Cross-Location Splitting (Mandatory): If a conversation happens between characters in different physical settings/locations (e.g., Mom inside the house and Alex outside in the yard):\n"
-        "     - You MUST split them into separate sequential shots, assigning the correct specific environment name to EACH shot depending on who is visible. Do NOT put them in the same shot.\n"
-        "  4. Natural Performance Buffers (Pacing): Never start a shot with immediate speech or end it immediately after the speech. Always allocate 0.5s to 1s at the beginning of a shot for the character to react/prepare, and 0.5s to 1s at the end to hold their pose, blink, and breathe naturally. This prevents stiff \"clip joining\" effects.\n"
-        "  5. Vary Shot Composition to Avoid \"Talking Heads\": Instead of boring, mechanical cuts between isolated Close-ups of characters speaking (A speaks -> cut to B speaks), use professional cinematography:\n"
-        "     - Over-the-Shoulder (OTS) Shots: Frame the speaking character focusing on their face/gestures, while showing the shoulder or back of the head of the listening character in the foreground. This connects them spatially.\n"
-        "     - Two-Shots (Medium / Medium Wide): Show both characters in the same frame. One speaks and gestures, while the other reacts dynamically (nodding, smiling, blinking).\n"
-        "     - Reaction / Cutaway Shots: Focus on the listener's emotional response (Close-up) while the speaker's voice is heard off-screen (as off-screen dialogue) if it adds to the scene's emotional weight.\n"
-        "  6. Cinematic Camera Director Speed & Tone Mapping Rules (CRITICAL):\n"
-        "     - Match Camera Movement & Speed to the Scene's Emotional Tone:\n"
-        "       * Calm / Peaceful / Emotional / Tender scenes: Use slow, smooth, gentle camera movements (e.g. 'Slow Push-in', 'Slow Arc/Orbit', 'Smooth Dolly In').\n"
-        "       * Dramatic / Tense / Action / Shock scenes: Use fast, dynamic, rapid camera movements (e.g. 'Fast Push-in', 'Rapid Tracking', 'Handheld Shaky Cam', 'Snap Zoom').\n"
-        "       * Energetic / Comedic scenes: Use lively tracking, dynamic pan, whip pan, medium pacing.\n"
-        "     - Continuous 1-Shot Multi-Stage Camera Choreography (for 2-person dialogue shots up to 8s):\n"
-        "       * Do NOT leave the camera completely static during dialogue shots. Map continuous camera movements across the timeline.\n"
-        "       * Example: '0s-3.5s: Slow Push-in on Emma speaking while John listens silently with closed lips; 3.5s-5s: Smooth Pan Right shifting focus to John; 5s-8s: Gentle Zoom-in on John as he responds while Emma listens with closed lips.'\n"
-        "       * Explicit Lip-Sync & Listening Rule: State clearly in timeline/actions that the speaking character opens mouth and speaks while the non-speaking character stays silent with closed lips listening to prevent overlapping lip movement (\"nói leo\").\n"
-        "  7. Phone Call & Off-Screen Dialogue Lip-Sync Rule:\n"
-        "     - When a character is speaking but is OFF-SCREEN (e.g., speaking over the phone, or acting as an off-screen voiceover, while the camera focuses on another character listening):\n"
-        "       - The `characters` list for that shot MUST ONLY contain the visible character.\n"
-        "       - You MUST explicitly state in the `actions` field and `keyframe_prompt` that: '[Visible Character] is listening silently with closed lips, reacting to the voice.' and '[Off-screen Character] is off-screen / voiceover.' to prevent lip-sync errors.\n"
-        "  8. Dynamic Shot Duration Calculation Rules:\n"
-        "     - For any shot containing dialogue: the duration must be at least: `ceil(character_count / 15) + 2 seconds` of buffer (for natural breathing, gestures, or reaction/performance pauses). A shot containing speech must NEVER be shorter than 4 seconds.\n"
-        "     - For any shot containing physical actions: allocate at least 4 to 6 seconds for that action to happen naturally.\n"
-        "     - MAXIMUM SHOT DURATION LIMIT: The duration of any single shot must NEVER exceed 8 seconds. If dialogue or action requires more than 8 seconds, you MUST split it into multiple sequential shots (each between 4 to 8 seconds).\n"
-        "     - Dynamic Scene Duration Overriding: If the sum of the required durations for the split shots exceeds the original scene's `duration_seconds`, you MUST override and increase the shot's `duration_seconds` to satisfy the minimum requirements.\n"
-        "  9. Flexible Shot Quantity & Granular Splitting: Split scenes into as many sequential shots as logically needed to tell the story clearly, focusing on proper pacing, visual variety, and separating dialogue from action.\n"
-        "- BÓC TÁCH HÀNH ĐỘNG, LỜI THOẠI, VÀ DIỄN TẢ (CRITICAL):\n"
-        "  - You MUST clearly separate the physical action (e.g. walking, moving props), the spoken dialogue, and the character's expression/performance/reactions (e.g., smiling, crying, looking surprised, listening intently).\n"
-        "  - The physical action and dialogue must be mapped chronologically to the `timeline` field.\n"
-        "  - Character expressions, reaction styles, and performance details must be clearly described in the `actions` field and reflected in the `keyframe_prompt` (e.g., 'Lisa looks up at Emma with a warm, welcoming smile') to ensure the generator synthesizes proper facial expressions and emotional context.\n"
-        "  - The `actions` field MUST ONLY describe physical movements, positioning, poses, expressions, and emotions. You MUST NEVER write dialogue lines, spoken words, or speech (e.g. do not write 'CharacterName: \"Speech\"' or 'CharacterName: Speech') in the `actions` field. Keep the `actions` field purely visual.\n"
-        "- When splitting a scene into multiple shots, you must distribute the scene's dialogue, actions, expressions, and timeline sequentially and logically across the split shots. Ensure that no dialogue or action overlaps or is repeated. If a shot contains a character's dialogue, only include that specific character's speech in that shot's dialogue list.\n"
-        "  * Concrete Splitting Example: If a scene has Description: 'Lisa returns to the table. Emma smiles.' and Dialogue: [Emma: 'Great job!', Lisa: 'Now my hands are clean.']. Since 'Lisa returns to the table' is a complex action, and the total words of the dialogue is short (8 words), you should split it into 3 shots:\n"
-        "    - Shot A (4s): Action Shot. Focuses on Lisa returning to the table and stopping beside it, while Emma sits and smiles (No dialogue list).\n"
-        "    - Shot B (4s): Dialogue Shot. Focuses on Emma speaking 'Great job!' in a Medium Close-up (Dialogue list only contains Emma: 'Great job!').\n"
-        "    - Shot C (4s): Dialogue Shot. Focuses on Lisa replying 'Now my hands are clean.' in a Medium Close-up (Dialogue list only contains Lisa: 'Now my hands are clean.').\n\n"
-        "Your additions for each shot:\n"
-        "1. Camera and framing parameters. You must apply these strict Camera Rule mappings to determine camera_movement and shot_type:\n"
-        "   - Focus on Dialogue -> shot_type must be 'Medium Shot'\n"
-        "   - Focus on Emotion -> shot_type must be 'Close-up'\n"
-        "   - Focus on Walking -> camera_movement must be 'Tracking Shot'\n"
-        "   - Focus on Introducing a location -> shot_type must be 'Wide Shot'\n"
-        "   - Focus on Action (active movements) -> shot_type must be 'Medium Wide'\n"
-        "   - Focus on a specific Object -> shot_type must be 'Insert Shot'\n"
-        "   - Focus on Reaction -> shot_type must be 'Close-up'\n"
-        "   Define `camera` as a combination (e.g. 'Medium Shot, Static'). Specify composition, lighting, transition.\n"
-        "   - Transition Parameter: Preserve any intro/outro transition tags present in the storyboard (e.g. '[MỞ CẢNH: FADE_IN]', '[INTRO: FADE_IN]', '[CHUYỂN CẢNH: PULL_BACK]', '[OUTRO: PULL_BACK]', '[CHUYỂN CẢNH: FADE_OUT]', '[OUTRO: FADE_OUT]', '[CHUYỂN CẢNH: TILT_UP]', '[OUTRO: TILT_UP]', '[CHUYỂN CẢNH: WALK_AWAY]', '[OUTRO: WALK_AWAY]'). Populate `transition` with the exact tag or transition name.\n\n"
-        "2. Keyframe Prompt (Image Prompt):\n"
-        "   - Write a detailed text-to-image prompt to generate a single static keyframe reference image.\n"
-        "   - DO NOT repeat or describe the character's appearance, features, hairstyle, clothing, outfit, or other visual details (e.g. do not say 'female, brown hair, wearing a striped t-shirt...'). Doing so is extremely incorrect.\n"
-        "   - Instead, ONLY refer to each character by their specific name (e.g. 'Lisa', 'Emma'). Do NOT write the media_id or any ID in the prompt text.\n"
-        "   - Keep Props and Environment Names Extremely Specific (CRITICAL FOR PROP CONSISTENCY): To prevent props or background settings from changing styles between shots (e.g., drawing a corded phone in one shot and a modern smartphone in another):\n"
-        "     * You MUST use the specific prop asset names (e.g., 'black smartphone' or 'modern iPhone' instead of a generic 'phone', and 'ceramic coffee mug' instead of 'cup').\n"
-        "     * Keep the prop's descriptive name completely identical and consistent across the `keyframe_prompt` of all shots in which the prop appears.\n"
-        "     * Refer to the environments and props by their specific name (e.g., 'school cafeteria', 'lunch tray') without writing any ID numbers.\n"
-        "   - Include only the character name(s), the specific environment name, any active props, the character actions/posing, camera framing/shot type (e.g. Medium Shot, Close-up), and lighting/mood details.\n"
-        "   - Ensure the prompt starts with the standard style prefix: 'Pixar-quality stylized 3D, cinematic composition, reference keyframe, no motion blur, no text, no captions.' followed by the characters, environment, props, actions, framing, and lighting.\n"
-        "   - Do NOT describe motion, timeline, movement, or speech in the keyframe prompt.\n"
-        "   - Clean the text for safety: do not include age descriptors or sensitive child-related terms (ONLY refer to characters by their specific names like 'Lisa', 'Tom', or generic terms like 'person' or 'character' to prevent Gemini API safety blocks. Do NOT use terms like 'boy', 'girl', 'child', or 'kids').\n\n"
-        "3. Timeline:\n"
-        "   - Generate a simple chronological breakdown of actions in seconds, matching the shot duration. Keep descriptions concise and simple.\n"
-        "   - Dialogue lines in the timeline MUST be formatted exactly as: '[CharacterName]: [Dialogue text]'. Other actions should be simple descriptions.\n"
-        "   - Example:\n"
-        "     [{\"time\": \"0-3\", \"action\": \"Emma notices Lisa.\"}, {\"time\": \"3-6\", \"action\": \"Emma: Lisa, did you wash your hands?\"}, {\"time\": \"6-8\", \"action\": \"Lisa: Oh! I forgot.\"}]\n"
-        "   - CRITICAL DIALOGUE DURATION RULE: For any dialogue action (e.g. '[CharacterName]: ...'), you MUST allocate a reasonable duration based on character count: average speaking speed is roughly 15 English characters per second (including spaces). Calculate speaking duration as: ceil(character_count / 15) + 2 seconds of buffer for natural pauses. Speaking segments must NEVER be shorter than 4 seconds (e.g. if the formula yields less than 4, default to 4 seconds) to prevent characters from being cut off mid-speech. For example, if a dialogue has 33 characters, allocate 33/15 + 2 = 4.2s -> round up to 5 seconds in the timeline.\n\n"
-        "4. Motion Details:\n"
-        "   - primary_motion: The main motion of the character (e.g. 'Walk') in English.\n"
-        "   - secondary_motion: List of secondary/idle motions, e.g. ['Blink', 'Breathing'].\n"
-        "   - motion_level: Motion level, e.g. 'Low', 'Medium', 'High'.\n\n"
-        "5. Character Motion and Walking Rules (CRITICAL):\n"
-        "   - Never describe only the destination (e.g., do not write 'Lisa walks to the table').\n"
-        "   - Always describe: 1) starting position, 2) walking path, and 3) stopping position (e.g., 'Lisa walks along the open aisle between the tables and stops beside the blue table').\n"
-        "   - Characters never choose their own path. Always instruct them to use existing walkable space.\n"
-        "   - Never pass through furniture. Never intersect objects.\n"
-        "   - Keep realistic physical spacing from surrounding objects and other characters.\n"
-        "   - Avoid long walking whenever possible. Prefer standing, turning, leaning, or small steps.\n\n"
-        "Ensure shot_id is sequential: Shot001, Shot002, etc. Return valid JSON conforming to the ShotPlannerResponse schema."
-    )
-    
-    # We need to maintain an overall sequential shot_id counter across chunks.
-    # To do this, we can let Gemini generate the schema first, and then post-process the shot_ids to ensure they are sequence aligned starting from 1.
-    global_shot_counter = 1
-    
-    for chunk in scene_chunks:
-        # Collect referenced assets in this chunk
-        referenced_chars = set()
-        referenced_envs = set()
-        referenced_props = set()
-        for scene in chunk:
-            for c in scene.get("characters", []):
-                referenced_chars.add(c.strip().lower())
-            env = scene.get("location") or scene.get("setting")
-            if env:
-                referenced_envs.add(env.strip().lower())
-            for p in scene.get("props", []):
-                referenced_props.add(p.strip().lower())
-        
-        # Filter assets to only include referenced ones, with fallback to all if none match
-        chunk_characters = [
-            c for c in all_characters 
-            if c.get("name", "").strip().lower() in referenced_chars or 
-               c.get("canonical_name", "").strip().lower() in referenced_chars or
-               c.get("id", "").strip().lower() in referenced_chars
-        ]
-        if not chunk_characters and all_characters:
-            chunk_characters = all_characters
-
-        chunk_environments = [
-            e for e in all_environments 
-            if e.get("name", "").strip().lower() in referenced_envs or 
-               e.get("setting_name", "").strip().lower() in referenced_envs or
-               e.get("id", "").strip().lower() in referenced_envs
-        ]
-        if not chunk_environments and all_environments:
-            chunk_environments = all_environments
-
-        chunk_props = [
-            p for p in all_props 
-            if p.get("name", "").strip().lower() in referenced_props or 
-               p.get("prop_name", "").strip().lower() in referenced_props or
-               p.get("id", "").strip().lower() in referenced_props
-        ]
-        if not chunk_props and all_props:
-            chunk_props = all_props
-        
-        # Clean character fields for safety (removing age / child keywords)
-        cleaned_characters = []
-        for c in chunk_characters:
-            cc = c.copy()
-            cc["age"] = ""
-            for field in ["appearance", "outfit", "hairstyle", "accessories", "turnaround_prompt", "prompt", "personality", "voice_style", "description", "gender"]:
-                if field in cc and cc[field]:
-                    cc[field] = clean_text_for_safety(cc[field])
-            cleaned_characters.append(cc)
-            
-        # Clean environment fields for safety
-        cleaned_environments = []
-        for e in chunk_environments:
-            ee = e.copy()
-            for field in ["description", "turnaround_prompt", "prompt", "reference_prompt"]:
-                if field in ee and ee[field]:
-                    ee[field] = clean_text_for_safety(ee[field])
-            cleaned_environments.append(ee)
-            
-        # Clean prop fields for safety
-        cleaned_props = []
-        for p in chunk_props:
-            pp = p.copy()
-            for field in ["description", "turnaround_prompt", "prompt", "reference_prompt"]:
-                if field in pp and pp[field]:
-                    pp[field] = clean_text_for_safety(pp[field])
-            cleaned_props.append(pp)
- 
-        # Ensure we clean storyboard if provided, otherwise clean scene actions
-        cleaned_chunk = []
-        for scene in chunk:
-            sc = scene.copy()
-            if "action" in sc and sc["action"]:
-                sc["action"] = clean_text_for_safety(sc["action"])
-            if "description" in sc and sc["description"]:
-                sc["description"] = clean_text_for_safety(sc["description"])
-            if "dialogue" in sc and sc["dialogue"]:
-                cleaned_dialogue = []
-                for d in sc["dialogue"]:
-                    dc = d.copy()
-                    if "speech" in dc and dc["speech"]:
-                        dc["speech"] = clean_text_for_safety(dc["speech"])
-                    if "text" in dc and dc["text"]:
-                        dc["text"] = clean_text_for_safety(dc["text"])
-                    cleaned_dialogue.append(dc)
-                sc["dialogue"] = cleaned_dialogue
-            cleaned_chunk.append(sc)
-
-        chunk_scenes_json = json.dumps(cleaned_chunk, ensure_ascii=False)
-        chunk_characters_json = json.dumps(cleaned_characters, ensure_ascii=False)
-        chunk_environments_json = json.dumps(cleaned_environments, ensure_ascii=False)
-        chunk_props_json = json.dumps(cleaned_props, ensure_ascii=False)
-        
-        # Get the sliding window of last 6 shots for continuity context (excluding heavy keyframe_prompt text to optimize speed)
-        recent_shots = all_shots[-6:] if len(all_shots) > 6 else all_shots
-        previous_shots_str = ""
-        if recent_shots:
-            simplified_previous = []
-            for s in recent_shots:
-                simplified_previous.append({
-                    "shot_id": s.shot_id,
-                    "scene_number": s.scene_number,
-                    "characters": s.characters,
-                    "environment": s.environment,
-                    "props": s.props,
-                    "actions": s.actions,
-                    "dialogue": [{"character": d.character, "speech": d.speech} for d in s.dialogue] if s.dialogue else []
-                })
-            previous_shots_str = json.dumps(simplified_previous, ensure_ascii=False)
-        else:
-            previous_shots_str = "None (This is the start of the storyboard)"
-
-        prompt = (
-            f"Previously Generated Shots (for continuity context):\n{previous_shots_str}\n\n"
-            f"Scenes to generate shots for in this batch:\n{chunk_scenes_json}\n\n"
-            f"Character Reference Assets:\n{chunk_characters_json}\n\n"
-            f"Environment Reference Assets:\n{chunk_environments_json}\n\n"
-            f"Prop Reference Assets:\n{chunk_props_json}\n\n"
-            f"Generate shots, keyframe prompts, and motion parameters for this batch of scenes. Apply camera rules and keep durations exactly."
-        )
-        
-        response_text = await generate_gemini_content(
-            api_keys=api_keys,
-            model=model,
+    """Uses Gemini API to analyze character traits, age, gender, appearance, outfit, voice style, and detailed turnaround prompts."""
+    prompt = f"Analyze and extract detailed characters, environments, and props from storyboard and scene analysis:\n\nSTORYBOARD:\n{clean_text_for_safety(storyboard)}\n\nSCENES:\n{clean_text_for_safety(scenes_json)}"
+    try:
+        raw_res = await generate_gemini_content(
             prompt=prompt,
-            system_instruction=system_instruction,
-            response_schema=ShotPlannerResponse,
-            rpm_limit=rpm_limit
-        )
-        chunk_data = ShotPlannerResponse.model_validate_json(response_text)
-        
-        # Format shot IDs and compile motion prompts programmatically
-        for shot in chunk_data.shots:
-            shot.shot_id = f"Shot{global_shot_counter:03d}"
-            global_shot_counter += 1
-            # Compile the motion prompt string using the helper
-            shot.motion_prompt = compile_motion_prompt(shot, character_map)
-            
-        all_shots.extend(chunk_data.shots)
-        
-    return ShotPlannerResponse(shots=all_shots)
-
-# --- Step 4: Keyframe Prompt Generator ---
-async def run_keyframe_prompt_generator(
-    shots_json: str,
-    characters_json: str,
-    environments_json: str,
-    props_json: str,
-    api_keys: List[str],
-    model: str,
-    rpm_limit: int = 5,
-    chunk_size: int = 5
-) -> KeyframePromptResponse:
-    shots = json.loads(shots_json)
-    
-    # Check if all shots already have keyframe_prompt (pre-computed by Shot Prompt Generator)
-    has_all_keyframes = True
-    keyframes = []
-    for s in shots:
-        prompt_val = s.get("keyframe_prompt") if isinstance(s, dict) else getattr(s, "keyframe_prompt", "")
-        shot_id_val = s.get("shot_id") if isinstance(s, dict) else getattr(s, "shot_id", "")
-        if prompt_val:
-            keyframes.append(ShotKeyframePrompt(shot_id=shot_id_val, prompt=prompt_val))
-        else:
-            has_all_keyframes = False
-            break
-
-    if shots and has_all_keyframes:
-        return KeyframePromptResponse(keyframes=keyframes)
-    
-    # Group shots by scene number first to keep context isolated, then split if scene shots exceed chunk_size
-    from collections import defaultdict
-    shots_by_scene = defaultdict(list)
-    for shot in shots:
-        scene_num = shot.get("scene_number") or shot.get("scene_id") or 1
-        try:
-            scene_num = int(scene_num)
-        except (ValueError, TypeError):
-            scene_num = 1
-        shots_by_scene[scene_num].append(shot)
-        
-    shot_chunks = []
-    for scene_num in sorted(shots_by_scene.keys()):
-        scene_shots = shots_by_scene[scene_num]
-        for i in range(0, len(scene_shots), chunk_size):
-            shot_chunks.append(scene_shots[i:i + chunk_size])
-    
-    all_keyframes = []
-    
-    # Parse full assets
-    all_characters = json.loads(characters_json) if characters_json else []
-    all_environments = json.loads(environments_json) if environments_json else []
-    all_props = json.loads(props_json) if props_json else []
-    
-    system_instruction = (
-        "You are an expert Keyframe Image Prompt Generator.\n"
-        "For each shot in the provided list, write a detailed text-to-image prompt to generate a single static keyframe reference image.\n\n"
-        "CRITICAL SCENE & SHOT CONTINUITY RULES (NEVER FORGET):\n"
-        "- Read and analyze the 'Previously Generated Keyframe Prompts' section carefully (if present) before generating the new prompts.\n"
-        "- Track Character States & Inventory: If a character was holding or carrying a prop (e.g. 'Emma holds a cup of water') in the previous keyframe prompts, they must CONTINUE to hold/carry it in the new prompts, unless they explicitly set it down in the shot description or action. If they set it down, they must no longer hold it in subsequent prompts.\n"
-        "- Keep character positions, poses, and environment status consistent with the previous keyframe prompts.\n\n"
-        "PROMPT FORMATTING RULES:\n"
-        "- DO NOT repeat or describe the character's appearance, features, hairstyle, clothing, outfit, or other visual details (e.g. do not say 'female, brown hair, wearing a striped t-shirt...'). Doing so is extremely incorrect.\n"
-        "- Instead, ONLY refer to each character by their specific name (e.g. 'Lisa', 'Emma'). Do NOT write the media_id or any ID in the prompt text.\n"
-        "- Similarly, do not repeat or describe the environments or props. Refer to them only by their name (e.g., 'cafeteria', 'lunch tray') without writing any ID or description.\n"
-        "- Include only the character name(s), the environment name, any active props, the character actions/posing, camera framing/shot type (e.g. Medium Shot, Close-up), and lighting/mood details.\n"
-        "- Ensure the prompt starts with the standard style prefix: 'Pixar-quality stylized 3D, cinematic composition, reference keyframe, no motion blur, no text, no captions.' followed by the characters, environment, props, actions, framing, and lighting.\n"
-        "- Do NOT describe motion, timeline, movement, or speech in the keyframe prompt.\n"
-        "- SAFETY RULE: Do NOT use any age-identifying words like 'child', 'children', 'boy', 'girl', 'kid', 'kids', 'young boy', 'young girl', 'schoolboy', 'schoolgirl' or similar child-related terms in the prompts. Instead, ONLY refer to characters by their specific names (e.g. 'Lisa', 'Tom') or generic terms (e.g. 'person', 'character')."
-    )
-    
-    for chunk in shot_chunks:
-        # Collect referenced assets in this chunk
-        referenced_chars = set()
-        referenced_envs = set()
-        referenced_props = set()
-        for shot in chunk:
-            for c in shot.get("characters", []):
-                referenced_chars.add(c.strip().lower())
-            env = shot.get("environment")
-            if env:
-                referenced_envs.add(env.strip().lower())
-            for p in shot.get("props", []):
-                referenced_props.add(p.strip().lower())
-        
-        # Filter assets to only include referenced ones, with fallback to all if none match
-        chunk_characters = [
-            c for c in all_characters 
-            if c.get("name", "").strip().lower() in referenced_chars or 
-               c.get("canonical_name", "").strip().lower() in referenced_chars
-        ]
-        if not chunk_characters and all_characters:
-            chunk_characters = all_characters
-
-        chunk_environments = [
-            e for e in all_environments 
-            if e.get("name", "").strip().lower() in referenced_envs or 
-               e.get("setting_name", "").strip().lower() in referenced_envs
-        ]
-        if not chunk_environments and all_environments:
-            chunk_environments = all_environments
-
-        chunk_props = [
-            p for p in all_props 
-            if p.get("name", "").strip().lower() in referenced_props or 
-               p.get("prop_name", "").strip().lower() in referenced_props
-        ]
-        if not chunk_props and all_props:
-            chunk_props = all_props
-        
-        # Clean character fields for safety (removing age / child keywords)
-        cleaned_characters = []
-        for c in chunk_characters:
-            cc = c.copy()
-            cc["age"] = ""
-            for field in ["appearance", "outfit", "hairstyle", "accessories", "turnaround_prompt", "prompt", "personality", "voice_style", "description", "gender"]:
-                if field in cc and cc[field]:
-                    cc[field] = clean_text_for_safety(cc[field])
-            cleaned_characters.append(cc)
-            
-        # Clean environment fields for safety
-        cleaned_environments = []
-        for e in chunk_environments:
-            ee = e.copy()
-            for field in ["description", "turnaround_prompt", "prompt"]:
-                if field in ee and ee[field]:
-                    ee[field] = clean_text_for_safety(ee[field])
-            cleaned_environments.append(ee)
-            
-        # Clean prop fields for safety
-        cleaned_props = []
-        for p in chunk_props:
-            pp = p.copy()
-            for field in ["description", "turnaround_prompt", "prompt"]:
-                if field in pp and pp[field]:
-                    pp[field] = clean_text_for_safety(pp[field])
-            cleaned_props.append(pp)
-
-        # Clean shots chunk for safety
-        cleaned_chunk = []
-        for shot in chunk:
-            s_copy = shot.copy()
-            for field in ["actions", "action", "description"]:
-                if field in s_copy and s_copy[field]:
-                    s_copy[field] = clean_text_for_safety(s_copy[field])
-            if "dialogue" in s_copy and s_copy["dialogue"]:
-                cleaned_dialogue = []
-                for d in s_copy["dialogue"]:
-                    dc = d.copy()
-                    if "speech" in dc and dc["speech"]:
-                        dc["speech"] = clean_text_for_safety(dc["speech"])
-                    if "text" in dc and dc["text"]:
-                        dc["text"] = clean_text_for_safety(dc["text"])
-                    cleaned_dialogue.append(dc)
-                s_copy["dialogue"] = cleaned_dialogue
-            cleaned_chunk.append(s_copy)
-
-        chunk_shots_json = json.dumps(cleaned_chunk, ensure_ascii=False)
-        chunk_characters_json = json.dumps(cleaned_characters, ensure_ascii=False)
-        chunk_environments_json = json.dumps(cleaned_environments, ensure_ascii=False)
-        chunk_props_json = json.dumps(cleaned_props, ensure_ascii=False)
-        
-        # Get the sliding window of last 12 keyframe prompts for continuity context
-        recent_keyframes = all_keyframes[-12:] if len(all_keyframes) > 12 else all_keyframes
-        previous_keyframes_str = ""
-        if recent_keyframes:
-            previous_keyframes_str = json.dumps([{"shot_id": k.shot_id, "prompt": k.prompt} for k in recent_keyframes], ensure_ascii=False, indent=2)
-        else:
-            previous_keyframes_str = "None"
-            
-        prompt = (
-            f"Previously Generated Keyframe Prompts (for continuity context):\n{previous_keyframes_str}\n\n"
-            f"Shots to generate keyframe prompts for in this batch:\n{chunk_shots_json}\n\n"
-            f"Character Assets:\n{chunk_characters_json}\n\n"
-            f"Environment Assets:\n{chunk_environments_json}\n\n"
-            f"Prop Assets:\n{chunk_props_json}\n\n"
-            f"Generate keyframe image prompts for this batch of shots."
-        )
-        
-        response_text = await generate_gemini_content(
-            api_keys=api_keys,
+            system_instruction=ASSETS_EXTRACTOR_SYSTEM,
+            response_schema=AssetsResponse,
             model=model,
-            prompt=prompt,
-            system_instruction=system_instruction,
-            response_schema=KeyframePromptResponse,
-            rpm_limit=rpm_limit
+            profile_ids=profile_ids,
+            raw_api_keys=raw_api_keys,
         )
-        chunk_data = KeyframePromptResponse.model_validate_json(response_text)
-        all_keyframes.extend(chunk_data.keyframes)
-        
-    return KeyframePromptResponse(keyframes=all_keyframes)
-
-# --- Step 5: Motion Prompt Generator ---
-async def run_motion_prompt_generator(
-    storyboard: str,
-    shots_json: str,
-    characters_json: str,
-    environments_json: str,
-    props_json: str,
-    api_keys: List[str],
-    model: str,
-    rpm_limit: int = 5,
-    chunk_size: int = 5,
-    custom_instructions: Optional[str] = None
-) -> MotionPromptResponse:
-    shots = json.loads(shots_json)
-    all_characters = json.loads(characters_json) if characters_json else []
-    
-    # Build character map
-    character_map = {c["name"].strip().lower(): c for c in all_characters if "name" in c}
-    for c in all_characters:
-        if "canonical_name" in c and c["canonical_name"]:
-            character_map[c["canonical_name"].strip().lower()] = c
-
-    # Compile motion prompts directly from shot details if custom_instructions is not provided
-    has_all_prompts = True
-    motion_prompts = []
-    
-    if not custom_instructions:
-        for s in shots:
+        res = AssetsResponse.model_validate_json(raw_res)
+        # Ensure backward-compatible prompts
+        for c in res.characters:
+            if not c.turnaround_prompt:
+                c.turnaround_prompt = f"Pixar 3D animation style character turnaround sheet of {c.canonical_name}, {c.age} {c.gender}, {c.appearance}, wearing {c.outfit}, front view, side view, back view, neutral pose, clean studio lighting, 8k render, no text."
+            c.prompt = c.turnaround_prompt
+        for e in res.environments:
+            if not e.reference_prompt:
+                e.reference_prompt = f"Pixar 3D animation style background reference of {e.name}, warm cinematic lighting, feature film 8k render, no text."
+            e.prompt = e.reference_prompt
+        for p in res.props:
+            if not p.reference_prompt:
+                p.reference_prompt = f"Pixar 3D animation style prop reference asset of {p.name}, clean studio lighting, isolated 3D object render, no text."
+            p.prompt = p.reference_prompt
+        return res
+    except Exception as err:
+        logger.warning("Gemini Asset Extractor failed (%s). Falling back to deterministic assets.", err)
+        parsed_scenes: List[SceneAnalysis] = []
+        if scenes_json:
             try:
-                # Try compiling from shot details (no Gemini API calls, extremely fast)
-                # Always re-compile programmatically to ensure character voice styles, age, gender, and new structure are injected
-                shot_obj = Shot.model_validate(s) if isinstance(s, dict) else s
-                compiled = compile_motion_prompt(shot_obj, character_map)
-                shot_id_val = s.get("shot_id") if isinstance(s, dict) else getattr(s, "shot_id", "")
-                motion_prompts.append(ShotMotionPrompt(shot_id=shot_id_val, prompt=compiled))
-            except Exception as e:
-                logger.warning(f"Failed to validate shot for programmatic compilation: {e}. Falling back to Gemini.")
-                has_all_prompts = False
-                break
-    else:
-        has_all_prompts = False
-            
-    if shots and has_all_prompts:
-        return MotionPromptResponse(motion_prompts=motion_prompts)
-    
-    # Group shots by scene number first to keep context isolated, then split if scene shots exceed chunk_size
-    from collections import defaultdict
-    shots_by_scene = defaultdict(list)
-    for shot in shots:
-        scene_num = shot.get("scene_number") or shot.get("scene_id") or 1
-        try:
-            scene_num = int(scene_num)
-        except (ValueError, TypeError):
-            scene_num = 1
-        shots_by_scene[scene_num].append(shot)
-        
-    shot_chunks = []
-    for scene_num in sorted(shots_by_scene.keys()):
-        scene_shots = shots_by_scene[scene_num]
-        for i in range(0, len(scene_shots), chunk_size):
-            shot_chunks.append(scene_shots[i:i + chunk_size])
-    
-    all_motion_prompts = []
-    
-    # Parse full assets
-    all_characters = json.loads(characters_json) if characters_json else []
-    all_environments = json.loads(environments_json) if environments_json else []
-    all_props = json.loads(props_json) if props_json else []
-    
-    system_instruction = (
-        "You are an expert Motion Prompt Generator for Google Veo 3 (video generation).\n"
-        "For each shot, you must output a structured, extremely concise, 100% English motion prompt.\n"
-        "Your generated prompt for each shot MUST strictly follow this exact format and order:\n\n"
-        "SCENE:\n"
-        "[Brief setting name and environment/lighting details. Include 'matching the reference image' for consistency.]\n\n"
-        "REFERENCE:\n"
-        "Continue from the provided reference image. Do not change characters' appearance or background environment.\n\n"
-        "CHARACTERS:\n"
-        "[List of characters visible in the shot, including their gender, age, personality, and voice style description in parentheses, e.g.:\n"
-        "- Emma (female, 30s, caring, warm gentle voice)\n"
-        "- Lisa (girl, 6, curious, cheerful young voice). If there are no characters, write 'None'.]\n\n"
-        "SHOT:\n"
-        "[Camera framing and movement, e.g. 'Medium shot. Static camera.']\n\n"
-        "TIMELINE:\n"
-        "[Simple chronological breakdown of actions in seconds, without 's' suffixes. For dialogue lines, use speaker name and their voice attributes in parentheses, e.g.:\n"
-        "0-3 Emma notices Lisa.\n"
-        "3-6 Emma (female, warm gentle voice): Lisa, did you wash your hands?\n"
-        "6-8 Lisa (girl, cheerful young voice): Oh! I forgot.]\n\n"
-        "DIALOGUE:\n"
-        "[Dialogue lines, formatted as: CharacterName (gender, voice style description): \"speech text\". E.g., Emma (female, warm gentle voice): \"Lisa, did you wash your hands?\". Below the dialogue, append exactly:\n"
-        "Dialogue must match exactly.\n"
-        "No additional speech.\n"
-        "Remain silent after the final line.\n"
-        "If there is no dialogue, write 'None'.]\n\n"
-        "ACTIONS:\n"
-        "[Simplified character movements. Always start with: 'Both characters maintain natural breathing, blinking and subtle body movement.' (or single character equivalent). Followed by the shot action, and character behaviors. The ACTIONS section must only describe physical movements, poses, expressions, and gestures. You MUST NEVER write dialogue lines, spoken words, or speech (e.g. do not write 'CharacterName: \"Speech\"' or 'CharacterName: Speech') in the ACTIONS field. Keep ACTIONS purely visual. E.g. 'Emma: Looks toward Lisa and gestures.' / 'Lisa: Turns toward Emma and nods.']\n\n"
-        "SPATIAL RULES:\n"
-        "Characters move only through clear walkable space.\n"
-        "Walk along existing aisles.\n"
-        "Avoid tables, chairs, walls and furniture.\n"
-        "Never intersect scene objects.\n"
-        "Stop before interacting with furniture.\n"
-        "Keep both feet naturally on the floor.\n"
-        "Maintain realistic spacing from surrounding objects.\n\n"
-        "ENDING:\n"
-        "Hold final pose silently. Blink and breathe naturally.\n\n"
-        "STYLE:\n"
-        "High-quality stylized 3D animation.\n"
-        "Feature film quality.\n"
-        "No on-screen text.\n\n"
-        "CRITICAL LIMITS:\n"
-        "- Total word count must be between 80 and 150 words. Do not repeat descriptions or write unnecessary details.\n"
-        "- Do not use any Negative Prompt section.\n"
-        "- SAFETY RULE: Do NOT use any age-identifying words like 'child', 'children', 'kid', 'kids', 'young boy', 'young girl', 'schoolboy', 'schoolgirl' or similar child-related terms in the motion prompts. Instead, ONLY refer to characters by their specific names (e.g. 'Lisa', 'Tom') or generic pronouns (e.g. 'they', 'he', 'she'). Note: 'boy' or 'girl' is allowed when describing voice/character gender characteristics, but avoid child/kids terms."
-    )
-    
-    for chunk in shot_chunks:
-        # Collect referenced assets and scene numbers in this chunk
-        referenced_chars = set()
-        referenced_envs = set()
-        referenced_props = set()
-        scene_numbers = set()
-        for shot in chunk:
-            for c in shot.get("characters", []):
-                referenced_chars.add(c.strip().lower())
-            env = shot.get("environment")
-            if env:
-                referenced_envs.add(env.strip().lower())
-            for p in shot.get("props", []):
-                referenced_props.add(p.strip().lower())
-            scene_id = shot.get("scene_number") or shot.get("scene_id")
-            if scene_id is not None:
-                try:
-                    scene_numbers.add(int(scene_id))
-                except ValueError:
-                    pass
-        
-        # Filter assets, with fallback to all if none match
-        chunk_characters = [
-            c for c in all_characters 
-            if c.get("name", "").strip().lower() in referenced_chars or 
-               c.get("canonical_name", "").strip().lower() in referenced_chars
-        ]
-        if not chunk_characters and all_characters:
-            chunk_characters = all_characters
-
-        chunk_environments = [
-            e for e in all_environments 
-            if e.get("name", "").strip().lower() in referenced_envs or 
-               e.get("setting_name", "").strip().lower() in referenced_envs
-        ]
-        if not chunk_environments and all_environments:
-            chunk_environments = all_environments
-
-        chunk_props = [
-            p for p in all_props 
-            if p.get("name", "").strip().lower() in referenced_props or 
-               p.get("prop_name", "").strip().lower() in referenced_props
-        ]
-        if not chunk_props and all_props:
-            chunk_props = all_props
-        
-        # Extract only relevant storyboard text
-        chunk_storyboard = extract_relevant_storyboard_scenes(storyboard, scene_numbers)
-        # Clean storyboard for safety
-        chunk_storyboard = clean_text_for_safety(chunk_storyboard)
-        
-        # Clean character fields for safety (removing age / child keywords)
-        cleaned_characters = []
-        for c in chunk_characters:
-            cc = c.copy()
-            cc["age"] = ""
-            for field in ["appearance", "outfit", "hairstyle", "accessories", "turnaround_prompt", "prompt", "personality", "voice_style", "description", "gender"]:
-                if field in cc and cc[field]:
-                    cc[field] = clean_text_for_safety(cc[field])
-            cleaned_characters.append(cc)
-            
-        # Clean environment fields for safety
-        cleaned_environments = []
-        for e in chunk_environments:
-            ee = e.copy()
-            for field in ["description", "turnaround_prompt", "prompt"]:
-                if field in ee and ee[field]:
-                    ee[field] = clean_text_for_safety(ee[field])
-            cleaned_environments.append(ee)
-            
-        # Clean prop fields for safety
-        cleaned_props = []
-        for p in chunk_props:
-            pp = p.copy()
-            for field in ["description", "turnaround_prompt", "prompt"]:
-                if field in pp and pp[field]:
-                    pp[field] = clean_text_for_safety(pp[field])
-            cleaned_props.append(pp)
-
-        # Clean shots chunk for safety
-        cleaned_chunk = []
-        for shot in chunk:
-            s_copy = shot.copy()
-            for field in ["actions", "action", "description"]:
-                if field in s_copy and s_copy[field]:
-                    s_copy[field] = clean_text_for_safety(s_copy[field])
-            if "dialogue" in s_copy and s_copy["dialogue"]:
-                cleaned_dialogue = []
-                for d in s_copy["dialogue"]:
-                    dc = d.copy()
-                    if "speech" in dc and dc["speech"]:
-                        dc["speech"] = clean_text_for_safety(dc["speech"])
-                    if "text" in dc and dc["text"]:
-                        dc["text"] = clean_text_for_safety(dc["text"])
-                    cleaned_dialogue.append(dc)
-                s_copy["dialogue"] = cleaned_dialogue
-            cleaned_chunk.append(s_copy)
-            
-        chunk_shots_json = json.dumps(cleaned_chunk, ensure_ascii=False)
-        chunk_characters_json = json.dumps(cleaned_characters, ensure_ascii=False)
-        chunk_environments_json = json.dumps(cleaned_environments, ensure_ascii=False)
-        chunk_props_json = json.dumps(cleaned_props, ensure_ascii=False)
-        
-        prompt = (
-            f"Storyboard:\n{chunk_storyboard}\n\n"
-            f"Shots in this batch:\n{chunk_shots_json}\n\n"
-            f"Character Reference Assets:\n{chunk_characters_json}\n\n"
-            f"Environment Reference Assets:\n{chunk_environments_json}\n\n"
-            f"Prop Reference Assets:\n{chunk_props_json}\n\n"
-        )
-        if custom_instructions:
-            prompt += f"Additional User Instructions/Requirements:\n{custom_instructions}\n\n"
-        prompt += "Generate Veo 3 motion prompts for this batch of shots conforming to formatting guidelines, length limit, and Motion Direction Rules. Apply the Additional User Instructions/Requirements if provided."
-        
-        response_text = await generate_gemini_content(
-            api_keys=api_keys,
-            model=model,
-            prompt=prompt,
-            system_instruction=system_instruction,
-            response_schema=MotionPromptResponse,
-            rpm_limit=rpm_limit
-        )
-        chunk_data = MotionPromptResponse.model_validate_json(response_text)
-        
-        # Check compliance and regenerate if needed for each shot in the chunk
-        for s in chunk:
-            shot_id = s["shot_id"]
-            motion_item = next((mp for mp in chunk_data.motion_prompts if mp.shot_id == shot_id), None)
-            if not motion_item:
-                continue
-            
-            # retry loop
-            for attempt in range(3):
-                # run compliance check with filtered storyboard
-                check_res = await check_compliance(
-                    motion_prompt=motion_item.prompt,
-                    shot=s,
-                    storyboard=chunk_storyboard,
-                    api_keys=api_keys,
-                    model=model,
-                    rpm_limit=rpm_limit
-                )
-                if check_res.is_compliant:
-                    break
-                
-                # If fail, regenerate it specifically
-                print(f"Compliance check failed for {shot_id} (Attempt {attempt+1}): {check_res.errors}")
-                regen_prompt = (
-                    f"The previously generated motion prompt for shot {shot_id} failed compliance checking.\n"
-                    f"Errors:\n" + "\n".join(f"- {err}" for err in check_res.errors) + "\n\n"
-                    f"Previous Prompt:\n{motion_item.prompt}\n\n"
-                    f"Shot Details:\n{json.dumps(s, ensure_ascii=False)}\n\n"
-                    f"Character Assets:\n{chunk_characters_json}\n\n"
-                    f"Environment Assets:\n{chunk_environments_json}\n\n"
-                    f"Prop Assets:\n{chunk_props_json}\n\n"
-                    f"Please rewrite the motion prompt to fix the errors. Keep it strictly between 80 and 150 words and in the exact format required."
-                )
-                
-                # Single shot regeneration
-                regen_response_text = await generate_gemini_content(
-                    api_keys=api_keys,
-                    model=model,
-                    prompt=regen_prompt,
-                    system_instruction=system_instruction,
-                    response_schema=ShotMotionPrompt,
-                    rpm_limit=rpm_limit
-                )
-                try:
-                    new_motion_prompt = ShotMotionPrompt.model_validate_json(regen_response_text)
-                    motion_item.prompt = new_motion_prompt.prompt
-                except Exception as ex:
-                    print(f"Failed to parse regenerated prompt for {shot_id}: {ex}")
-        
-        all_motion_prompts.extend(chunk_data.motion_prompts)
-        
-    return MotionPromptResponse(motion_prompts=all_motion_prompts)
+                raw_data = json.loads(scenes_json)
+                if isinstance(raw_data, list):
+                    parsed_scenes = [SceneAnalysis.model_validate(item) for item in raw_data]
+            except Exception:
+                pass
+        if not parsed_scenes:
+            manual_story = parse_storyboard_manual(storyboard)
+            if manual_story and manual_story.scenes:
+                parsed_scenes = manual_story.scenes
+        return build_deterministic_assets(parsed_scenes)
 
 
-# --- Step 6: Veo Compliance Checker ---
-async def check_compliance(
-    motion_prompt: str,
-    shot: Dict[str, Any],
-    storyboard: str,
-    api_keys: List[str],
-    model: str,
-    rpm_limit: int = 5
-) -> ComplianceCheckResult:
-    system_instruction = (
-        "You are a strict Veo Compliance Checker. Your task is to verify if a generated Motion Prompt meets all guidelines.\n"
-        "Analyze the provided Motion Prompt against the original Shot details and Storyboard, and verify each checklist item:\n"
-        "- dialogue đúng 100%: The exact dialogue text must match the storyboard dialogue exactly. No paraphrasing, no improvisation.\n"
-        "- duration hợp lý: The duration in seconds matches the shot duration.\n"
-        "- prompt dưới giới hạn: The total word count of the Motion Prompt is between 80 and 150 words.\n"
-        "- không có tiếng Việt: The prompt must be entirely in English (except for character names if necessary).\n"
-        "- không có lời kể / không có narration / không có voice over: The prompt must not contain any narrative voice-over or storytelling text.\n"
-        "- không có prompt mâu thuẫn: No conflicting directions.\n"
-        "- không có nhân vật dư / không có location dư: No extra characters or settings described that are not in the shot.\n\n"
-        "Return a JSON object with is_compliant (boolean) and errors (list of strings if is_compliant is false)."
-    )
-    
+# --- Step 3: Dynamic Token Chunking ---
+
+def chunk_scenes_by_tokens(
+    scenes: List[SceneAnalysis],
+    preset: str = "balanced",
+) -> List[List[SceneAnalysis]]:
+    """Groups scenes into dynamic batches based on estimated token weight and max shot constraints."""
+    preset_limits = {
+        "quality": {"target_tokens": 20000, "max_shots": 6, "max_scenes": 2},
+        "balanced": {"target_tokens": 25000, "max_shots": 8, "max_scenes": 4},
+        "fast": {"target_tokens": 32000, "max_shots": 10, "max_scenes": 6},
+    }
+    limits = preset_limits.get(preset.lower(), preset_limits["balanced"])
+    batches: List[List[SceneAnalysis]] = []
+    current_batch: List[SceneAnalysis] = []
+    current_tokens = 0
+    current_shots = 0
+
+    for scene in scenes:
+        scene_str = json.dumps(scene.model_dump(), ensure_ascii=False)
+        scene_tokens = estimate_tokens(scene_str)
+        # Estimate ~2 shots per scene average
+        est_shots = max(1, len(scene.dialogue) + 1)
+
+        exceeds_tokens = (current_tokens + scene_tokens > limits["target_tokens"]) and len(current_batch) > 0
+        exceeds_shots = (current_shots + est_shots > limits["max_shots"]) and len(current_batch) > 0
+        exceeds_scenes = len(current_batch) >= limits["max_scenes"]
+
+        if exceeds_tokens or exceeds_shots or exceeds_scenes:
+            batches.append(current_batch)
+            current_batch = [scene]
+            current_tokens = scene_tokens
+            current_shots = est_shots
+        else:
+            current_batch.append(scene)
+            current_tokens += scene_tokens
+            current_shots += est_shots
+
+    if current_batch:
+        batches.append(current_batch)
+
+    logger.info("Dynamic token chunking (%s): split %d scenes into %d batches", preset, len(scenes), len(batches))
+    return batches
+
+
+# --- Step 4: Shot Planning Batch Worker ---
+
+SHOT_PLANNER_SYSTEM = """You are a Senior Cinematographer & Animation Technical Director.
+Plan visual shots for the provided scene batch using character, environment, and prop bibles plus scene state_before/state_after ledgers.
+
+CRITICAL DIRECT MAPPING RULES FROM STORYBOARD SCENE:
+Every generated shot, keyframe_prompt, and motion_prompt MUST derive 100% of its content directly from the input Storyboard Scene:
+1. Environment/Location (`SCENE:`): MUST match the Scene's `location`/`Setting` (e.g. `villa_livingroom`).
+2. Duration (`TIMELINE:`): MUST match the Scene's `duration_seconds`/`Duration` (e.g. `0-6s`).
+3. Characters (`CHARACTERS:`): MUST list ONLY the exact canonical character names appearing in the Scene (e.g. `- lily`, `- stranger_guy`).
+4. Props: MUST match the Scene's active `props` (e.g. `red_backpack`, `folded_map`).
+5. Actions (`ACTIONS:`, `TIMELINE:`): MUST be derived directly from the Scene's `action` text.
+6. Dialogue (`DIALOGUE:`): MUST match the exact character speech lines from the Scene's `dialogue`.
+
+NO RE-DESCRIPTION RULE:
+DO NOT include character visual descriptions (age, clothes, hair, shoes, child terms) inside keyframe_prompt or motion_prompt. Character appearance is handled by the Character Bible. In keyframe_prompt and motion_prompt, refer to characters ONLY by their exact canonical names."""
+
+async def run_shot_planner_batch(
+    scenes_batch: List[SceneAnalysis],
+    characters: List[CharacterAsset],
+    environments: List[EnvironmentAsset],
+    props: List[PropAsset],
+    profile_ids: Optional[List[str]] = None,
+    model: str = "gemini-2.5-flash",
+    raw_api_keys: Optional[List[str]] = None,
+) -> List[Shot]:
+    scenes_json = json.dumps([s.model_dump() for s in scenes_batch], ensure_ascii=False)
+    chars_json = json.dumps([c.model_dump() for c in characters], ensure_ascii=False)
+    envs_json = json.dumps([e.model_dump() for e in environments], ensure_ascii=False)
+    props_json = json.dumps([p.model_dump() for p in props], ensure_ascii=False)
+
     prompt = (
-        f"Storyboard:\n{storyboard}\n\n"
-        f"Shot Details:\n{json.dumps(shot, ensure_ascii=False)}\n\n"
-        f"Generated Motion Prompt:\n{motion_prompt}\n\n"
-        f"Please verify compliance and return the compliance check result JSON."
+        f"CHARACTER BIBLE:\n{clean_text_for_safety(chars_json)}\n\n"
+        f"ENVIRONMENT BIBLE:\n{clean_text_for_safety(envs_json)}\n\n"
+        f"PROP BIBLE:\n{clean_text_for_safety(props_json)}\n\n"
+        f"SCENES BATCH (with state ledgers):\n{clean_text_for_safety(scenes_json)}"
     )
-    
-    response_text = await generate_gemini_content(
-        api_keys=api_keys,
-        model=model,
+
+    scene_nums = [s.scene_number for s in scenes_batch]
+    try:
+        raw_res = await generate_gemini_content(
+            prompt=prompt,
+            system_instruction=SHOT_PLANNER_SYSTEM,
+            response_schema=ShotPlannerResponse,
+            model=model,
+            profile_ids=profile_ids,
+            raw_api_keys=raw_api_keys,
+        )
+    except Exception as err:
+        logger.error("Gemini Safety Filter BLOCKED Shot Planner Batch for Scenes %s. Reason: %s", scene_nums, err)
+        logger.error("Blocked Prompt Content (Scenes %s):\n%s", scene_nums, prompt[:600])
+        raise RuntimeError(f"Shot Planner blocked by Gemini Safety Filter at Scenes {scene_nums}. Details: {err}") from err
+    res = ShotPlannerResponse.model_validate_json(raw_res)
+
+    # Always compile motion prompt using compile_motion_prompt to guarantee 100% adherence to 10-section structured spec
+    char_map = {c.canonical_name.lower(): c for c in characters}
+    for s in res.shots:
+        if s.keyframe_prompt:
+            s.keyframe_prompt = clean_text_for_safety(s.keyframe_prompt)
+        s.motion_prompt = compile_motion_prompt(s, char_map)
+    return res.shots
+
+
+# --- Step 5: Local Validation & Selective Repair ---
+
+def validate_shots_locally(shots: List[Shot]) -> Tuple[List[Shot], List[Dict[str, Any]]]:
+    """Validates shots locally. Returns valid shots list and repair queue items for failing shots."""
+    valid_shots: List[Shot] = []
+    repair_queue: List[Dict[str, Any]] = []
+
+    for idx, shot in enumerate(shots):
+        reasons = []
+        if not shot.shot_id:
+            shot.shot_id = f"Shot{idx+1:03d}"
+        if not shot.keyframe_prompt or len(shot.keyframe_prompt) < 20:
+            reasons.append("keyframe_prompt empty or too short")
+        if not shot.actions:
+            reasons.append("actions empty")
+        if not shot.camera:
+            reasons.append("camera description empty")
+
+        if reasons:
+            logger.warning("Local validation issue for %s: %s", shot.shot_id, ", ".join(reasons))
+            repair_queue.append({
+                "shot_id": shot.shot_id,
+                "scene_number": shot.scene_number,
+                "reasons": reasons,
+                "shot": shot.model_dump(),
+            })
+        else:
+            valid_shots.append(shot)
+
+    return valid_shots, repair_queue
+
+
+async def repair_single_shot(
+    item: Dict[str, Any],
+    characters: List[CharacterAsset],
+    environments: List[EnvironmentAsset],
+    props: List[PropAsset],
+    profile_ids: Optional[List[str]] = None,
+    model: str = "gemini-2.5-flash",
+) -> Shot:
+    """Repair a single failing shot via targeted repair prompt."""
+    shot_data = item["shot"]
+    reasons = ", ".join(item["reasons"])
+    prompt = (
+        f"Repair and complete this shot. Reason for repair: {reasons}\n"
+        f"Existing Shot Data:\n{json.dumps(shot_data, ensure_ascii=False)}"
+    )
+    raw_res = await generate_gemini_content(
         prompt=prompt,
-        system_instruction=system_instruction,
-        response_schema=ComplianceCheckResult,
-        rpm_limit=rpm_limit
+        system_instruction="You are a Shot Repair Agent. Fix missing or truncated keyframe/motion prompt fields while keeping shot consistency.",
+    response_schema=ShotPlannerResponse,
+        model=model,
+        profile_ids=profile_ids,
     )
-    return ComplianceCheckResult.model_validate_json(response_text)
+    res = ShotPlannerResponse.model_validate_json(raw_res)
+    return res.shots[0] if res.shots else Shot.model_validate(shot_data)
+
+
+def standardized_shots_to_shots(std_shots: List[StandardizedShotData], style_preset_id: str = "3d_pixar") -> List[Shot]:
+    """Converts StandardizedShotData into Shot objects deterministically without calling Gemini."""
+    assembled = assemble_prompts(std_shots, style_preset_id=style_preset_id)
+    result_shots: List[Shot] = []
+    for idx, s in enumerate(assembled, 1):
+        shot_id = f"Shot{idx:03d}"
+        shot = Shot(
+            shot_id=shot_id,
+            scene_number=s.scene_number,
+            duration_seconds=s.duration_seconds,
+            actions=s.visual or "Scene action",
+            characters=s.characters,
+            environment=s.setting or "Unspecified location",
+            props=s.props,
+            dialogue=s.dialogue,
+            camera_movement=s.camera_motion or "Static",
+            shot_type=s.shot_type or "Medium Shot",
+            transition=s.closing_transition or s.opening_transition or "Cut",
+            composition="Rule of Thirds",
+            lighting=s.lighting or "Natural lighting",
+            camera=f"{s.shot_type or 'Medium Shot'}. {s.camera_motion or 'Static'}.",
+            timeline=[TimelineItem(time=f"0-{s.duration_seconds}", action=s.character_motion or s.visual or "Action")],
+            motion=MotionDetails(primary_motion=s.character_motion or "Action", secondary_motion=["Blink", "Breathing"], motion_level="Low"),
+            keyframe_prompt=s.assembled_image_prompt,
+            motion_prompt=""
+        )
+        shot.motion_prompt = compile_motion_prompt(shot)
+        result_shots.append(shot)
+    return result_shots
+
+
+# --- Main Pipeline Task ---
+
+async def execute_pipeline_job(
+    job_id: str,
+    storyboard: str,
+    profile_ids: Optional[List[str]] = None,
+    mode: str = "fast",
+    quality_preset: str = "balanced",
+    style_preset_id: str = "3d_pixar",
+) -> None:
+    """Executes full pipeline end-to-end.
+    Gemini is ONLY called for Step 2 Asset Extractor.
+    Shot planning & Prompt Assembly are handled deterministically without extra AI calls when standardized storyboard format is used.
+    """
+    update_job_status(job_id, status="running", progress=0.05, completed_steps=0)
+    ckpt = get_checkpoint(job_id)
+
+    scenes: List[SceneAnalysis] = [SceneAnalysis.model_validate(s) for s in ckpt["scenes"]] if ckpt and ckpt["scenes"] else []
+    characters: List[CharacterAsset] = [CharacterAsset.model_validate(c) for c in ckpt["characters"]] if ckpt and ckpt["characters"] else []
+    environments: List[EnvironmentAsset] = [EnvironmentAsset.model_validate(e) for e in ckpt["environments"]] if ckpt and ckpt["environments"] else []
+    props: List[PropAsset] = [PropAsset.model_validate(p) for p in ckpt["props"]] if ckpt and ckpt["props"] else []
+    all_shots: List[Shot] = [Shot.model_validate(s) for s in ckpt["shots"]] if ckpt and ckpt["shots"] else []
+    completed_batch_indices: Set[int] = set(ckpt["completed_batch_indices"]) if ckpt and ckpt["completed_batch_indices"] else set()
+
+    # Step 1: Story Analyzer (Deterministic manual parsing preferred)
+    if not scenes:
+        logger.info("Executing Story Analyzer for job_id=%s", job_id)
+        story_res = await run_story_analyzer(storyboard, profile_ids=profile_ids)
+        scenes = story_res.scenes
+        save_checkpoint(job_id, scenes=[s.model_dump() for s in scenes])
+        update_job_status(job_id, progress=0.20, completed_steps=1)
+
+    # Step 2: 1x Combined Asset Extractor (The ONLY Gemini API call)
+    if not characters or not environments or not props:
+        logger.info("Executing 1x Combined Asset Extractor (Gemini API) for job_id=%s", job_id)
+        scenes_json = json.dumps([s.model_dump() for s in scenes], ensure_ascii=False)
+        assets_res = await run_assets_extractor(storyboard, scenes_json, profile_ids=profile_ids)
+        characters = assets_res.characters
+        environments = assets_res.environments
+        props = assets_res.props
+        save_checkpoint(
+            job_id,
+            characters=[c.model_dump() for c in characters],
+            environments=[e.model_dump() for e in environments],
+            props=[p.model_dump() for p in props],
+        )
+        update_job_status(job_id, progress=0.40, completed_steps=2)
+
+    # Step 3: Fast Deterministic Shot & Prompt Assembly
+    std_shots = parse_storyboard_to_standardized_shots(storyboard)
+    if std_shots and not all_shots:
+        logger.info("Parsing %d standardized shots & assembling prompts deterministically (0 extra Gemini calls)", len(std_shots))
+        all_shots = standardized_shots_to_shots(std_shots, style_preset_id=style_preset_id)
+        save_checkpoint(job_id, shots=[s.model_dump() for s in all_shots], completed_batch_indices=[0])
+        update_job_status(job_id, progress=0.80, completed_steps=3)
+    elif not all_shots:
+        # Fallback to batch shot planner if not written in standardized format
+        batches = chunk_scenes_by_tokens(scenes, preset=quality_preset)
+        pending_batch_indices = [idx for idx in range(len(batches)) if idx not in completed_batch_indices]
+
+        if pending_batch_indices:
+            logger.info("Executing %d parallel shot planning batches for job_id=%s", len(pending_batch_indices), job_id)
+
+            async def worker_task(batch_idx: int) -> Tuple[int, List[Shot]]:
+                b_scenes = batches[batch_idx]
+                batch_shots = await run_shot_planner_batch(b_scenes, characters, environments, props, profile_ids=profile_ids)
+                return batch_idx, batch_shots
+
+            batch_shots_map: Dict[int, List[Shot]] = {}
+            previous_shots = list(all_shots)
+            for idx in completed_batch_indices:
+                scene_numbers = {scene.scene_number for scene in batches[idx]}
+                batch_shots_map[idx] = [shot for shot in previous_shots if shot.scene_number in scene_numbers]
+
+        # Keep only a small number of scheduler tasks in memory. This permits
+        # independent batches to use separate authorised quota pools while still
+        # checkpointing every completed batch and pausing cleanly on RPD exhaustion.
+        concurrency = 4
+        pending_iter = iter(pending_batch_indices)
+        in_flight: Dict[asyncio.Task, int] = {}
+        quota_exhausted_error: Optional[Exception] = None
+
+        def start_next() -> bool:
+            try:
+                batch_idx = next(pending_iter)
+            except StopIteration:
+                return False
+            task = asyncio.create_task(worker_task(batch_idx))
+            in_flight[task] = batch_idx
+            return True
+
+        for _ in range(min(concurrency, len(pending_batch_indices))):
+            start_next()
+
+        while in_flight:
+            done, _ = await asyncio.wait(in_flight.keys(), return_when=asyncio.FIRST_COMPLETED)
+            for task in done:
+                batch_idx = in_flight.pop(task)
+                try:
+                    result_idx, b_shots = task.result()
+                except Exception as exc:
+                    if "daily request limit" in str(exc).lower():
+                        quota_exhausted_error = exc
+                        break
+                    raise
+                batch_shots_map[result_idx] = b_shots
+                completed_batch_indices.add(result_idx)
+                start_next()
+            if quota_exhausted_error:
+                for task in in_flight:
+                    task.cancel()
+                await asyncio.gather(*in_flight.keys(), return_exceptions=True)
+                break
+
+        # Reconstruct all shots in order
+        all_shots = []
+        for idx in range(len(batches)):
+            if idx in batch_shots_map:
+                all_shots.extend(batch_shots_map[idx])
+
+        save_checkpoint(
+            job_id,
+            shots=[s.model_dump() for s in all_shots],
+            completed_batch_indices=list(completed_batch_indices),
+        )
+        update_job_status(job_id, progress=0.75, completed_steps=3)
+
+        if quota_exhausted_error:
+            completed_ratio = len(completed_batch_indices) / max(1, len(batches))
+            update_job_status(
+                job_id,
+                status="paused",
+                progress=round(0.40 + completed_ratio * 0.35, 3),
+                completed_steps=2,
+                error="Daily Gemini request quota reached. Resume after the quota reset.",
+            )
+            return {
+                "job_id": job_id,
+                "status": "paused",
+                "completed_batches": len(completed_batch_indices),
+                "total_batches": len(batches),
+            }
+
+    # Step 5: Local Validation & Selective Repair
+    valid_shots, repair_queue = validate_shots_locally(all_shots)
+    if repair_queue:
+        logger.info("Running selective repair queue (%d shots) for job_id=%s", len(repair_queue), job_id)
+        repaired_shots: List[Shot] = []
+        for item in repair_queue:
+            try:
+                r_shot = await repair_single_shot(item, characters, environments, props, profile_ids=profile_ids)
+                repaired_shots.append(r_shot)
+            except Exception as r_err:
+                logger.error("Repair failed for %s: %s", item["shot_id"], r_err)
+                repaired_shots.append(Shot.model_validate(item["shot"]))
+
+        # Merge repaired shots back into valid shots
+        repaired_map = {s.shot_id: s for s in repaired_shots}
+        final_shots = [repaired_map.get(s.shot_id, s) for s in all_shots]
+        all_shots = final_shots
+
+    # Step 6: Quality Mode (On-demand keyframe & motion regeneration)
+    keyframes = [ShotKeyframePrompt(shot_id=s.shot_id, prompt=s.keyframe_prompt) for s in all_shots]
+    motion_prompts = [ShotMotionPrompt(shot_id=s.shot_id, prompt=s.motion_prompt) for s in all_shots]
+
+    save_checkpoint(
+        job_id,
+        shots=[s.model_dump() for s in all_shots],
+        keyframes=[k.model_dump() for k in keyframes],
+        motion_prompts=[m.model_dump() for m in motion_prompts],
+    )
+    update_job_status(job_id, status="completed", progress=1.0, completed_steps=5, eta_seconds=0.0)
+
+    logger.info("Pipeline job job_id=%s completed successfully!", job_id)
+    return {
+        "job_id": job_id,
+        "scenes": [s.model_dump() for s in scenes],
+        "characters": [c.model_dump() for c in characters],
+        "environments": [e.model_dump() for e in environments],
+        "props": [p.model_dump() for p in props],
+        "shots": [s.model_dump() for s in all_shots],
+        "keyframes": [k.model_dump() for k in keyframes],
+        "motion_prompts": [m.model_dump() for m in motion_prompts],
+    }
