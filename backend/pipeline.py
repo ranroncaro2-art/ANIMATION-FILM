@@ -686,10 +686,12 @@ Analyze the input storyboard and scene descriptions carefully. Infer and expand 
 - name: Prop item name
 - reference_prompt: Detailed isolated 3D prop asset reference prompt."""
 
-def build_deterministic_assets(scenes: List[SceneAnalysis]) -> AssetsResponse:
+def build_deterministic_assets(scenes: List[SceneAnalysis], style_preset_id: str = "3d_pixar") -> AssetsResponse:
     """Builds Character, Environment, and Prop Bibles instantly (0.001s) from scene metadata.
     Eliminates Gemini API timeouts, latency, and safety blocks during Step 2 Asset Extraction.
     """
+    preset = DEFAULT_STYLE_PRESETS.get(style_preset_id, DEFAULT_STYLE_PRESETS["3d_pixar"])
+    style_prefix = preset.prompt_prefix or "3D Disney Pixar animation style, 3D character design, clay render, soft studio lighting"
     unique_chars: List[CharacterAsset] = []
     seen_chars = set()
     unique_envs: List[EnvironmentAsset] = []
@@ -703,7 +705,7 @@ def build_deterministic_assets(scenes: List[SceneAnalysis]) -> AssetsResponse:
         if env_name.lower() not in seen_envs:
             seen_envs.add(env_name.lower())
             clean_id = f"env_{env_name.lower().replace(' ', '_')}"
-            ref_p = f"Pixar 3D animation style background reference of {env_name}, warm cinematic lighting, feature film 8k render, no text."
+            ref_p = f"{style_prefix}, background reference of {env_name}, warm cinematic lighting, feature film 8k render, no text."
             unique_envs.append(
                 EnvironmentAsset(
                     id=clean_id,
@@ -721,7 +723,7 @@ def build_deterministic_assets(scenes: List[SceneAnalysis]) -> AssetsResponse:
             if char_name.lower() not in seen_chars:
                 seen_chars.add(char_name.lower())
                 clean_id = f"char_{char_name.lower().replace(' ', '_')}"
-                ref_c = f"Pixar 3D animation style character turnaround sheet of {char_name}, front view, side view, back view, neutral pose, clean studio lighting, 8k render, no text."
+                ref_c = f"{style_prefix}, character turnaround sheet of {char_name}, front view, side view, back view, neutral pose, clean studio lighting, 8k render, no text."
                 unique_chars.append(
                     CharacterAsset(
                         id=clean_id,
@@ -729,9 +731,9 @@ def build_deterministic_assets(scenes: List[SceneAnalysis]) -> AssetsResponse:
                         name=char_name,
                         age="character",
                         gender="character",
-                        appearance="Expressive 3D character face, clean Pixar animation style",
-                        outfit="Stylized 3D outfit matching character reference image",
-                        hairstyle="Stylized 3D hair",
+                        appearance=f"Expressive 3D character face, clean {style_prefix} style",
+                        outfit=f"Stylized outfit matching {style_prefix} style",
+                        hairstyle="Stylized hair",
                         accessories="None",
                         voice_style="Gentle expressive tone",
                         personality="Friendly and adventurous",
@@ -748,7 +750,7 @@ def build_deterministic_assets(scenes: List[SceneAnalysis]) -> AssetsResponse:
             if prop_name.lower() not in seen_props:
                 seen_props.add(prop_name.lower())
                 clean_id = f"prop_{prop_name.lower().replace(' ', '_')}"
-                ref_prop = f"Pixar 3D animation style prop reference asset of {prop_name}, clean studio lighting, isolated 3D object render, no text."
+                ref_prop = f"{style_prefix}, prop reference asset of {prop_name}, clean studio lighting, isolated object render, no text."
                 unique_props.append(
                     PropAsset(
                         id=clean_id,
@@ -773,6 +775,7 @@ async def run_assets_extractor(
     profile_ids: Optional[List[str]] = None,
     model: str = "gemini-2.5-flash",
     raw_api_keys: Optional[List[str]] = None,
+    style_preset_id: str = "3d_pixar",
 ) -> AssetsResponse:
     """Uses Gemini API to analyze character traits, age, gender, appearance, outfit, voice style, and detailed turnaround prompts."""
     prompt = f"Analyze and extract detailed characters, environments, and props from storyboard and scene analysis:\n\nSTORYBOARD:\n{clean_text_for_safety(storyboard)}\n\nSCENES:\n{clean_text_for_safety(scenes_json)}"
@@ -786,19 +789,31 @@ async def run_assets_extractor(
             raw_api_keys=raw_api_keys,
         )
         res = AssetsResponse.model_validate_json(raw_res)
-        # Ensure backward-compatible prompts
+        preset = DEFAULT_STYLE_PRESETS.get(style_preset_id, DEFAULT_STYLE_PRESETS["3d_pixar"])
+        style_prefix = preset.prompt_prefix or "3D Disney Pixar animation style, 3D character design, clay render, soft studio lighting"
+        
+        # Ensure style prefix is in the turnaround/reference prompts
         for c in res.characters:
             if not c.turnaround_prompt:
-                c.turnaround_prompt = f"Pixar 3D animation style character turnaround sheet of {c.canonical_name}, {c.age} {c.gender}, {c.appearance}, wearing {c.outfit}, front view, side view, back view, neutral pose, clean studio lighting, 8k render, no text."
+                c.turnaround_prompt = f"character turnaround sheet of {c.canonical_name}, {c.age} {c.gender}, {c.appearance}, wearing {c.outfit}, front view, side view, back view, neutral pose, clean studio background, studio lighting, 8k render, no text."
+            if style_prefix and not c.turnaround_prompt.lower().startswith(style_prefix.lower()[:20]):
+                c.turnaround_prompt = f"{style_prefix}, {c.turnaround_prompt}"
             c.prompt = c.turnaround_prompt
+            
         for e in res.environments:
             if not e.reference_prompt:
-                e.reference_prompt = f"Pixar 3D animation style background reference of {e.name}, warm cinematic lighting, feature film 8k render, no text."
+                e.reference_prompt = f"background reference of {e.name}, warm cinematic lighting, feature film 8k render, no text."
+            if style_prefix and not e.reference_prompt.lower().startswith(style_prefix.lower()[:20]):
+                e.reference_prompt = f"{style_prefix}, {e.reference_prompt}"
             e.prompt = e.reference_prompt
+            
         for p in res.props:
             if not p.reference_prompt:
-                p.reference_prompt = f"Pixar 3D animation style prop reference asset of {p.name}, clean studio lighting, isolated 3D object render, no text."
+                p.reference_prompt = f"prop reference asset of {p.name}, clean studio lighting, isolated object render, no text."
+            if style_prefix and not p.reference_prompt.lower().startswith(style_prefix.lower()[:20]):
+                p.reference_prompt = f"{style_prefix}, {p.reference_prompt}"
             p.prompt = p.reference_prompt
+            
         return res
     except Exception as err:
         logger.warning("Gemini Asset Extractor failed (%s). Falling back to deterministic assets.", err)
@@ -814,7 +829,7 @@ async def run_assets_extractor(
             manual_story = parse_storyboard_manual(storyboard)
             if manual_story and manual_story.scenes:
                 parsed_scenes = manual_story.scenes
-        return build_deterministic_assets(parsed_scenes)
+        return build_deterministic_assets(parsed_scenes, style_preset_id=style_preset_id)
 
 
 # --- Step 3: Dynamic Token Chunking ---
@@ -1050,7 +1065,12 @@ async def execute_pipeline_job(
     if not characters or not environments or not props:
         logger.info("Executing 1x Combined Asset Extractor (Gemini API) for job_id=%s", job_id)
         scenes_json = json.dumps([s.model_dump() for s in scenes], ensure_ascii=False)
-        assets_res = await run_assets_extractor(storyboard, scenes_json, profile_ids=profile_ids)
+        assets_res = await run_assets_extractor(
+            storyboard,
+            scenes_json,
+            profile_ids=profile_ids,
+            style_preset_id=style_preset_id,
+        )
         characters = assets_res.characters
         environments = assets_res.environments
         props = assets_res.props

@@ -311,7 +311,13 @@ async def extract_assets(req: PipelineRequest):
             scenes_res = await run_story_analyzer(req.storyboard, raw_api_keys=req.api_keys, model=req.model)
             scenes = scenes_res.scenes
         scenes_json = json.dumps([s.model_dump() for s in scenes], ensure_ascii=False)
-        res = await run_assets_extractor(req.storyboard, scenes_json, raw_api_keys=req.api_keys, model=req.model)
+        res = await run_assets_extractor(
+            req.storyboard,
+            scenes_json,
+            raw_api_keys=req.api_keys,
+            model=req.model,
+            style_preset_id=req.style_preset_id,
+        )
         res.input_tokens = input_tokens_var.get()
         res.output_tokens = output_tokens_var.get()
         return res
