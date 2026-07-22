@@ -22,7 +22,7 @@ const getBackendUrl = () => {
 
 export interface ProjectTaskState {
   projectId: string;
-  status: "idle" | "running" | "success" | "failed";
+  status: "idle" | "running" | "success" | "failed" | "paused";
   activeStep: StepKey | null;
   isRunningAll: boolean;
   error?: string;
