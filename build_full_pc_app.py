@@ -245,8 +245,6 @@ namespace AIKidsStudio
             }
             catch { }
         }
-            }
-        }
 
         private static bool WaitForServerReady(string url, int timeoutSeconds)
         {
