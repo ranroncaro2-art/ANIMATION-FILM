@@ -36,6 +36,17 @@ def main():
     print(f"Copying backend executable from {backend_dist_src} -> {backend_dist_dest}")
     shutil.copytree(backend_dist_src, backend_dist_dest)
     
+    # Copy Visual C++ Runtime DLLs for clean Windows installations
+    system32_dir = os.path.join(os.environ.get("SystemRoot", r"C:\Windows"), "System32")
+    for dll_name in ["vcruntime140.dll", "msvcp140.dll", "vcruntime140_1.dll"]:
+        dll_path = os.path.join(system32_dir, dll_name)
+        if os.path.exists(dll_path):
+            try:
+                shutil.copy2(dll_path, backend_dist_dest)
+                print(f"Bundled VC++ runtime DLL: {dll_name}")
+            except Exception as e:
+                print(f"[WARNING] Could not copy {dll_name}: {e}")
+    
     # 3. Copy Portable node.exe
     print("[3/6] Copying Portable Node.js runtime...")
     node_src = "C:\\Program Files\\nodejs\\node.exe"
@@ -90,6 +101,7 @@ namespace AIKidsStudio
         private static Process backendProcess;
         private static Process frontendProcess;
         private static Process browserProcess;
+        private static string logFile;
 
         [STAThread]
         static void Main()
@@ -98,6 +110,9 @@ namespace AIKidsStudio
             Application.SetCompatibleTextRenderingDefault(false);
 
             string appDir = AppDomain.CurrentDomain.BaseDirectory;
+            logFile = Path.Combine(appDir, "app_launch.log");
+            File.WriteAllText(logFile, "=== AI Kids Animation Studio Launch Log ===\nStarted: " + DateTime.Now.ToString() + "\n");
+
             string backendExe = Path.Combine(appDir, "backend", "backend.exe");
             
             string nodeExe = Path.Combine(appDir, "node.exe");
@@ -119,6 +134,7 @@ namespace AIKidsStudio
 
                 if (File.Exists(backendExe))
                 {
+                    Log("Starting Backend process: " + backendExe);
                     ProcessStartInfo backendInfo = new ProcessStartInfo
                     {
                         FileName = backendExe,
@@ -131,6 +147,7 @@ namespace AIKidsStudio
                 else if (File.Exists(backendPy))
                 {
                     string pythonBin = File.Exists(venvPython) ? venvPython : "python";
+                    Log("Starting Backend via python script: " + backendPy);
                     ProcessStartInfo backendInfo = new ProcessStartInfo
                     {
                         FileName = pythonBin,
@@ -141,10 +158,15 @@ namespace AIKidsStudio
                     };
                     backendProcess = Process.Start(backendInfo);
                 }
+                else
+                {
+                    Log("ERROR: Backend executable or main.py not found!");
+                }
 
                 // 2. Start Frontend Server quietly
                 if (Directory.Exists(frontendDir))
                 {
+                    Log("Starting Frontend process: " + nodeExe + " " + nextScript);
                     ProcessStartInfo frontendInfo = new ProcessStartInfo
                     {
                         FileName = nodeExe,
@@ -156,12 +178,22 @@ namespace AIKidsStudio
                     frontendInfo.EnvironmentVariables["NODE_ENV"] = "production";
                     frontendProcess = Process.Start(frontendInfo);
                 }
+                else
+                {
+                    Log("ERROR: Frontend directory not found!");
+                }
 
                 // 3. Poll server until ready (up to 30s)
+                Log("Waiting for frontend server at http://localhost:3001...");
                 bool serverReady = WaitForServerReady("http://localhost:3001", 30);
                 if (!serverReady)
                 {
-                    Thread.Sleep(2000);
+                    Log("WARNING: Frontend server http://localhost:3001 did not respond within 30s.");
+                    MessageBox.Show("Ứng dụng không thể khởi động đúng cách trong 30 giây.\n\nVui lòng kiểm tra lại Antivirus/Windows Defender hoặc xem log chi tiết tại file app_launch.log.", "AI Kids Animation Studio", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                }
+                else
+                {
+                    Log("Frontend server is READY!");
                 }
 
                 // 4. Open Edge in App Mode (or default browser)
@@ -173,6 +205,7 @@ namespace AIKidsStudio
 
                 if (File.Exists(edgePath))
                 {
+                    Log("Opening Edge App Mode...");
                     ProcessStartInfo edgeInfo = new ProcessStartInfo
                     {
                         FileName = edgePath,
@@ -184,20 +217,34 @@ namespace AIKidsStudio
                 }
                 else
                 {
+                    Log("Opening default browser...");
                     Process.Start("http://localhost:3001");
                     MessageBox.Show("AI Kids Animation Studio is running at http://localhost:3001.\n\nClick OK when you are done to exit.", "AI Kids Animation Studio", MessageBoxButtons.OK, MessageBoxIcon.Information);
                 }
             }
             catch (Exception ex)
             {
-                MessageBox.Show("Error starting application: " + ex.Message, "Error", MessageBoxButtons.OK, MessageBoxIcon.Error);
+                Log("CRITICAL ERROR: " + ex.ToString());
+                MessageBox.Show("Error starting application: " + ex.Message + "\n\nSee app_launch.log for details.", "Error", MessageBoxButtons.OK, MessageBoxIcon.Error);
             }
             finally
             {
+                Log("Shutting down processes...");
                 KillProcess(browserProcess);
                 KillProcess(frontendProcess);
                 KillProcess(backendProcess);
                 KillProcessByName("backend");
+            }
+        }
+
+        private static void Log(string msg)
+        {
+            try
+            {
+                File.AppendAllText(logFile, "[" + DateTime.Now.ToString("HH:mm:ss") + "] " + msg + "\n");
+            }
+            catch { }
+        }
             }
         }
 
