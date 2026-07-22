@@ -115,7 +115,7 @@ namespace AIKidsStudioInstaller
                 }
                 Directory.CreateDirectory(installDir);
 
-                // Extract Zip payload appended at the tail of executable
+                // Extract Zip payload appended at the tail of executable via SubStream (zero memory, no 2GB limit)
                 string currentExe = Application.ExecutablePath;
                 using (FileStream fs = new FileStream(currentExe, FileMode.Open, FileAccess.Read, FileShare.Read))
                 {
@@ -125,24 +125,11 @@ namespace AIKidsStudioInstaller
                     long zipLen = BitConverter.ToInt64(lenBytes, 0);
 
                     long zipOffset = fs.Length - 8 - zipLen;
-                    fs.Seek(zipOffset, SeekOrigin.Begin);
 
-                    using (MemoryStream ms = new MemoryStream())
+                    using (SubStream subStream = new SubStream(fs, zipOffset, zipLen))
+                    using (ZipArchive archive = new ZipArchive(subStream, ZipArchiveMode.Read))
                     {
-                        byte[] buffer = new byte[65536];
-                        long remaining = zipLen;
-                        while (remaining > 0)
-                        {
-                            int read = fs.Read(buffer, 0, (int)Math.Min(buffer.Length, remaining));
-                            if (read <= 0) break;
-                            ms.Write(buffer, 0, read);
-                            remaining -= read;
-                        }
-                        ms.Seek(0, SeekOrigin.Begin);
-                        using (ZipArchive archive = new ZipArchive(ms))
-                        {
-                            archive.ExtractToDirectory(installDir);
-                        }
+                        archive.ExtractToDirectory(installDir);
                     }
                 }
 
@@ -193,6 +180,64 @@ namespace AIKidsStudioInstaller
         }
     }
 
+    public class SubStream : Stream
+    {
+        private readonly Stream _baseStream;
+        private readonly long _startPosition;
+        private readonly long _length;
+        private long _position;
+
+        public SubStream(Stream baseStream, long startPosition, long length)
+        {
+            _baseStream = baseStream;
+            _startPosition = startPosition;
+            _length = length;
+            _position = 0;
+            _baseStream.Seek(_startPosition, SeekOrigin.Begin);
+        }
+
+        public override bool CanRead { get { return true; } }
+        public override bool CanSeek { get { return true; } }
+        public override bool CanWrite { get { return false; } }
+        public override long Length { get { return _length; } }
+        public override long Position
+        {
+            get { return _position; }
+            set
+            {
+                if (value < 0 || value > _length) throw new ArgumentOutOfRangeException();
+                _position = value;
+                _baseStream.Seek(_startPosition + _position, SeekOrigin.Begin);
+            }
+        }
+
+        public override int Read(byte[] buffer, int offset, int count)
+        {
+            long remaining = _length - _position;
+            if (remaining <= 0) return 0;
+            if (count > remaining) count = (int)remaining;
+            _baseStream.Seek(_startPosition + _position, SeekOrigin.Begin);
+            int bytesRead = _baseStream.Read(buffer, offset, count);
+            _position += bytesRead;
+            return bytesRead;
+        }
+
+        public override long Seek(long offset, SeekOrigin origin)
+        {
+            long targetPos = _position;
+            if (origin == SeekOrigin.Begin) targetPos = offset;
+            else if (origin == SeekOrigin.Current) targetPos += offset;
+            else if (origin == SeekOrigin.End) targetPos = _length + offset;
+
+            Position = targetPos;
+            return _position;
+        }
+
+        public override void Flush() { }
+        public override void SetLength(long value) { throw new NotSupportedException(); }
+        public override void Write(byte[] buffer, int offset, int count) { throw new NotSupportedException(); }
+    }
+
     static class Program
     {
         [STAThread]
@@ -228,9 +273,13 @@ namespace AIKidsStudioInstaller
             f_out.write(f_stub.read())
         
         with open(zip_path, "rb") as f_zip:
-            zip_bytes = f_zip.read()
-            zip_len = len(zip_bytes)
-            f_out.write(zip_bytes)
+            zip_len = 0
+            while True:
+                chunk = f_zip.read(1024 * 1024)
+                if not chunk:
+                    break
+                f_out.write(chunk)
+                zip_len += len(chunk)
             f_out.write(struct.pack("<q", zip_len)) # 8-byte little-endian int64 length header
 
     print("\n=========================================================")
